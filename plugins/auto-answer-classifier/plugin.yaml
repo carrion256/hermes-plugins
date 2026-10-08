@@ -1,0 +1,19 @@
+name: auto-answer-classifier
+version: 0.1.0
+description: "Auto-picks the classifier-endorsed option when the user times out on a clarify question; never picks on disagreement."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_middleware:
+  - tool_execution
+provides_hooks:
+  - post_tool_call
+config_schema:
+  endpoint:
+    type: str
+    default: "http://192.168.50.149:8787"
+    description: "Classifier service base URL."
+  api_key_env:
+    type: str
+    default: "CLASSIFIER_API_KEY"
+    description: "Env var holding the Bearer key (name only; value read at call time)."

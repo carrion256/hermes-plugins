@@ -1,0 +1,31 @@
+name: subagent-effort
+version: 0.1.0
+description: "Classifier-driven reasoning-effort routing for delegated subagents: cheap tasks get low effort, hard ones get max."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_middleware:
+  - llm_request
+provides_hooks:
+  - subagent_start
+config_schema:
+  endpoint:
+    type: str
+    default: "http://192.168.50.149:8787"
+    description: "Classifier service base URL."
+  api_key_env:
+    type: str
+    default: "CLASSIFIER_API_KEY"
+    description: "Env var holding the Bearer key (name only; value read at call time)."
+  subagent_prefixes:
+    type: list
+    default: ["subagent", "worker", "child"]
+    description: "task_id prefixes that mark delegated sessions."
+  low_effort:
+    type: str
+    default: "low"
+    description: "Effort for tasks classified simple."
+  high_effort:
+    type: str
+    default: "high"
+    description: "Effort for tasks classified hard."

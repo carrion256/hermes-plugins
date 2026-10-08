@@ -1,0 +1,15 @@
+name: rules
+version: 0.1.0
+description: "Cursor/Windsurf-style rule files: always-apply rules injected every turn; tool-matched rules rewrite tool args."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_middleware:
+  - tool_request
+provides_hooks:
+  - pre_llm_call
+config_schema:
+  rules_dir:
+    type: str
+    default: "~/.hermes/rules"
+    description: "Directory with *.md rule files. Front-matter 'applies: always' injects every turn; 'tools: [terminal, ...]' gates a tool_request transform whose body is appended to matching tool args."

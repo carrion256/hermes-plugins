@@ -1,0 +1,21 @@
+name: auto-review-classifier
+version: 0.1.0
+description: "Screens every tool call through the self-hosted classifier before execution; deny (or fall through to approval) on risky verdicts. Fail-open on classifier errors."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_middleware:
+  - tool_execution
+config_schema:
+  endpoint:
+    type: str
+    default: "http://192.168.50.149:8787"
+    description: "Classifier service base URL (GET /health, POST /classify)."
+  api_key_env:
+    type: str
+    default: "CLASSIFIER_API_KEY"
+    description: "Env var holding the Bearer key. Name only — value read at call time, never stored."
+  policy:
+    type: str
+    default: "ask"
+    description: "'ask' = fall through to normal approval; 'deny' = short-circuit deny on risky verdicts."

@@ -1,0 +1,15 @@
+name: tool-docling
+version: 0.1.0
+description: "Local document conversion via docling CLI: PDF/DOCX/PPTX/XLSX/HTML → Markdown or structured JSON."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - docling_convert
+external_dependencies:
+  - "docling CLI on PATH (pip: docling)"
+config_schema:
+  binary:
+    type: str
+    default: "docling"
+    description: "docling executable (on PATH or absolute path)."

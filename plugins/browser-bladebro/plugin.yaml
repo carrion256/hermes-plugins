@@ -1,0 +1,23 @@
+name: browser-bladebro
+version: 0.1.0
+description: "Registers bladebro browser tools (see/act/state/vision) over the bladebro CLI --json interface, plus text-first steering."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - bladebro_see
+  - bladebro_act
+  - bladebro_state
+  - bladebro_vision
+provides_hooks: []
+external_dependencies:
+  - "bladebro CLI on PATH or configured binary"
+config_schema:
+  binary:
+    type: str
+    default: ""
+    description: "bladebro executable (empty = detect on PATH; tool hidden when absent)."
+  timeout:
+    type: int
+    default: 120
+    description: "Per-call timeout in seconds."

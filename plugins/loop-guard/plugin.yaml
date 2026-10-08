@@ -1,0 +1,22 @@
+name: loop-guard
+version: 0.1.0
+description: "Pathological loop detectors: identical tool-call streaks and repeated-answer loops get corrective steers."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_hooks:
+  - post_tool_call
+  - post_api_request
+config_schema:
+  tool_call_streak:
+    type: int
+    default: 5
+    description: "Consecutive identical tool-call batches before a corrective steer fires."
+  answer_repetition:
+    type: int
+    default: 3
+    description: "Consecutive near-identical text answers (no tool call) before a corrective steer fires."
+  redirect_cap:
+    type: int
+    default: 2
+    description: "Max corrective steers per session per detector."

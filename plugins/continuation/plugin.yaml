@@ -1,0 +1,22 @@
+name: continuation
+version: 0.1.0
+description: "Prompt continuation: catches turns that promised action without acting (unexpected stop / empty stop) and steers the session to resume."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_hooks:
+  - on_session_end
+  - post_api_request
+config_schema:
+  max_steers_per_session:
+    type: int
+    default: 3
+    description: "Cap on continuation steers per session (loop guard)."
+  empty_stop:
+    type: bool
+    default: true
+    description: "Steer when a committed turn had no text, reasoning, or tool calls."
+  unexpected_stop:
+    type: bool
+    default: true
+    description: "Steer when the final assistant text promised an action but no tool ran."
