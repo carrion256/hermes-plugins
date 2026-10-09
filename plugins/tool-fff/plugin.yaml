@@ -1,21 +1,14 @@
 name: tool-fff
 version: 0.1.0
-description: "fff-backed search: registers fff_search (fff binary when configured, ripgrep fallback). Optional opt-in override of built-in search_files."
+description: "Native-Hermes search adapter: optional override of built-in search_files delegating to the native handler (schema, task CWD/backend, credential redaction, pagination bounds preserved). No fff acceleration exists."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 capabilities:
   - tools.override
-provides_tools:
-  - fff_search
-external_dependencies:
-  - "fff binary (optional — falls back to ripgrep when absent)"
+external_dependencies: []
 config_schema:
-  binary:
-    type: str
-    default: ""
-    description: "fff executable (empty = auto-detect on PATH; fall back to ripgrep if absent)."
   override_search_files:
     type: bool
     default: false
-    description: "Register fff_search as an override of built-in search_files (requires plugins.entries.tool-fff.allow_tool_override: true)."
+    description: "Register the search_files override delegating to the native handler (requires plugins.entries.tool-fff.allow_tool_override: true)."
