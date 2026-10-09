@@ -1,0 +1,21 @@
+{
+  "not_part_of_scored_corpus": true,
+  "purpose": "Native endpoint effort qualification before the frozen six-case run",
+  "rejected_high": {
+    "requested_effort": "high",
+    "model": "qwen3.8-flash-next",
+    "status": "failed",
+    "exit_reason": "error",
+    "error": "HTTP 400: Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.",
+    "api_calls": 1
+  },
+  "accepted_xhigh": {
+    "requested_effort": "xhigh",
+    "model": "qwen3.8-flash-next",
+    "status": "completed",
+    "exit_reason": "completed",
+    "summary": "- Changed `answer.py`: `return 0` \u2192 `return 42`.\n- Validation: `python3 -m pytest -q` \u2192 **1 passed** (exit code 0).\n- `test_public.py` untouched; no other files created or modified.",
+    "api_calls": 4
+  },
+  "medium_and_low": "Advertised by the endpoint error response; not exercised"
+}

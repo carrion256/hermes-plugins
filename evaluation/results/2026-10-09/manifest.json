@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "mode": "live",
+  "corpus_sha256": "eee5d46495740821f26addf304b1fdf13bb7f580678dce710765d7bc25ad10d0",
+  "runner_sha256": "88eb2b4b49f327017f4355a4b869f32ac75b599cb97f10d21481219f36e34ad0",
+  "plugin_sha256": "f13019282a2c895e92c3f96320f8500887054e5d5cb422f7d5d50e2f1378d5c3",
+  "hermes_python": "/nix/store/3a49ppxcvvhfshavhyi7rk8ybszjpp0n-hermes-agent-env/bin/python3.12",
+  "seed": 20261009,
+  "order": [
+    "record-lines",
+    "ledger-batches",
+    "suffix-removal",
+    "memo-flight",
+    "page-count",
+    "catalog-csv"
+  ],
+  "settings": {
+    "model": "qwen3.8-flash-next",
+    "base_url": "http://localhost:8001/v1",
+    "provider": "lilith",
+    "api_mode": "chat_completions",
+    "effort": "xhigh",
+    "max_iterations": 12,
+    "child_timeout_seconds": 180,
+    "worker_timeout_seconds": 240,
+    "assert_timeout_seconds": 20,
+    "max_tokens": 4096,
+    "verify_on_stop": true,
+    "max_verify_nudges": 2,
+    "subagent_auto_approve": false,
+    "background_reviews": false
+  },
+  "automatic_routing": "NOT_QUALIFIED",
+  "services": {
+    "model": {
+      "url": "http://localhost:8001/v1/models",
+      "status": 200,
+      "identity": {
+        "object": "list",
+        "data": [
+          {
+            "id": "qwen3.8-flash-next",
+            "object": "model",
+            "created": 1791559720,
+            "owned_by": "vllm",
+            "root": "/models/qwen38-flash-next-cyber-graft",
+            "parent": null,
+            "max_model_len": 262144,
+            "permission": [
+              {
+                "id": "modelperm-8d4b0ab456583d06",
+                "object": "model_permission",
+                "created": 1791559720,
+                "allow_create_engine": false,
+                "allow_sampling": true,
+                "allow_logprobs": true,
+                "allow_search_indices": false,
+                "allow_view": true,
+                "allow_fine_tuning": false,
+                "organization": "*",
+                "group": null,
+                "is_blocking": false
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "classifier": {
+      "url": "http://192.168.50.149:8787/health",
+      "status": 200,
+      "identity": {
+        "model": "Winnow-12B",
+        "revision": "b6ac22b0d51b",
+        "device": "cuda",
+        "ready": true
+      }
+    }
+  },
+  "baselines_proven_broken": true,
+  "baselines_complete": true,
+  "evaluation_complete": true
+}

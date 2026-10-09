@@ -1,10 +1,9 @@
 """Auto-review classifier gate — port of dsh-auto-review-classifier.
 
-Registers ``tool_execution`` middleware: every tool call is screened through
-the self-hosted classifier (POST /classify) BEFORE downstream execution.
-A risky verdict short-circuits the call (deny) or falls through to the normal
-approval flow (ask). Classifier errors fail OPEN — an unreachable endpoint
-never wedges the agent.
+Registers a native ``pre_tool_call`` risk gate. Risky calls are either blocked
+or escalated to Hermes's human-approval directive BEFORE execution.
+Classifier errors retain the documented fail-open behavior; this is an
+advisory screen, not an authorization boundary.
 
 Read-only tool calls skip screening (fast path).
 """
@@ -21,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Tool calls that are safe to skip: read-only, no side effects on external state.
 _SKIP_TOOLS = {"read_file", "search_files", "web_search", "web_extract", "skill_view",
-               "skills_list", "ha_get_state", "ha_list_entities", "ha_list_services",
-               "process_manage"}
+               "skills_list", "ha_get_state", "ha_list_entities", "ha_list_services"}
+_READ_ONLY_PROCESS_ACTIONS = {"list", "poll", "log", "wait"}
 
 # One-shot risk screen; extend with more heads as needed.
 SCHEMA = {"risk": ["safe", "risky"]}
@@ -52,20 +51,20 @@ def register(ctx) -> None:
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
             return None
 
-    def gate(tool_name: str = "", args: dict | None = None, next_call=None, **_kw):
-        if tool_name in _SKIP_TOOLS or not next_call:
-            return next_call(args or {}) if next_call else None
+    def gate(tool_name: str = "", args: dict | None = None, **_kw):
+        if tool_name in _SKIP_TOOLS:
+            return None
+        if tool_name == "process_manage" and isinstance(args, dict) and args.get("action") in _READ_ONLY_PROCESS_ACTIONS:
+            return None
         summary = json.dumps({tool_name: args or {}}, default=str)[:4000]
-        verdict = classify(summary)
-        if verdict == "risky":
-            if policy == "deny":
-                logger.info("auto-review: denied %s (classifier risky)", tool_name)
-                return json.dumps({"success": False, "blocked": True,
-                                   "reason": "auto-review-classifier: verdict risky"})
-            # policy == "ask": run the call anyway but stamp a review note —
-            # real approval flow is core's; this seam short-circuits only on deny.
-            logger.info("auto-review: %s flagged risky (policy=ask, proceeding)", tool_name)
-        return next_call(args or {})
+        if classify(summary) != "risky":
+            return None
+        logger.info("auto-review: %s flagged risky (policy=%s)", tool_name, policy)
+        return {
+            "action": "block" if policy == "deny" else "approve",
+            "message": f"auto-review-classifier: {tool_name} was classified risky; human review required.",
+            "rule_key": f"auto-review:{tool_name}",
+        }
 
-    ctx.register_middleware("tool_execution", gate)
-    logger.info("auto-review-classifier: active (policy=%s, endpoint=%s)", policy, endpoint or "none")
+    ctx.register_hook("pre_tool_call", gate)
+    logger.info("auto-review-classifier: active (policy=%s)", policy)

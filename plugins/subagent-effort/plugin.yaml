@@ -1,13 +1,15 @@
 name: subagent-effort
-version: 0.1.0
-description: "Classifier-driven reasoning-effort routing for delegated subagents: cheap tasks get low effort, hard ones get max."
+version: 0.5.3
+description: "Classifier-driven reasoning-effort evaluation for delegated subagents. PURE SHADOW by design: records verdicts, observed child origin, native-normalized recommendations and outcomes in durable ctx.state; never applies effort — every explicit operator/model/tool choice stays untouched."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
-provides_middleware:
-  - llm_request
 provides_hooks:
   - subagent_start
+  - pre_llm_call
+  - post_api_request
+  - post_llm_call
+  - subagent_stop
 config_schema:
   endpoint:
     type: str
@@ -17,15 +19,11 @@ config_schema:
     type: str
     default: "CLASSIFIER_API_KEY"
     description: "Env var holding the Bearer key (name only; value read at call time)."
-  subagent_prefixes:
-    type: list
-    default: ["subagent", "worker", "child"]
-    description: "task_id prefixes that mark delegated sessions."
   low_effort:
     type: str
     default: "low"
-    description: "Effort for tasks classified simple."
+    description: "Effort SUGGESTED (recorded only) for tasks classified simple."
   high_effort:
     type: str
     default: "high"
-    description: "Effort for tasks classified hard."
+    description: "Effort SUGGESTED (recorded only) for tasks classified complex."

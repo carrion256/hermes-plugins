@@ -1,0 +1,67 @@
+{
+  "tool_events": [
+    {
+      "tool_call_id": "chatcmpl-tool-aee99e48d08c02db",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 24,
+      "session_id": "20261009_163147_3f7e93",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-811e35fecb8c94d1",
+      "tool": "search_files",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 44,
+      "session_id": "20261009_163147_3f7e93",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-91ce44d51e95ac85",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 3,
+      "session_id": "20261009_163147_3f7e93",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-809c4995bd7fbd6a",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 174,
+      "session_id": "20261009_163147_3f7e93",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-aaf0897f39389d0f",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 619,
+      "session_id": "20261009_163147_3f7e93",
+      "verification_evidence_status": "passed"
+    }
+  ],
+  "source_changes": [
+    {
+      "tool_call_id": "chatcmpl-tool-809c4995bd7fbd6a",
+      "tool": "patch",
+      "changed": [
+        "pages.py"
+      ]
+    }
+  ],
+  "verified_corrective_revisions": 0,
+  "corrective_revision_events": [],
+  "child_session_id": "20261009_163147_3f7e93",
+  "verification_ledger_rows_observed": 1
+}

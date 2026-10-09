@@ -1,0 +1,2350 @@
+{
+  "results": [
+    {
+      "id": "record-lines",
+      "status": "completed",
+      "public_test_initial_sha256": "c60abc0b5fa65adea6bfcbd0aac93f3e184550ffa04b0218e80ec74009df2e03",
+      "initial_source_hashes": {
+        "records.py": "ce1c1cb17c61f35df8776542b9e3200d3710d1e3a6cb6401de43bb017049dba7"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 8, in <module>\nAssertionError: non-object accepted\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 110,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 12, in <module>\nAssertionError: ('accepted bad record', 'null')\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 123,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 9.98,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "Fixed `parse_records` in `records.py`:\n\n- **Changes**: Skip whitespace-only lines (via `str.strip()` check) instead of only empty lines; raise `ValueError(\"line N: expected JSON object\")` on malformed JSON or non-dict decode (e.g., `null`, arrays, scalars), where N is the original 1-based physical line number. `text.splitlines()` handles LF/CRLF natively.\n- **Verification**: `python3 -m pytest -q` → 1 passed. Manual spot checks confirmed CRLF handling, blank/whitespace skipping, ordered dict output, and exact error message/line numbering for both bad-JSON and non-dict cases.\n- **Files modified**: `records.py` only. `test_public.py` untouched.",
+        "api_calls": 5,
+        "duration_seconds": 7.05,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 32308,
+          "output": 975
+        },
+        "tool_trace": [
+          {
+            "tool": "read_file",
+            "args_bytes": 104,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace/records.py"
+              }
+            },
+            "result_bytes": 382,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 117,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 319,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 828,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace/records.py"
+              }
+            },
+            "result_bytes": 1127,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 131,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 254,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 468,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 149,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/hermes-home/cache/delegation/live/deleg_7c472bce/task-0.log"
+      },
+      "classifier": {
+        "verdict": "simple",
+        "suggested_effort": "low",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 7050,
+        "child_session_id": "20261009_162842_bcee50"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_162842_bcee50",
+            "verdict": "simple",
+            "suggested_effort": "low",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 7050,
+            "repeated_mutation_targets": null,
+            "usage": {
+              "prompt_tokens": 32308,
+              "completion_tokens": 975,
+              "total_tokens": 33283,
+              "requests": 5,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 1,
+                "created_at": "2026-10-09T15:28:47.697662+00:00",
+                "session_id": "20261009_162842_bcee50",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+                "command": "python3 -m pytest -q",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.00s"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+              "session_id": "20261009_162842_bcee50",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 32308,
+            "completion_tokens": 975,
+            "total_tokens": 33283,
+            "requests": 5,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-9daa56606492acd4",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 39,
+            "session_id": "20261009_162842_bcee50",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b049fc0d0ca65329",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 40,
+            "session_id": "20261009_162842_bcee50",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-8495c7fac1799281",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 172,
+            "session_id": "20261009_162842_bcee50",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-9763709de367bd4b",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 607,
+            "session_id": "20261009_162842_bcee50",
+            "verification_evidence_status": "passed"
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-9f0a5f2bd538ef0d",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 50,
+            "session_id": "20261009_162842_bcee50",
+            "verification_evidence_status": null
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-8495c7fac1799281",
+            "tool": "patch",
+            "changed": [
+              "records.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_162842_bcee50",
+        "verification_ledger_rows_observed": 1
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "records.py": "19e9954a3a6ac203d13d7b72481f580a03918b490cb8fe2f658480ce5f25394f"
+      },
+      "public_test_final_sha256": "c60abc0b5fa65adea6bfcbd0aac93f3e184550ffa04b0218e80ec74009df2e03",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    },
+    {
+      "id": "ledger-batches",
+      "status": "completed",
+      "public_test_initial_sha256": "2028c5849999ddf79a54e1feca8c31dd1733c2d0adf014a9bd58fcc0077eafd5",
+      "initial_source_hashes": {
+        "ledger.py": "17ff3091df3da5aebe12dd8021059ee57b7fe385621207e234991b39dad3d9e3",
+        "report.py": "b3bc197e4f0082ebd7601a86fc554f31237258d2679bc59de375fc29f5c6cef1"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 89,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 16, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 90,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 14.788,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "Both functions repaired and validated.\n\n**ledger.py — `apply_batch(state, events)`**: buffers changes into copies of `balances` and a `new_seen` set during iteration, so any failure (ValueError on overdraft or an exception raised while consuming the iterable) leaves the caller's state untouched and propagates the original error. On success it commits the new containers into the same `state` dict and returns it.\n\nFixes vs. original:\n- Skipped events already seen (previously batch-internal repeats double-applied).\n- Raises `ValueError('insufficient funds')` when an applied event would make a balance negative.\n- Atomic failure semantics (previously mutated state incrementally).\n\n**report.py — `summarize(state)`**: returns `sorted((account, balance))` tuples, omits zero balances, reads state without modifying it.\n\n**Validation**:\n- `python3 -m pytest -q` → 1 passed.\n- Extra edge checks all pass: exception mid-iteration propagates original error with state unchanged; insufficient-funds raises with state unchanged; batch-internal duplicate ids ignored despite differing fields; unknown accounts start at zero; balance hitting exactly zero is allowed and omitted from `summarize`; `apply_batch` returns the same `state` object.\n\nFiles modified: `ledger.py`, `report.py`. `test_public.py` untouched.",
+        "api_calls": 6,
+        "duration_seconds": 12.21,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 43772,
+          "output": 2163
+        },
+        "tool_trace": [
+          {
+            "tool": "terminal",
+            "args_bytes": 126,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 457,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 105,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+              }
+            },
+            "result_bytes": 362,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 105,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+              }
+            },
+            "result_bytes": 178,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 110,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/test_public.py"
+              }
+            },
+            "result_bytes": 496,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 110,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/pyproject.toml"
+              }
+            },
+            "result_bytes": 172,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 1082,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+              }
+            },
+            "result_bytes": 1372,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 366,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+              }
+            },
+            "result_bytes": 732,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 133,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 254,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 1559,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 65,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/hermes-home/cache/delegation/live/deleg_9f08b70e/task-0.log"
+      },
+      "classifier": {
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 12210,
+        "child_session_id": "20261009_162853_cc6a2f"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_162853_cc6a2f",
+            "verdict": "complex",
+            "suggested_effort": "high",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 12210,
+            "repeated_mutation_targets": null,
+            "usage": {
+              "prompt_tokens": 43772,
+              "completion_tokens": 2163,
+              "total_tokens": 45935,
+              "requests": 6,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 1,
+                "created_at": "2026-10-09T15:29:00.823752+00:00",
+                "session_id": "20261009_162853_cc6a2f",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+                "command": "python3 -m pytest -q",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+              "session_id": "20261009_162853_cc6a2f",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 43772,
+            "completion_tokens": 2163,
+            "total_tokens": 45935,
+            "requests": 6,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-aacb9044e142839d",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 63,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b18db1958c4c7dce",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 6,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b74abee3eb4e9f41",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 10,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 208,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-98af9ecf2a419d97",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 244,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-8ffa280ee35843e1",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 617,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": "passed"
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-85752d235ba307cf",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 103,
+            "session_id": "20261009_162853_cc6a2f",
+            "verification_evidence_status": null
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+            "tool": "patch",
+            "changed": [
+              "ledger.py",
+              "report.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_162853_cc6a2f",
+        "verification_ledger_rows_observed": 1
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "ledger.py": "65eb3afed58e584d92002355edff36e2482dacb4cee1901311bf348961e80c5c",
+        "report.py": "8bb4a0780e91078b8e50c88cf8957209b9689240cf2eb3ed6879b355a8bb726d"
+      },
+      "public_test_final_sha256": "2028c5849999ddf79a54e1feca8c31dd1733c2d0adf014a9bd58fcc0077eafd5",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    },
+    {
+      "id": "suffix-removal",
+      "status": "completed",
+      "public_test_initial_sha256": "f227e4c8613b8b96d36d792db0bbbe70762b3cf1d07ba246c8e25d81d5e42a0d",
+      "initial_source_hashes": {
+        "suffix.py": "55023214e9a867cde0310bb667bc13479eebeafd08348338df5711ab79e0b6db"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 2, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 89,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\nAssertionError: ('abc', 'abcd', 'abc')\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 113,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 8.028,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "Fixed `remove_suffix` in `suffix.py`: the buggy `text.rstrip(suffix)` (which strips any trailing characters from the suffix set, repeatedly) was replaced with an exact one-shot literal suffix check — `text.endswith(suffix)` with `suffix` nonempty, slicing off exactly `len(suffix)` chars; otherwise the text is returned unchanged. Signature preserved, stdlib only.\n\nValidation: `python3 -m pytest -q` → **1 passed**. `test_public.py` untouched; no other files modified.",
+        "api_calls": 4,
+        "duration_seconds": 5.22,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 24127,
+          "output": 558
+        },
+        "tool_trace": [
+          {
+            "tool": "read_file",
+            "args_bytes": 105,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace/suffix.py"
+              }
+            },
+            "result_bytes": 177,
+            "status": "ok"
+          },
+          {
+            "tool": "search_files",
+            "args_bytes": 130,
+            "input_summary": {
+              "argument_keys": [
+                "path",
+                "pattern",
+                "target"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace"
+              }
+            },
+            "result_bytes": 330,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 276,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace/suffix.py"
+              }
+            },
+            "result_bytes": 697,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 133,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 254,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/hermes-home/cache/delegation/live/deleg_7872565e/task-0.log"
+      },
+      "classifier": {
+        "verdict": "simple",
+        "suggested_effort": "low",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 5220,
+        "child_session_id": "20261009_162907_4d062e"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_162907_4d062e",
+            "verdict": "simple",
+            "suggested_effort": "low",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 5220,
+            "repeated_mutation_targets": null,
+            "usage": {
+              "prompt_tokens": 24127,
+              "completion_tokens": 558,
+              "total_tokens": 24685,
+              "requests": 4,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 1,
+                "created_at": "2026-10-09T15:29:12.270482+00:00",
+                "session_id": "20261009_162907_4d062e",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace",
+                "command": "python3 -m pytest -q",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/suffix-removal/workspace",
+              "session_id": "20261009_162907_4d062e",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 24127,
+            "completion_tokens": 558,
+            "total_tokens": 24685,
+            "requests": 4,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-932c641c7b897651",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 23,
+            "session_id": "20261009_162907_4d062e",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b9c519be82f29d19",
+            "tool": "search_files",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 41,
+            "session_id": "20261009_162907_4d062e",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-8d5f46f6228197ea",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 200,
+            "session_id": "20261009_162907_4d062e",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-bdf5161c722e87c8",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 619,
+            "session_id": "20261009_162907_4d062e",
+            "verification_evidence_status": "passed"
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-8d5f46f6228197ea",
+            "tool": "patch",
+            "changed": [
+              "suffix.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_162907_4d062e",
+        "verification_ledger_rows_observed": 1
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "suffix.py": "833a908277906c1897b47fe444f8a8c772d04ded249b48d09f6f886cd84d3442"
+      },
+      "public_test_final_sha256": "f227e4c8613b8b96d36d792db0bbbe70762b3cf1d07ba246c8e25d81d5e42a0d",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    },
+    {
+      "id": "memo-flight",
+      "status": "completed",
+      "public_test_initial_sha256": "867428d746a9195ec4739346d488f2e2c035eb9f3fb01e3629222bd39474d81a",
+      "initial_source_hashes": {
+        "memo.py": "e9ebbd75a4a380e20da85eec2d02fe3a84da52d2b59c83cfa26980a501da0ac3"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 9, in <module>\n  File \"/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py\", line 8, in get\n    value = factory()\n            ^^^^^^^^^\n  File \"<string>\", line 8, in unexpected\nAssertionError: cached None recomputed\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 312,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 55, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 90,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 151.131,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "Fixed. `python3 -m pytest -q` passes (1 passed).\n\n**Change** — `memo.py`: rewrote `Memo.get` to be thread-safe:\n- A single `threading.Lock` guards `self.values` and a new `_in_progress` dict mapping key → `threading.Event`.\n- Caller under lock: cached → return value (identity preserved, `None` handled via `key in values` instead of the original `value is None` check, which was the None-caching bug).\n- If another thread is computing that key → release lock and `event.wait()`, then loop and read the cached value (or re-attempt if it failed).\n- Otherwise the caller claims the key: runs the factory **outside** any lock, then publishes the value and sets the event; on any exception (`BaseException`) it removes the in-progress entry and sets the event so waiters wake up and a later attempt can run — nothing is cached.\n- Per-key events + factory running outside the lock means a blocked factory on one key never blocks other keys.\n\n**Verification** — beyond the public test, I ran a scratch harness (since deleted) covering: 8 threads racing one factory (one run, shared result, `None` cached), exception propagating to runner and waiter with the key left unset for retry, a blocked key not stalling another key, 200 randomized flaky-factory rounds, and a 70-thread/7-key stress run — all passed.\n\nNo other files touched; `test_public.py` and `pyproject.toml` untouched.",
+        "api_calls": 11,
+        "duration_seconds": 147.97,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 190919,
+          "output": 4164
+        },
+        "tool_trace": [
+          {
+            "tool": "read_file",
+            "args_bytes": 100,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py"
+              }
+            },
+            "result_bytes": 386,
+            "status": "ok"
+          },
+          {
+            "tool": "search_files",
+            "args_bytes": 127,
+            "input_summary": {
+              "argument_keys": [
+                "path",
+                "pattern",
+                "target"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace"
+              }
+            },
+            "result_bytes": 319,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 107,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/test_public.py"
+              }
+            },
+            "result_bytes": 500,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 107,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/pyproject.toml"
+              }
+            },
+            "result_bytes": 172,
+            "status": "ok"
+          },
+          {
+            "tool": "write_file",
+            "args_bytes": 1174,
+            "input_summary": {
+              "argument_keys": [
+                "content",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py"
+              }
+            },
+            "result_bytes": 324,
+            "status": "ok"
+          },
+          {
+            "tool": "write_file",
+            "args_bytes": 2731,
+            "input_summary": {
+              "argument_keys": [
+                "content",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+              }
+            },
+            "result_bytes": 368,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 570,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+              }
+            },
+            "result_bytes": 830,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 179,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "timeout"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 52052,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 1583,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+              }
+            },
+            "result_bytes": 858,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 826,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+              }
+            },
+            "result_bytes": 1313,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 179,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "timeout"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 273,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 173,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "timeout"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 254,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/hermes-home/cache/delegation/live/deleg_938f7c3f/task-0.log"
+      },
+      "classifier": {
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 147970,
+        "child_session_id": "20261009_162916_5dcac4"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_162916_5dcac4",
+            "verdict": "complex",
+            "suggested_effort": "high",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 147970,
+            "repeated_mutation_targets": [
+              "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+            ],
+            "usage": {
+              "prompt_tokens": 190919,
+              "completion_tokens": 4164,
+              "total_tokens": 195083,
+              "requests": 11,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 2,
+                "created_at": "2026-10-09T15:31:41.767004+00:00",
+                "session_id": "20261009_162916_5dcac4",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+                "command": "cd /tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace && rm _scratch_concurrency_check.py && python3 -m pytest -q",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+              "session_id": "20261009_162916_5dcac4",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 190919,
+            "completion_tokens": 4164,
+            "total_tokens": 195083,
+            "requests": 11,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-a01eb87f86a14c03",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 35,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-af9f3f3607c85200",
+            "tool": "search_files",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 55,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b8874f6d932cbe5d",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 3,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+            "tool": "write_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 163,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+            "tool": "write_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 92,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 129,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-ae8b70b3679158a3",
+            "tool": "terminal",
+            "status": "error",
+            "error_type": "tool_error",
+            "error_message": "exit 124",
+            "duration_ms": 120155,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 135,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 127,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-babb40e464059d02",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 808,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": "passed"
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 616,
+            "session_id": "20261009_162916_5dcac4",
+            "verification_evidence_status": "passed"
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+            "tool": "write_file",
+            "changed": [
+              "memo.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+            "tool": "write_file",
+            "changed": [
+              "_scratch_concurrency_check.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+            "tool": "patch",
+            "changed": [
+              "_scratch_concurrency_check.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+            "tool": "patch",
+            "changed": [
+              "_scratch_concurrency_check.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+            "tool": "patch",
+            "changed": [
+              "_scratch_concurrency_check.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+            "tool": "terminal",
+            "changed": [
+              "_scratch_concurrency_check.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_162916_5dcac4",
+        "verification_ledger_rows_observed": 2
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "memo.py": "8a6955bb24adfe5c25638eda0f8cf7e5ecc94f38aec70a317d4bebe18b4c2d42"
+      },
+      "public_test_final_sha256": "867428d746a9195ec4739346d488f2e2c035eb9f3fb01e3629222bd39474d81a",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    },
+    {
+      "id": "page-count",
+      "status": "completed",
+      "public_test_initial_sha256": "7c80e870c7b711419acfb7d167e3f34929b3c173794c6c657e80ed995135afbe",
+      "initial_source_hashes": {
+        "pages.py": "85925d6d8ce1251d60ae2fc8a08f6a329109e91c8ed7dac92451eca5810f386d"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 2, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 89,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 5, in <module>\nAssertionError: (1, 8)\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 97,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 9.981,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "Fixed and verified.\n\n- **Change**: `pages.py` — `page_count` now returns `-(-total // size)` (integer ceiling division) instead of the truncating `total // size`. This gives exact results for arbitrarily large integers, returns 0 for `total == 0`, and rounds up for partial final pages.\n- **Validation**: `python3 -m pytest -q` → 1 passed. Additional checks confirmed correctness against `math.ceil` for small values and exact big-integer behavior (e.g., `10**30 + 1`, `2**200`).\n- `test_public.py` untouched; no other files created or read.",
+        "api_calls": 5,
+        "duration_seconds": 7.02,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 30922,
+          "output": 941
+        },
+        "tool_trace": [
+          {
+            "tool": "read_file",
+            "args_bytes": 100,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace/pages.py"
+              }
+            },
+            "result_bytes": 167,
+            "status": "ok"
+          },
+          {
+            "tool": "search_files",
+            "args_bytes": 126,
+            "input_summary": {
+              "argument_keys": [
+                "path",
+                "pattern",
+                "target"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace"
+              }
+            },
+            "result_bytes": 317,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 106,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace/test_public.py"
+              }
+            },
+            "result_bytes": 276,
+            "status": "ok"
+          },
+          {
+            "tool": "patch",
+            "args_bytes": 439,
+            "input_summary": {
+              "argument_keys": [
+                "new_string",
+                "old_string",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace/pages.py"
+              }
+            },
+            "result_bytes": 782,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 473,
+            "input_summary": {
+              "argument_keys": [
+                "command"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 271,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/hermes-home/cache/delegation/live/deleg_03ff351f/task-0.log"
+      },
+      "classifier": {
+        "verdict": "simple",
+        "suggested_effort": "low",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 7020,
+        "child_session_id": "20261009_163147_3f7e93"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_163147_3f7e93",
+            "verdict": "simple",
+            "suggested_effort": "low",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 7020,
+            "repeated_mutation_targets": null,
+            "usage": {
+              "prompt_tokens": 30922,
+              "completion_tokens": 941,
+              "total_tokens": 31863,
+              "requests": 5,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 1,
+                "created_at": "2026-10-09T15:31:53.311439+00:00",
+                "session_id": "20261009_163147_3f7e93",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace",
+                "command": "cd /tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace && python3 -m pytest -q && python3 -c \"\nfrom pages import page_count\nimport math\nassert page_count(10**30 + 1, 10**30) == 2\nassert page_count(10**100, 3) == (10**100 + 2) // 3\nassert page_count(2**200, 7) == -(-(2**200) // 7)\nfor t in range(0, 500):\n    for s in (1, 2, 3, 7, 10, 97):\n        assert page_count(t, s) == math.ceil(t / s)\nprint('extra checks OK')\n\"",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.01s\nextra checks OK"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/page-count/workspace",
+              "session_id": "20261009_163147_3f7e93",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 30922,
+            "completion_tokens": 941,
+            "total_tokens": 31863,
+            "requests": 5,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-aee99e48d08c02db",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 24,
+            "session_id": "20261009_163147_3f7e93",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-811e35fecb8c94d1",
+            "tool": "search_files",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 44,
+            "session_id": "20261009_163147_3f7e93",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-91ce44d51e95ac85",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 3,
+            "session_id": "20261009_163147_3f7e93",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-809c4995bd7fbd6a",
+            "tool": "patch",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 174,
+            "session_id": "20261009_163147_3f7e93",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-aaf0897f39389d0f",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 619,
+            "session_id": "20261009_163147_3f7e93",
+            "verification_evidence_status": "passed"
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-809c4995bd7fbd6a",
+            "tool": "patch",
+            "changed": [
+              "pages.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_163147_3f7e93",
+        "verification_ledger_rows_observed": 1
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "pages.py": "d0290a7fe08711a1e6d71c2bd7a7df0b8b4c3f02881be1eb691ab6e8d182f4f6"
+      },
+      "public_test_final_sha256": "7c80e870c7b711419acfb7d167e3f34929b3c173794c6c657e80ed995135afbe",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    },
+    {
+      "id": "catalog-csv",
+      "status": "completed",
+      "public_test_initial_sha256": "a572adc6e19743b14c5a28ff0cbe9659f4f854763c59ac09e3450acf7ba4b3af",
+      "initial_source_hashes": {
+        "catalog.py": "d981f6ac86cfa5d0696346b1b644abb6868f79751d0ec871ef3a1b235f09b438",
+        "catalog_cli.py": "1d3c5bf3bdb48bc17544ef5a032786fae2cd27fd690c02e99622ea203d1a0055"
+      },
+      "baseline": {
+        "public": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.032,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 89,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": true,
+          "expected_failure": true
+        },
+        "heldout": {
+          "returncode": 1,
+          "timed_out": false,
+          "duration_seconds": 0.064,
+          "stdout": "",
+          "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 13, in <module>\n  File \"/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog.py\", line 5, in read_catalog\n    name, quantity = line.strip().split(',')\n    ^^^^^^^^^^^^^^\nValueError: too many values to unpack (expected 2)\n",
+          "stdout_bytes": 0,
+          "stderr_bytes": 316,
+          "output_truncated": false,
+          "passed": false,
+          "assertion_failure": false,
+          "expected_failure": true
+        },
+        "proven_broken": true
+      },
+      "worker": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 28.062,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      },
+      "native": {
+        "task_index": 0,
+        "status": "completed",
+        "summary": "All repairs complete and verified.\n\n**Changes:**\n- **`catalog.py`** — rewrote `read_catalog(stream)` to use `csv.reader`: validates the exact `name,quantity` header (empty input or wrong header → `ValueError('invalid catalog')`), skips blank rows, requires exactly 2 fields per row, strips and rejects empty names (quoted commas/newlines preserved), accepts only nonempty ASCII-digit quantities, aggregates totals per stripped name (zeros retained), and maps `csv.Error` (malformed CSV) to the same ValueError.\n- **`catalog_cli.py`** — `main(argv=None)` defaults to `sys.argv[1:]`; wrong arg count → stderr `usage: catalog_cli.py PATH\\n`, return 2, no stdout. Opens the file `encoding='utf-8', newline=''`; `ValueError` → stderr `invalid catalog\\n`, return 2, no stdout. Success prints `json.dumps(data, sort_keys=True, ensure_ascii=False)` + newline and returns 0. Guard is `sys.exit(main())`.\n\n**Verification:**\n- `python3 -m pytest -q` → 1 passed (test_public.py untouched).\n- Edge-case script: valid (quoted commas/newlines, blank rows, whitespace stripping, zero totals, repeated names, `0005`→5, header-only→`{}`) and invalid (empty input, wrong header case/order, bad width, empty/whitespace name, empty/`-1`/`1.5`/non-ASCII-digit quantity, unclosed quote) all behave as specified.\n- CLI checks: exit codes, exact stderr strings, empty stdout on failures, sorted/non-ASCII JSON output confirmed.\n\nFile-open errors (e.g. missing path) propagate as `FileNotFoundError`, per the out-of-scope clause. Standard library only; no test files modified.",
+        "api_calls": 9,
+        "duration_seconds": 24.59,
+        "model": "qwen3.8-flash-next",
+        "exit_reason": "completed",
+        "truncated": false,
+        "tokens": {
+          "input": 73910,
+          "output": 4594
+        },
+        "tool_trace": [
+          {
+            "tool": "terminal",
+            "args_bytes": 116,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 378,
+            "status": "ok"
+          },
+          {
+            "tool": "search_files",
+            "args_bytes": 130,
+            "input_summary": {
+              "argument_keys": [
+                "path",
+                "pattern",
+                "target"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace"
+              }
+            },
+            "result_bytes": 322,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 103,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog.py"
+              }
+            },
+            "result_bytes": 322,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 107,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog_cli.py"
+              }
+            },
+            "result_bytes": 430,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 107,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/test_public.py"
+              }
+            },
+            "result_bytes": 383,
+            "status": "ok"
+          },
+          {
+            "tool": "read_file",
+            "args_bytes": 107,
+            "input_summary": {
+              "argument_keys": [
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/pyproject.toml"
+              }
+            },
+            "result_bytes": 172,
+            "status": "ok"
+          },
+          {
+            "tool": "write_file",
+            "args_bytes": 1052,
+            "input_summary": {
+              "argument_keys": [
+                "content",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog.py"
+              }
+            },
+            "result_bytes": 329,
+            "status": "ok"
+          },
+          {
+            "tool": "write_file",
+            "args_bytes": 704,
+            "input_summary": {
+              "argument_keys": [
+                "content",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog_cli.py"
+              }
+            },
+            "result_bytes": 337,
+            "status": "ok"
+          },
+          {
+            "tool": "write_file",
+            "args_bytes": 1023,
+            "input_summary": {
+              "argument_keys": [
+                "content",
+                "path"
+              ],
+              "targets": {
+                "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog.py"
+              }
+            },
+            "result_bytes": 329,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 130,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 254,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 1749,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 71,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 1604,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 294,
+            "status": "ok"
+          },
+          {
+            "tool": "terminal",
+            "args_bytes": 1914,
+            "input_summary": {
+              "argument_keys": [
+                "command",
+                "workdir"
+              ],
+              "targets": {}
+            },
+            "result_bytes": 701,
+            "status": "ok"
+          }
+        ],
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/hermes-home/cache/delegation/live/deleg_349fd6ae/task-0.log"
+      },
+      "classifier": {
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "clamped_effort": "unknown",
+        "supported_efforts": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 24590,
+        "child_session_id": "20261009_163157_3ca5f0"
+      },
+      "plugin_state": {
+        "mode": "shadow",
+        "children": [
+          {
+            "child_session_id": "20261009_163157_3ca5f0",
+            "verdict": "complex",
+            "suggested_effort": "high",
+            "supported_efforts": "unknown",
+            "clamped_effort": "unknown",
+            "child_reasoning_config": {
+              "enabled": true,
+              "effort": "xhigh"
+            },
+            "child_model": "qwen3.8-flash-next",
+            "child_provider": "lilith",
+            "outcome_status": "completed",
+            "latency_ms": 24590,
+            "repeated_mutation_targets": [
+              "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace/catalog.py"
+            ],
+            "usage": {
+              "prompt_tokens": 73910,
+              "completion_tokens": 4594,
+              "total_tokens": 78504,
+              "requests": 9,
+              "cost_usd": null,
+              "cost_status": "unknown",
+              "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+            },
+            "verification": {
+              "status": "passed",
+              "evidence": {
+                "id": 1,
+                "created_at": "2026-10-09T15:32:09.676611+00:00",
+                "session_id": "20261009_163157_3ca5f0",
+                "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace",
+                "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace",
+                "command": "python3 -m pytest -q",
+                "canonical_command": "pytest",
+                "kind": "test",
+                "scope": "full",
+                "status": "passed",
+                "exit_code": 0,
+                "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+              },
+              "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/catalog-csv/workspace",
+              "session_id": "20261009_163157_3ca5f0",
+              "changed_paths": []
+            },
+            "outcome_observed": true,
+            "prompt_tokens": 73910,
+            "completion_tokens": 4594,
+            "total_tokens": 78504,
+            "requests": 9,
+            "cost_usd": null,
+            "cost_status": "unknown",
+            "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+          }
+        ],
+        "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+      },
+      "telemetry": {
+        "tool_events": [
+          {
+            "tool_call_id": "chatcmpl-tool-9ce76fa96a4b77ee",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 62,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a79b871bd36df411",
+            "tool": "search_files",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 24,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-80d191664ae4da64",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 5,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-902462072115a158",
+            "tool": "read_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 9,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-aaa50901e6610059",
+            "tool": "write_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 177,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a9b3e696333c7921",
+            "tool": "write_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 215,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a2aeefb26219dfa3",
+            "tool": "write_file",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 116,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-80f1aa5c241a4a56",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 623,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": "passed"
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-9d544eaa1e7477a4",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 241,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-91b3d8bde31ba368",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 622,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-97157b384333b3b7",
+            "tool": "terminal",
+            "status": "ok",
+            "error_type": null,
+            "error_message": null,
+            "duration_ms": 628,
+            "session_id": "20261009_163157_3ca5f0",
+            "verification_evidence_status": null
+          }
+        ],
+        "source_changes": [
+          {
+            "tool_call_id": "chatcmpl-tool-aaa50901e6610059",
+            "tool": "write_file",
+            "changed": [
+              "catalog.py",
+              "catalog_cli.py"
+            ]
+          },
+          {
+            "tool_call_id": "chatcmpl-tool-a2aeefb26219dfa3",
+            "tool": "write_file",
+            "changed": [
+              "catalog.py"
+            ]
+          }
+        ],
+        "verified_corrective_revisions": 0,
+        "corrective_revision_events": [],
+        "child_session_id": "20261009_163157_3ca5f0",
+        "verification_ledger_rows_observed": 1
+      },
+      "evaluable": true,
+      "final_source_hashes": {
+        "catalog.py": "4defa7ece6245f6a199d1537914834eaa94bae6e4e0a27da08a9b0e4be19e642",
+        "catalog_cli.py": "cf8cd5966d6744ad0d8f6bd36d2cf1e7c72bb88992c8a5388c2c66b7a49c7a39"
+      },
+      "public_test_final_sha256": "a572adc6e19743b14c5a28ff0cbe9659f4f854763c59ac09e3450acf7ba4b3af",
+      "public_test_unchanged": true,
+      "public": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.032,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "heldout": {
+        "returncode": 0,
+        "timed_out": false,
+        "duration_seconds": 0.164,
+        "stdout": "",
+        "stderr": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "output_truncated": false,
+        "passed": true,
+        "assertion_failure": false,
+        "expected_failure": false
+      },
+      "correct": true
+    }
+  ],
+  "aggregate": {
+    "attempted": 6,
+    "evaluable": 6,
+    "infra_errors": 0,
+    "expected_scored_observations": 6,
+    "scored_observations": 6,
+    "evaluation_complete": true,
+    "corrective_cycles": "observed",
+    "by_classifier_label": {
+      "simple": {
+        "n": 3,
+        "correct": 3,
+        "corrective_cycles": 0,
+        "corrective_observations": 3,
+        "cost_available": 0,
+        "correctness_rate": 1.0,
+        "corrective_cycles_observed": true,
+        "latency_seconds_observations": 3,
+        "latency_seconds_mean": 6.43,
+        "tokens_observations": 3,
+        "tokens_mean": 29943.666666666668
+      },
+      "complex": {
+        "n": 3,
+        "correct": 3,
+        "corrective_cycles": 0,
+        "corrective_observations": 3,
+        "cost_available": 0,
+        "correctness_rate": 1.0,
+        "corrective_cycles_observed": true,
+        "latency_seconds_observations": 3,
+        "latency_seconds_mean": 61.59,
+        "tokens_observations": 3,
+        "tokens_mean": 106507.33333333333
+      }
+    },
+    "automatic_routing": "NOT_QUALIFIED",
+    "design": "N=6 purpose-made cases; observational explicit-xhigh only; no lower-effort causal claim",
+    "cost_qualification": "failed: unknown/estimated local cost is not actual billing"
+  }
+}

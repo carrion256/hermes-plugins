@@ -1,0 +1,223 @@
+{
+  "native": {
+    "task_index": 0,
+    "status": "completed",
+    "summary": "Both functions repaired and validated.\n\n**ledger.py — `apply_batch(state, events)`**: buffers changes into copies of `balances` and a `new_seen` set during iteration, so any failure (ValueError on overdraft or an exception raised while consuming the iterable) leaves the caller's state untouched and propagates the original error. On success it commits the new containers into the same `state` dict and returns it.\n\nFixes vs. original:\n- Skipped events already seen (previously batch-internal repeats double-applied).\n- Raises `ValueError('insufficient funds')` when an applied event would make a balance negative.\n- Atomic failure semantics (previously mutated state incrementally).\n\n**report.py — `summarize(state)`**: returns `sorted((account, balance))` tuples, omits zero balances, reads state without modifying it.\n\n**Validation**:\n- `python3 -m pytest -q` → 1 passed.\n- Extra edge checks all pass: exception mid-iteration propagates original error with state unchanged; insufficient-funds raises with state unchanged; batch-internal duplicate ids ignored despite differing fields; unknown accounts start at zero; balance hitting exactly zero is allowed and omitted from `summarize`; `apply_batch` returns the same `state` object.\n\nFiles modified: `ledger.py`, `report.py`. `test_public.py` untouched.",
+    "api_calls": 6,
+    "duration_seconds": 12.21,
+    "model": "qwen3.8-flash-next",
+    "exit_reason": "completed",
+    "truncated": false,
+    "tokens": {
+      "input": 43772,
+      "output": 2163
+    },
+    "tool_trace": [
+      {
+        "tool": "terminal",
+        "args_bytes": 126,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 457,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 105,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+          }
+        },
+        "result_bytes": 362,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 105,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+          }
+        },
+        "result_bytes": 178,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 110,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/test_public.py"
+          }
+        },
+        "result_bytes": 496,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 110,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/pyproject.toml"
+          }
+        },
+        "result_bytes": 172,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 1082,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+          }
+        },
+        "result_bytes": 1372,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 366,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+          }
+        },
+        "result_bytes": 732,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 133,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 254,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 1559,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 65,
+        "status": "ok"
+      }
+    ],
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/hermes-home/cache/delegation/live/deleg_9f08b70e/task-0.log"
+  },
+  "status": "completed",
+  "classifier": {
+    "verdict": "complex",
+    "suggested_effort": "high",
+    "clamped_effort": "unknown",
+    "supported_efforts": "unknown",
+    "child_reasoning_config": {
+      "enabled": true,
+      "effort": "xhigh"
+    },
+    "child_model": "qwen3.8-flash-next",
+    "child_provider": "lilith",
+    "outcome_status": "completed",
+    "latency_ms": 12210,
+    "child_session_id": "20261009_162853_cc6a2f"
+  },
+  "plugin_state": {
+    "mode": "shadow",
+    "children": [
+      {
+        "child_session_id": "20261009_162853_cc6a2f",
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "supported_efforts": "unknown",
+        "clamped_effort": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 12210,
+        "repeated_mutation_targets": null,
+        "usage": {
+          "prompt_tokens": 43772,
+          "completion_tokens": 2163,
+          "total_tokens": 45935,
+          "requests": 6,
+          "cost_usd": null,
+          "cost_status": "unknown",
+          "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+        },
+        "verification": {
+          "status": "passed",
+          "evidence": {
+            "id": 1,
+            "created_at": "2026-10-09T15:29:00.823752+00:00",
+            "session_id": "20261009_162853_cc6a2f",
+            "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+            "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+            "command": "python3 -m pytest -q",
+            "canonical_command": "pytest",
+            "kind": "test",
+            "scope": "full",
+            "status": "passed",
+            "exit_code": 0,
+            "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+          },
+          "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+          "session_id": "20261009_162853_cc6a2f",
+          "changed_paths": []
+        },
+        "outcome_observed": true,
+        "prompt_tokens": 43772,
+        "completion_tokens": 2163,
+        "total_tokens": 45935,
+        "requests": 6,
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+      }
+    ],
+    "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+  }
+}

@@ -1,11 +1,11 @@
 name: auto-review-classifier
-version: 0.1.0
-description: "Screens every tool call through the self-hosted classifier before execution; deny (or fall through to approval) on risky verdicts. Fail-open on classifier errors."
+version: 0.2.0
+description: "Advisory risk screen using Hermes's native block/approve directives; mutating process actions are screened. Classifier outages remain fail-open."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
-provides_middleware:
-  - tool_execution
+provides_hooks:
+  - pre_tool_call
 config_schema:
   endpoint:
     type: str
@@ -18,4 +18,4 @@ config_schema:
   policy:
     type: str
     default: "ask"
-    description: "'ask' = fall through to normal approval; 'deny' = short-circuit deny on risky verdicts."
+    description: "'ask' = require native human approval; 'deny' = block a risky call before execution."

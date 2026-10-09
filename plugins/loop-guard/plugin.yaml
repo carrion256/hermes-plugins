@@ -1,22 +1,26 @@
 name: loop-guard
-version: 0.1.0
-description: "Pathological loop detectors: identical tool-call streaks and repeated-answer loops get corrective steers."
+version: 0.2.0
+description: "Result-aware tool loop blocks and next-turn answer reminders; never injects another session's task."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_hooks:
+  - pre_tool_call
   - post_tool_call
-  - post_api_request
+  - post_llm_call
+  - pre_llm_call
+  - on_session_reset
+  - on_session_finalize
 config_schema:
   tool_call_streak:
     type: int
     default: 5
-    description: "Consecutive identical tool-call batches before a corrective steer fires."
+    description: "Identical calls with identical results before blocking the next retry. Read-only polling is exempt."
   answer_repetition:
     type: int
     default: 3
-    description: "Consecutive near-identical text answers (no tool call) before a corrective steer fires."
+    description: "Repeated final answers before a targeted reminder on the next genuine turn."
   redirect_cap:
     type: int
     default: 2
-    description: "Max corrective steers per session per detector."
+    description: "Maximum interventions per detector and live agent; zero disables interventions."

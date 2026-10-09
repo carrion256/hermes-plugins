@@ -1,0 +1,135 @@
+{
+  "tool_events": [
+    {
+      "tool_call_id": "chatcmpl-tool-9ce76fa96a4b77ee",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 62,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a79b871bd36df411",
+      "tool": "search_files",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 24,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-80d191664ae4da64",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 5,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-902462072115a158",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 9,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-aaa50901e6610059",
+      "tool": "write_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 177,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a9b3e696333c7921",
+      "tool": "write_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 215,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a2aeefb26219dfa3",
+      "tool": "write_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 116,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-80f1aa5c241a4a56",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 623,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": "passed"
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-9d544eaa1e7477a4",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 241,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-91b3d8bde31ba368",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 622,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-97157b384333b3b7",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 628,
+      "session_id": "20261009_163157_3ca5f0",
+      "verification_evidence_status": null
+    }
+  ],
+  "source_changes": [
+    {
+      "tool_call_id": "chatcmpl-tool-aaa50901e6610059",
+      "tool": "write_file",
+      "changed": [
+        "catalog.py",
+        "catalog_cli.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a2aeefb26219dfa3",
+      "tool": "write_file",
+      "changed": [
+        "catalog.py"
+      ]
+    }
+  ],
+  "verified_corrective_revisions": 0,
+  "corrective_revision_events": [],
+  "child_session_id": "20261009_163157_3ca5f0",
+  "verification_ledger_rows_observed": 1
+}

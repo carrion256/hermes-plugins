@@ -1,13 +1,16 @@
 name: keyword-steering
-version: 0.1.0
-description: "Magic-keyword prompt steering: config-driven keyword table injected as context when the user message triggers on a keyword."
+version: 0.2.0
+description: "Magic-keyword prompt steering: config-driven keyword table injected once per user turn via pre_llm_call; matches genuine prose only (code, quotes, identifiers excluded)."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_hooks:
   - pre_llm_call
+  - on_session_reset
+  - on_session_finalize
+  - agent_loop_stopped
 config_schema:
   keywords:
     type: dict
     default: {}
-    description: "Mapping of trigger keyword -> steering text injected as context when the user message contains it (case-insensitive, whole-word)."
+    description: "Mapping of trigger keyword -> steering text injected as context once per user turn when the message mentions the keyword (case-insensitive, whole-word; fenced code, inline code, quoted text, and identifier/path contexts are ignored)."

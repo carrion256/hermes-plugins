@@ -1,0 +1,165 @@
+{
+  "native": {
+    "task_index": 0,
+    "status": "completed",
+    "summary": "Fixed `parse_records` in `records.py`:\n\n- **Changes**: Skip whitespace-only lines (via `str.strip()` check) instead of only empty lines; raise `ValueError(\"line N: expected JSON object\")` on malformed JSON or non-dict decode (e.g., `null`, arrays, scalars), where N is the original 1-based physical line number. `text.splitlines()` handles LF/CRLF natively.\n- **Verification**: `python3 -m pytest -q` → 1 passed. Manual spot checks confirmed CRLF handling, blank/whitespace skipping, ordered dict output, and exact error message/line numbering for both bad-JSON and non-dict cases.\n- **Files modified**: `records.py` only. `test_public.py` untouched.",
+    "api_calls": 5,
+    "duration_seconds": 7.05,
+    "model": "qwen3.8-flash-next",
+    "exit_reason": "completed",
+    "truncated": false,
+    "tokens": {
+      "input": 32308,
+      "output": 975
+    },
+    "tool_trace": [
+      {
+        "tool": "read_file",
+        "args_bytes": 104,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace/records.py"
+          }
+        },
+        "result_bytes": 382,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 117,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 319,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 828,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace/records.py"
+          }
+        },
+        "result_bytes": 1127,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 131,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 254,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 468,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 149,
+        "status": "ok"
+      }
+    ],
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/hermes-home/cache/delegation/live/deleg_7c472bce/task-0.log"
+  },
+  "status": "completed",
+  "classifier": {
+    "verdict": "simple",
+    "suggested_effort": "low",
+    "clamped_effort": "unknown",
+    "supported_efforts": "unknown",
+    "child_reasoning_config": {
+      "enabled": true,
+      "effort": "xhigh"
+    },
+    "child_model": "qwen3.8-flash-next",
+    "child_provider": "lilith",
+    "outcome_status": "completed",
+    "latency_ms": 7050,
+    "child_session_id": "20261009_162842_bcee50"
+  },
+  "plugin_state": {
+    "mode": "shadow",
+    "children": [
+      {
+        "child_session_id": "20261009_162842_bcee50",
+        "verdict": "simple",
+        "suggested_effort": "low",
+        "supported_efforts": "unknown",
+        "clamped_effort": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 7050,
+        "repeated_mutation_targets": null,
+        "usage": {
+          "prompt_tokens": 32308,
+          "completion_tokens": 975,
+          "total_tokens": 33283,
+          "requests": 5,
+          "cost_usd": null,
+          "cost_status": "unknown",
+          "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+        },
+        "verification": {
+          "status": "passed",
+          "evidence": {
+            "id": 1,
+            "created_at": "2026-10-09T15:28:47.697662+00:00",
+            "session_id": "20261009_162842_bcee50",
+            "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+            "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+            "command": "python3 -m pytest -q",
+            "canonical_command": "pytest",
+            "kind": "test",
+            "scope": "full",
+            "status": "passed",
+            "exit_code": 0,
+            "output_summary": ".                                                                        [100%]\n1 passed in 0.00s"
+          },
+          "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/record-lines/workspace",
+          "session_id": "20261009_162842_bcee50",
+          "changed_paths": []
+        },
+        "outcome_observed": true,
+        "prompt_tokens": 32308,
+        "completion_tokens": 975,
+        "total_tokens": 33283,
+        "requests": 5,
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+      }
+    ],
+    "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+  }
+}

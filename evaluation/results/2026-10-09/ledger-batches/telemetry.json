@@ -1,0 +1,88 @@
+{
+  "tool_events": [
+    {
+      "tool_call_id": "chatcmpl-tool-aacb9044e142839d",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 63,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b18db1958c4c7dce",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 6,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b74abee3eb4e9f41",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 10,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 208,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-98af9ecf2a419d97",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 244,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-8ffa280ee35843e1",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 617,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": "passed"
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-85752d235ba307cf",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 103,
+      "session_id": "20261009_162853_cc6a2f",
+      "verification_evidence_status": null
+    }
+  ],
+  "source_changes": [
+    {
+      "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+      "tool": "patch",
+      "changed": [
+        "ledger.py",
+        "report.py"
+      ]
+    }
+  ],
+  "verified_corrective_revisions": 0,
+  "corrective_revision_events": [],
+  "child_session_id": "20261009_162853_cc6a2f",
+  "verification_ledger_rows_observed": 1
+}

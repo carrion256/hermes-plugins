@@ -1,15 +1,24 @@
 name: rules
-version: 0.1.0
-description: "Cursor/Windsurf-style rule files: always-apply rules injected every turn; tool-matched rules rewrite tool args."
+version: 0.3.0
+description: "Cursor/Windsurf-style rule files: per-session project + global rulebook and always-apply text in cache-safe system-prompt sections; tool/condition/glob rules deliver once as tool_execution guidance without touching tool args."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
-provides_middleware:
-  - tool_request
 provides_hooks:
-  - pre_llm_call
+  - on_session_reset
+  - on_session_finalize
+provides_middleware:
+  - tool_execution
 config_schema:
-  rules_dir:
-    type: str
-    default: "~/.hermes/rules"
-    description: "Directory with *.md rule files. Front-matter 'applies: always' injects every turn; 'tools: [terminal, ...]' gates a tool_request transform whose body is appended to matching tool args."
+  rule_dirs:
+    type: list
+    default: ["~/.hermes/rules"]
+    description: "Global rule directories in ascending priority (later overrides earlier per rule filename stem). Project dirs (.cursor/rules, .windsurf/rules, .claude/rules) are discovered per session by walking up from the session cwd and override global rules of the same name; the nearest directory wins."
+  disabled_rules:
+    type: list
+    default: []
+    description: "Rule names (filename stems) dropped before bucketing."
+  ttsr_enabled:
+    type: bool
+    default: true
+    description: "Rules scoped by tools/condition/globs deliver once per session as one-time tool_execution guidance (canonical tool-error result with full rule text + file path; executor and args untouched). Disable to silence this lane. Scopes combine with AND; unknown session identity delivers nothing; fired marks cover only actually delivered guidance."

@@ -1,0 +1,512 @@
+{
+  "id": "memo-flight",
+  "status": "completed",
+  "public_test_initial_sha256": "867428d746a9195ec4739346d488f2e2c035eb9f3fb01e3629222bd39474d81a",
+  "initial_source_hashes": {
+    "memo.py": "e9ebbd75a4a380e20da85eec2d02fe3a84da52d2b59c83cfa26980a501da0ac3"
+  },
+  "baseline": {
+    "public": {
+      "returncode": 1,
+      "timed_out": false,
+      "duration_seconds": 0.032,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 9, in <module>\n  File \"/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py\", line 8, in get\n    value = factory()\n            ^^^^^^^^^\n  File \"<string>\", line 8, in unexpected\nAssertionError: cached None recomputed\n",
+      "stdout_bytes": 0,
+      "stderr_bytes": 312,
+      "output_truncated": false,
+      "passed": false,
+      "assertion_failure": true,
+      "expected_failure": true
+    },
+    "heldout": {
+      "returncode": 1,
+      "timed_out": false,
+      "duration_seconds": 0.032,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 55, in <module>\nAssertionError\n",
+      "stdout_bytes": 0,
+      "stderr_bytes": 90,
+      "output_truncated": false,
+      "passed": false,
+      "assertion_failure": true,
+      "expected_failure": true
+    },
+    "proven_broken": true
+  },
+  "worker": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 151.131,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false
+  },
+  "native": {
+    "task_index": 0,
+    "status": "completed",
+    "summary": "Fixed. `python3 -m pytest -q` passes (1 passed).\n\n**Change** — `memo.py`: rewrote `Memo.get` to be thread-safe:\n- A single `threading.Lock` guards `self.values` and a new `_in_progress` dict mapping key → `threading.Event`.\n- Caller under lock: cached → return value (identity preserved, `None` handled via `key in values` instead of the original `value is None` check, which was the None-caching bug).\n- If another thread is computing that key → release lock and `event.wait()`, then loop and read the cached value (or re-attempt if it failed).\n- Otherwise the caller claims the key: runs the factory **outside** any lock, then publishes the value and sets the event; on any exception (`BaseException`) it removes the in-progress entry and sets the event so waiters wake up and a later attempt can run — nothing is cached.\n- Per-key events + factory running outside the lock means a blocked factory on one key never blocks other keys.\n\n**Verification** — beyond the public test, I ran a scratch harness (since deleted) covering: 8 threads racing one factory (one run, shared result, `None` cached), exception propagating to runner and waiter with the key left unset for retry, a blocked key not stalling another key, 200 randomized flaky-factory rounds, and a 70-thread/7-key stress run — all passed.\n\nNo other files touched; `test_public.py` and `pyproject.toml` untouched.",
+    "api_calls": 11,
+    "duration_seconds": 147.97,
+    "model": "qwen3.8-flash-next",
+    "exit_reason": "completed",
+    "truncated": false,
+    "tokens": {
+      "input": 190919,
+      "output": 4164
+    },
+    "tool_trace": [
+      {
+        "tool": "read_file",
+        "args_bytes": 100,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py"
+          }
+        },
+        "result_bytes": 386,
+        "status": "ok"
+      },
+      {
+        "tool": "search_files",
+        "args_bytes": 127,
+        "input_summary": {
+          "argument_keys": [
+            "path",
+            "pattern",
+            "target"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace"
+          }
+        },
+        "result_bytes": 319,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 107,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/test_public.py"
+          }
+        },
+        "result_bytes": 500,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 107,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/pyproject.toml"
+          }
+        },
+        "result_bytes": 172,
+        "status": "ok"
+      },
+      {
+        "tool": "write_file",
+        "args_bytes": 1174,
+        "input_summary": {
+          "argument_keys": [
+            "content",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/memo.py"
+          }
+        },
+        "result_bytes": 324,
+        "status": "ok"
+      },
+      {
+        "tool": "write_file",
+        "args_bytes": 2731,
+        "input_summary": {
+          "argument_keys": [
+            "content",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+          }
+        },
+        "result_bytes": 368,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 570,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+          }
+        },
+        "result_bytes": 830,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 179,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "timeout"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 52052,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 1583,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+          }
+        },
+        "result_bytes": 858,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 826,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+          }
+        },
+        "result_bytes": 1313,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 179,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "timeout"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 273,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 173,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "timeout"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 254,
+        "status": "ok"
+      }
+    ],
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/hermes-home/cache/delegation/live/deleg_938f7c3f/task-0.log"
+  },
+  "classifier": {
+    "verdict": "complex",
+    "suggested_effort": "high",
+    "clamped_effort": "unknown",
+    "supported_efforts": "unknown",
+    "child_reasoning_config": {
+      "enabled": true,
+      "effort": "xhigh"
+    },
+    "child_model": "qwen3.8-flash-next",
+    "child_provider": "lilith",
+    "outcome_status": "completed",
+    "latency_ms": 147970,
+    "child_session_id": "20261009_162916_5dcac4"
+  },
+  "plugin_state": {
+    "mode": "shadow",
+    "children": [
+      {
+        "child_session_id": "20261009_162916_5dcac4",
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "supported_efforts": "unknown",
+        "clamped_effort": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 147970,
+        "repeated_mutation_targets": [
+          "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace/_scratch_concurrency_check.py"
+        ],
+        "usage": {
+          "prompt_tokens": 190919,
+          "completion_tokens": 4164,
+          "total_tokens": 195083,
+          "requests": 11,
+          "cost_usd": null,
+          "cost_status": "unknown",
+          "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+        },
+        "verification": {
+          "status": "passed",
+          "evidence": {
+            "id": 2,
+            "created_at": "2026-10-09T15:31:41.767004+00:00",
+            "session_id": "20261009_162916_5dcac4",
+            "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+            "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+            "command": "cd /tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace && rm _scratch_concurrency_check.py && python3 -m pytest -q",
+            "canonical_command": "pytest",
+            "kind": "test",
+            "scope": "full",
+            "status": "passed",
+            "exit_code": 0,
+            "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+          },
+          "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/memo-flight/workspace",
+          "session_id": "20261009_162916_5dcac4",
+          "changed_paths": []
+        },
+        "outcome_observed": true,
+        "prompt_tokens": 190919,
+        "completion_tokens": 4164,
+        "total_tokens": 195083,
+        "requests": 11,
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+      }
+    ],
+    "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+  },
+  "telemetry": {
+    "tool_events": [
+      {
+        "tool_call_id": "chatcmpl-tool-a01eb87f86a14c03",
+        "tool": "read_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 35,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-af9f3f3607c85200",
+        "tool": "search_files",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 55,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b8874f6d932cbe5d",
+        "tool": "read_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 3,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+        "tool": "write_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 163,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+        "tool": "write_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 92,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+        "tool": "patch",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 129,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-ae8b70b3679158a3",
+        "tool": "terminal",
+        "status": "error",
+        "error_type": "tool_error",
+        "error_message": "exit 124",
+        "duration_ms": 120155,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+        "tool": "patch",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 135,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+        "tool": "patch",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 127,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-babb40e464059d02",
+        "tool": "terminal",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 808,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": "passed"
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+        "tool": "terminal",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 616,
+        "session_id": "20261009_162916_5dcac4",
+        "verification_evidence_status": "passed"
+      }
+    ],
+    "source_changes": [
+      {
+        "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+        "tool": "write_file",
+        "changed": [
+          "memo.py"
+        ]
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+        "tool": "write_file",
+        "changed": [
+          "_scratch_concurrency_check.py"
+        ]
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+        "tool": "patch",
+        "changed": [
+          "_scratch_concurrency_check.py"
+        ]
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+        "tool": "patch",
+        "changed": [
+          "_scratch_concurrency_check.py"
+        ]
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+        "tool": "patch",
+        "changed": [
+          "_scratch_concurrency_check.py"
+        ]
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+        "tool": "terminal",
+        "changed": [
+          "_scratch_concurrency_check.py"
+        ]
+      }
+    ],
+    "verified_corrective_revisions": 0,
+    "corrective_revision_events": [],
+    "child_session_id": "20261009_162916_5dcac4",
+    "verification_ledger_rows_observed": 2
+  },
+  "evaluable": true,
+  "final_source_hashes": {
+    "memo.py": "8a6955bb24adfe5c25638eda0f8cf7e5ecc94f38aec70a317d4bebe18b4c2d42"
+  },
+  "public_test_final_sha256": "867428d746a9195ec4739346d488f2e2c035eb9f3fb01e3629222bd39474d81a",
+  "public_test_unchanged": true,
+  "public": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 0.032,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false,
+    "passed": true,
+    "assertion_failure": false,
+    "expected_failure": false
+  },
+  "heldout": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 0.032,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false,
+    "passed": true,
+    "assertion_failure": false,
+    "expected_failure": false
+  },
+  "correct": true
+}

@@ -1,109 +1,120 @@
-"""Loop guard — port of dsh-loop-guard (turn-level detectors).
-
-Two cross-turn guards, both detect+steer via ctx.inject_message:
-1. tool-call loop: N consecutive executed tool-call batches with identical
-   signatures (name+args, order-insensitive) -> "never call X with those args".
-2. answer repetition: N consecutive near-identical text answers with no tool
-   call -> "repeating the answer is not progress".
-
-Streaming reasoning-loop detectors (Z-algorithm cycles) are deliberately NOT
-ported: on_stream_delta exists but mid-stream steering has no inject channel —
-detect-only there would be inert infrastructure. Turn-level guards carry the
-practical value.
-
-v1 note: the tool-call detector signatures individual calls (name+args), not
-whole batches — a mixed batch repeated verbatim won't trip it. Single-tool
-streaks are the dominant real pathology.
-"""
-
+"""Owned, result-aware loop reminders without injecting new conversation tasks."""
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
+import threading
+import weakref
 
-logger = logging.getLogger(__name__)
-
-
-def _norm_batch(calls) -> str:
-    items = sorted(
-        f"{c.get('function', {}).get('name', '')}:{json.dumps(c.get('function', {}).get('arguments', ''), sort_keys=True, default=str)}"
-        for c in (calls or [])
-    )
-    return hashlib.sha256("|".join(items).encode()).hexdigest()[:16]
+_POLL_TOOLS = {"process_manage"}
+_POLL_ACTIONS = {"list", "poll", "log", "wait"}
 
 
-def _shingles(text: str) -> set:
-    words = text.lower().split()
-    return {tuple(words[i:i + 4]) for i in range(len(words) - 3)} if len(words) > 8 else {tuple(words)}
+def _signature(name, args) -> str:
+    return json.dumps([name, args], sort_keys=True, ensure_ascii=False, default=str)
 
 
 def _similar(a: str, b: str) -> bool:
-    sa, sb = _shingles(a), _shingles(b)
-    if not sa or not sb:
-        return False
-    return len(sa & sb) / len(sa | sb) >= 0.85
+    def shingles(text):
+        words = text.lower().split()
+        return {tuple(words[i:i + 4]) for i in range(max(0, len(words) - 3))}
+    left, right = shingles(a), shingles(b)
+    return bool(left and right) and len(left & right) / len(left | right) >= 0.85
 
 
 def register(ctx) -> None:
-    streak_n = max(2, int(ctx.get_config("tool_call_streak", 5) or 5))
-    answer_n = max(2, int(ctx.get_config("answer_repetition", 3) or 3))
-    cap = max(1, int(ctx.get_config("redirect_cap", 2) or 2))
-    # session_id -> state
-    batch_state: dict[str, tuple[str, int]] = {}
-    answer_state: dict[str, tuple[str, int]] = {}
-    redirects: dict[str, int] = {}
+    streak = max(2, int(ctx.get_config("tool_call_streak", 5)))
+    answer_limit = max(2, int(ctx.get_config("answer_repetition", 3)))
+    cap = max(0, int(ctx.get_config("redirect_cap", 2)))
+    states = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
 
-    def post_tool_call(tool_name: str = "", args=None, tool_call_id: str = "",
-                       session_id: str = "", **_kw):
-        # Accumulate the batch signature per (session, turn) — the turn's calls
-        # share turn_id; we key on session and reset the streak on signature change.
-        sig = _norm_batch([{"function": {"name": tool_name, "arguments": args}}])
-        prev_sig, count = batch_state.get(session_id, ("", 0))
-        batch_state[session_id] = (sig, count + 1 if sig == prev_sig else 1)
-        if batch_state[session_id][1] >= streak_n and redirects.get(session_id, 0) < cap:
-            redirects[session_id] = redirects.get(session_id, 0) + 1
-            batch_state[session_id] = (sig, 0)  # reset so we don't spam
-            try:
-                ctx.inject_message(
-                    f"LOOP GUARD: you called {tool_name} with identical arguments "
-                    f"{streak_n}+ times with no progress. Do not call {tool_name} "
-                    "with those arguments again — take a different action or state "
-                    "the blocker.", session_key=session_id or None)
-            except Exception:
-                logger.debug("loop-guard: inject failed", exc_info=True)
+    def owner(session_id):
+        from agent.subagent_lifecycle import get_active_subagent_parent
+        agent = get_active_subagent_parent()
+        if (agent is None or str(getattr(agent, "session_id", "") or "") != session_id
+                or getattr(agent, "_persist_disabled", False)
+                or getattr(agent, "_interrupt_requested", False)):
+            return None
+        return agent
 
-    def post_api_request(session_id: str = "", response=None,
-                         assistant_tool_call_count: int = 0, **_kw):
-        if assistant_tool_call_count:
-            return  # text answers only
-        text = ""
-        if isinstance(response, dict):
-            try:
-                text = (response["choices"][0]["message"].get("content") or "").strip()
-            except (KeyError, IndexError, TypeError):
-                text = ""
-        if len(text.split()) < 12:
+    def state(agent):
+        return states.setdefault(agent, {"call": None, "result": None, "count": 0,
+                                        "tool_redirects": 0, "answer_redirects": 0,
+                                        "answer": "", "answers": 0})
+
+    def before(tool_name="", args=None, session_id="", **_kw):
+        agent = owner(session_id)
+        if agent is None:
+            return None
+        with lock:
+            s = state(agent)
+            if (s["call"] == _signature(tool_name, args) and s["count"] >= streak
+                    and s["tool_redirects"] < cap):
+                s["count"] = 0
+                s["tool_redirects"] += 1
+                return {"action": "block", "message": (
+                    f"LOOP GUARD: {tool_name} returned the same result {streak} times. "
+                    "Repeating that exact call is not progress. Use a different query/action "
+                    "or explain the blocker. Read-only polling is exempt."
+                )}
+        return None
+
+    def after(tool_name="", args=None, result=None, session_id="", **_kw):
+        agent = owner(session_id)
+        if agent is None:
             return
-        prev, count = answer_state.get(session_id, ("", 0))
-        if prev and _similar(prev, text):
-            count += 1
-            if count >= answer_n and redirects.get(session_id, 0) < cap:
-                redirects[session_id] = redirects.get(session_id, 0) + 1
-                answer_state[session_id] = (text, 0)
-                try:
-                    ctx.inject_message(
-                        "LOOP GUARD: you have repeated the same answer several times "
-                        "without any tool calls. Repeating the answer is not progress — "
-                        "take the next concrete tool action or finish with something new.",
-                        session_key=session_id or None)
-                except Exception:
-                    logger.debug("loop-guard: inject failed", exc_info=True)
+        with lock:
+            s = state(agent)
+            s["answer"], s["answers"] = "", 0
+            if tool_name in _POLL_TOOLS and isinstance(args, dict) and args.get("action") in _POLL_ACTIONS:
+                s["call"], s["count"] = None, 0
                 return
-        else:
-            count = 0
-        answer_state[session_id] = (text, count)
+            if result is None or "LOOP GUARD:" in str(result):
+                return
+            signature = _signature(tool_name, args)
+            digest = hashlib.sha256(str(result).encode()).hexdigest()
+            s["count"] = s["count"] + 1 if (signature, digest) == (s["call"], s["result"]) else 1
+            s["call"], s["result"] = signature, digest
 
-    ctx.register_hook("post_tool_call", post_tool_call)
-    ctx.register_hook("post_api_request", post_api_request)
-    logger.info("loop-guard: active (tool streak %d, answer repetition %d)", streak_n, answer_n)
+    def finished(session_id="", assistant_response="", **_kw):
+        agent = owner(session_id)
+        if agent is None or not isinstance(assistant_response, str):
+            return
+        with lock:
+            s = state(agent)
+            s["call"], s["result"], s["count"] = None, None, 0
+            if len(assistant_response.split()) < 12:
+                s["answer"], s["answers"] = "", 0
+                return
+            s["answers"] = s["answers"] + 1 if _similar(s["answer"], assistant_response) else 1
+            s["answer"] = assistant_response
+
+    def reminder(session_id="", **_kw):
+        agent = owner(session_id)
+        if agent is None:
+            return None
+        with lock:
+            s = state(agent)
+            if s["answers"] >= answer_limit and s["answer_redirects"] < cap:
+                s["answers"] = 0
+                s["answer_redirects"] += 1
+                return {"context": (
+                    "LOOP GUARD: prior answers repeated without intervening tool progress. "
+                    "Address the current user request with new evidence or a concrete blocker; "
+                    "do not substitute another repetition."
+                )}
+        return None
+
+    def clear(session_id="", **_kw):
+        agent = owner(session_id)
+        if agent is not None:
+            with lock:
+                states.pop(agent, None)
+
+    ctx.register_hook("pre_tool_call", before)
+    ctx.register_hook("post_tool_call", after)
+    ctx.register_hook("post_llm_call", finished)
+    ctx.register_hook("pre_llm_call", reminder)
+    ctx.register_hook("on_session_reset", clear)
+    ctx.register_hook("on_session_finalize", clear)

@@ -1,22 +1,21 @@
 name: continuation
-version: 0.1.0
-description: "Prompt continuation: catches turns that promised action without acting (unexpected stop / empty stop) and steers the session to resume."
+version: 0.2.0
+description: "Evidence-based completion: pre_verify stop gate holds coding turns until the native todo ledger is clear, verification evidence is fresh, and an independent native /review closed on the exact reviewed change."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_hooks:
-  - on_session_end
-  - post_api_request
+  - pre_llm_call
+  - pre_verify
+  - transform_llm_output
+  # on_session_reset/finalize and agent_loop_stopped clear session state;
+  # on_session_end deliberately unregistered so a pending reviewer stays bound
+  # and reset/finalize/stop bound the new task identity.
+  - on_session_reset
+  - on_session_finalize
+  - agent_loop_stopped
 config_schema:
-  max_steers_per_session:
+  max_review_rounds:
     type: int
-    default: 3
-    description: "Cap on continuation steers per session (loop guard)."
-  empty_stop:
-    type: bool
-    default: true
-    description: "Steer when a committed turn had no text, reasoning, or tool calls."
-  unexpected_stop:
-    type: bool
-    default: true
-    description: "Steer when the final assistant text promised an action but no tool ran."
+    default: 2
+    description: "Bounded review/fix rounds per genuine user turn; exhaustion releases the turn but the final response is labeled blocked/unverified, never silent completion."

@@ -1,0 +1,390 @@
+{
+  "id": "ledger-batches",
+  "status": "completed",
+  "public_test_initial_sha256": "2028c5849999ddf79a54e1feca8c31dd1733c2d0adf014a9bd58fcc0077eafd5",
+  "initial_source_hashes": {
+    "ledger.py": "17ff3091df3da5aebe12dd8021059ee57b7fe385621207e234991b39dad3d9e3",
+    "report.py": "b3bc197e4f0082ebd7601a86fc554f31237258d2679bc59de375fc29f5c6cef1"
+  },
+  "baseline": {
+    "public": {
+      "returncode": 1,
+      "timed_out": false,
+      "duration_seconds": 0.032,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nAssertionError\n",
+      "stdout_bytes": 0,
+      "stderr_bytes": 89,
+      "output_truncated": false,
+      "passed": false,
+      "assertion_failure": true,
+      "expected_failure": true
+    },
+    "heldout": {
+      "returncode": 1,
+      "timed_out": false,
+      "duration_seconds": 0.032,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 16, in <module>\nAssertionError\n",
+      "stdout_bytes": 0,
+      "stderr_bytes": 90,
+      "output_truncated": false,
+      "passed": false,
+      "assertion_failure": true,
+      "expected_failure": true
+    },
+    "proven_broken": true
+  },
+  "worker": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 14.788,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false
+  },
+  "native": {
+    "task_index": 0,
+    "status": "completed",
+    "summary": "Both functions repaired and validated.\n\n**ledger.py — `apply_batch(state, events)`**: buffers changes into copies of `balances` and a `new_seen` set during iteration, so any failure (ValueError on overdraft or an exception raised while consuming the iterable) leaves the caller's state untouched and propagates the original error. On success it commits the new containers into the same `state` dict and returns it.\n\nFixes vs. original:\n- Skipped events already seen (previously batch-internal repeats double-applied).\n- Raises `ValueError('insufficient funds')` when an applied event would make a balance negative.\n- Atomic failure semantics (previously mutated state incrementally).\n\n**report.py — `summarize(state)`**: returns `sorted((account, balance))` tuples, omits zero balances, reads state without modifying it.\n\n**Validation**:\n- `python3 -m pytest -q` → 1 passed.\n- Extra edge checks all pass: exception mid-iteration propagates original error with state unchanged; insufficient-funds raises with state unchanged; batch-internal duplicate ids ignored despite differing fields; unknown accounts start at zero; balance hitting exactly zero is allowed and omitted from `summarize`; `apply_batch` returns the same `state` object.\n\nFiles modified: `ledger.py`, `report.py`. `test_public.py` untouched.",
+    "api_calls": 6,
+    "duration_seconds": 12.21,
+    "model": "qwen3.8-flash-next",
+    "exit_reason": "completed",
+    "truncated": false,
+    "tokens": {
+      "input": 43772,
+      "output": 2163
+    },
+    "tool_trace": [
+      {
+        "tool": "terminal",
+        "args_bytes": 126,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 457,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 105,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+          }
+        },
+        "result_bytes": 362,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 105,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+          }
+        },
+        "result_bytes": 178,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 110,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/test_public.py"
+          }
+        },
+        "result_bytes": 496,
+        "status": "ok"
+      },
+      {
+        "tool": "read_file",
+        "args_bytes": 110,
+        "input_summary": {
+          "argument_keys": [
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/pyproject.toml"
+          }
+        },
+        "result_bytes": 172,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 1082,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/ledger.py"
+          }
+        },
+        "result_bytes": 1372,
+        "status": "ok"
+      },
+      {
+        "tool": "patch",
+        "args_bytes": 366,
+        "input_summary": {
+          "argument_keys": [
+            "new_string",
+            "old_string",
+            "path"
+          ],
+          "targets": {
+            "path": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace/report.py"
+          }
+        },
+        "result_bytes": 732,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 133,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 254,
+        "status": "ok"
+      },
+      {
+        "tool": "terminal",
+        "args_bytes": 1559,
+        "input_summary": {
+          "argument_keys": [
+            "command",
+            "workdir"
+          ],
+          "targets": {}
+        },
+        "result_bytes": 65,
+        "status": "ok"
+      }
+    ],
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "live_transcript": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/hermes-home/cache/delegation/live/deleg_9f08b70e/task-0.log"
+  },
+  "classifier": {
+    "verdict": "complex",
+    "suggested_effort": "high",
+    "clamped_effort": "unknown",
+    "supported_efforts": "unknown",
+    "child_reasoning_config": {
+      "enabled": true,
+      "effort": "xhigh"
+    },
+    "child_model": "qwen3.8-flash-next",
+    "child_provider": "lilith",
+    "outcome_status": "completed",
+    "latency_ms": 12210,
+    "child_session_id": "20261009_162853_cc6a2f"
+  },
+  "plugin_state": {
+    "mode": "shadow",
+    "children": [
+      {
+        "child_session_id": "20261009_162853_cc6a2f",
+        "verdict": "complex",
+        "suggested_effort": "high",
+        "supported_efforts": "unknown",
+        "clamped_effort": "unknown",
+        "child_reasoning_config": {
+          "enabled": true,
+          "effort": "xhigh"
+        },
+        "child_model": "qwen3.8-flash-next",
+        "child_provider": "lilith",
+        "outcome_status": "completed",
+        "latency_ms": 12210,
+        "repeated_mutation_targets": null,
+        "usage": {
+          "prompt_tokens": 43772,
+          "completion_tokens": 2163,
+          "total_tokens": 45935,
+          "requests": 6,
+          "cost_usd": null,
+          "cost_status": "unknown",
+          "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+        },
+        "verification": {
+          "status": "passed",
+          "evidence": {
+            "id": 1,
+            "created_at": "2026-10-09T15:29:00.823752+00:00",
+            "session_id": "20261009_162853_cc6a2f",
+            "cwd": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+            "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+            "command": "python3 -m pytest -q",
+            "canonical_command": "pytest",
+            "kind": "test",
+            "scope": "full",
+            "status": "passed",
+            "exit_code": 0,
+            "output_summary": ".                                                                        [100%]\n1 passed in 0.01s"
+          },
+          "root": "/tmp/nix-shell-1872564-1431633366/shadow-outcomes-8ajp2oqw/ledger-batches/workspace",
+          "session_id": "20261009_162853_cc6a2f",
+          "changed_paths": []
+        },
+        "outcome_observed": true,
+        "prompt_tokens": 43772,
+        "completion_tokens": 2163,
+        "total_tokens": 45935,
+        "requests": 6,
+        "cost_usd": null,
+        "cost_status": "unknown",
+        "cost_source": "child agent native accounting (session_estimated_cost_usd/session_cost_status, captured on post_llm_call)"
+      }
+    ],
+    "note": "pure shadow: the plugin never applies effort; status is a lifecycle fact, not correctness; repeated_mutation_targets is a proxy metric; usage/verification 'unknown' means not observed; cost partial/estimated statuses are native accounting provenance, not actual billing"
+  },
+  "telemetry": {
+    "tool_events": [
+      {
+        "tool_call_id": "chatcmpl-tool-aacb9044e142839d",
+        "tool": "terminal",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 63,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b18db1958c4c7dce",
+        "tool": "read_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 6,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-b74abee3eb4e9f41",
+        "tool": "read_file",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 10,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+        "tool": "patch",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 208,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-98af9ecf2a419d97",
+        "tool": "patch",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 244,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-8ffa280ee35843e1",
+        "tool": "terminal",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 617,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": "passed"
+      },
+      {
+        "tool_call_id": "chatcmpl-tool-85752d235ba307cf",
+        "tool": "terminal",
+        "status": "ok",
+        "error_type": null,
+        "error_message": null,
+        "duration_ms": 103,
+        "session_id": "20261009_162853_cc6a2f",
+        "verification_evidence_status": null
+      }
+    ],
+    "source_changes": [
+      {
+        "tool_call_id": "chatcmpl-tool-9967df88a3a3fc72",
+        "tool": "patch",
+        "changed": [
+          "ledger.py",
+          "report.py"
+        ]
+      }
+    ],
+    "verified_corrective_revisions": 0,
+    "corrective_revision_events": [],
+    "child_session_id": "20261009_162853_cc6a2f",
+    "verification_ledger_rows_observed": 1
+  },
+  "evaluable": true,
+  "final_source_hashes": {
+    "ledger.py": "65eb3afed58e584d92002355edff36e2482dacb4cee1901311bf348961e80c5c",
+    "report.py": "8bb4a0780e91078b8e50c88cf8957209b9689240cf2eb3ed6879b355a8bb726d"
+  },
+  "public_test_final_sha256": "2028c5849999ddf79a54e1feca8c31dd1733c2d0adf014a9bd58fcc0077eafd5",
+  "public_test_unchanged": true,
+  "public": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 0.032,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false,
+    "passed": true,
+    "assertion_failure": false,
+    "expected_failure": false
+  },
+  "heldout": {
+    "returncode": 0,
+    "timed_out": false,
+    "duration_seconds": 0.032,
+    "stdout": "",
+    "stderr": "",
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+    "output_truncated": false,
+    "passed": true,
+    "assertion_failure": false,
+    "expected_failure": false
+  },
+  "correct": true
+}

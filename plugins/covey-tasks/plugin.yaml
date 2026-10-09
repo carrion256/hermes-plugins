@@ -1,0 +1,21 @@
+name: covey-tasks
+version: 0.1.0
+description: "Durable finite worklists and fenced task ownership backed by the Covey CLI; native todo_list is left untouched."
+author: "hermes-plugins"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - covey_tasks
+provides_hooks:
+  - on_session_finalize
+  - on_session_reset
+  - subagent_stop
+config_schema:
+  binary:
+    type: str
+    default: "covey"
+    description: "Covey executable name or path (needs meta list and subtask finish support)."
+  db_path:
+    type: str
+    default: ""
+    description: "Absolute local path of the Covey SQLite database used by this profile (required; never defaulted)."

@@ -1,14 +1,20 @@
 name: auto-answer-classifier
-version: 0.1.0
-description: "Auto-picks the classifier-endorsed option when the user times out on a clarify question; never picks on disagreement."
+version: 0.2.0
+description: "Question-bound derived defaults in the originating clarification result; never changes human answers or grants approvals."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_middleware:
   - tool_execution
-provides_hooks:
-  - post_tool_call
 config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "Endorse low-risk single-question timeouts; multi-question batches remain advisory and human answers/skips always win."
+  dry_run:
+    type: bool
+    default: false
+    description: "Record recommendations as unapplied suggestions without selecting defaults."
   endpoint:
     type: str
     default: "http://192.168.50.149:8787"
@@ -16,4 +22,4 @@ config_schema:
   api_key_env:
     type: str
     default: "CLASSIFIER_API_KEY"
-    description: "Env var holding the Bearer key (name only; value read at call time)."
+    description: "Bearer-key environment variable name; never a credential value."

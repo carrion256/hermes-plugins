@@ -1,0 +1,162 @@
+{
+  "tool_events": [
+    {
+      "tool_call_id": "chatcmpl-tool-a01eb87f86a14c03",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 35,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-af9f3f3607c85200",
+      "tool": "search_files",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 55,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b8874f6d932cbe5d",
+      "tool": "read_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 3,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+      "tool": "write_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 163,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+      "tool": "write_file",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 92,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 129,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-ae8b70b3679158a3",
+      "tool": "terminal",
+      "status": "error",
+      "error_type": "tool_error",
+      "error_message": "exit 124",
+      "duration_ms": 120155,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 135,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+      "tool": "patch",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 127,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": null
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-babb40e464059d02",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 808,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": "passed"
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+      "tool": "terminal",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null,
+      "duration_ms": 616,
+      "session_id": "20261009_162916_5dcac4",
+      "verification_evidence_status": "passed"
+    }
+  ],
+  "source_changes": [
+    {
+      "tool_call_id": "chatcmpl-tool-bbecb59fe186ea20",
+      "tool": "write_file",
+      "changed": [
+        "memo.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-87f442c4e2ed405b",
+      "tool": "write_file",
+      "changed": [
+        "_scratch_concurrency_check.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-87a3ca95076dd9d9",
+      "tool": "patch",
+      "changed": [
+        "_scratch_concurrency_check.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b2dfcab326a85079",
+      "tool": "patch",
+      "changed": [
+        "_scratch_concurrency_check.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-b3308fc95abf6a5d",
+      "tool": "patch",
+      "changed": [
+        "_scratch_concurrency_check.py"
+      ]
+    },
+    {
+      "tool_call_id": "chatcmpl-tool-a59c33772e4b35b8",
+      "tool": "terminal",
+      "changed": [
+        "_scratch_concurrency_check.py"
+      ]
+    }
+  ],
+  "verified_corrective_revisions": 0,
+  "corrective_revision_events": [],
+  "child_session_id": "20261009_162916_5dcac4",
+  "verification_ledger_rows_observed": 2
+}

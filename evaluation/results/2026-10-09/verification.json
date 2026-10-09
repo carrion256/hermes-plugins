@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-09",
+  "source_and_corpus_digests_match_manifest": true,
+  "retained_candidate_digests_match_results": true,
+  "replayed_public_and_heldout_cases": [
+    "record-lines",
+    "ledger-batches",
+    "suffix-removal",
+    "memo-flight",
+    "page-count",
+    "catalog-csv"
+  ],
+  "replay_method": "Fresh temporary workspace for each retained candidate; execute frozen public and held-out assertions using the installed Hermes Python; require successful exit and an end-of-script sentinel.",
+  "native_and_shadow_prompt_output_total_tokens_match_all_cases": true,
+  "native_and_shadow_api_call_counts_match_all_cases": true,
+  "explicit_effort_preserved_all_cases": "xhigh",
+  "public_test_unchanged_all_cases": true,
+  "monetary_cost_status_all_cases": "unknown",
+  "credential_bytes_found_in_retained_evaluation_artifacts": 0,
+  "credential_bytes_found_in_real_terminal_pilot_files": 0,
+  "integration_suite": "114 passed",
+  "automatic_routing": "NOT_QUALIFIED",
+  "limitations": [
+    "Six purpose-made cases, one execution per case, not a representative production workload.",
+    "Only the fixed xhigh baseline was executed; no lower-effort counterfactual or causal savings claim.",
+    "Verified corrective revisions count failed native verification followed by source changes, not every form of iteration or test development.",
+    "The local model reports unknown monetary cost; observed tokens and latency are not provider invoices."
+  ]
+}
