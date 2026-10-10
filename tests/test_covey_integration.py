@@ -40,6 +40,8 @@ AC coverage map (plan R3 acceptance criteria):
        test_delayed_tick_past_expiry_retires_not_renews
        test_idle_runtime_issues_nothing_and_ticks_use_fresh_backend_keys
        test_teardown_under_db_lock_bounded_and_no_thread_left
+       test_teardown_budget_exhaustion_releases_cwd_routing
+       test_claim_publication_atomic_against_close_revocation
   AC6  test_retry_fail_release_abandon_exact_states
        test_required_evidence_refused_without_digest_preserved_with_valid_digest
        test_governed_task_refused_and_policy_unchanged
@@ -77,6 +79,9 @@ AC coverage map (plan R3 acceptance criteria):
   AC10 test_status_reports_capabilities_never_opens_db_or_registers
        test_stale_binary_refuses_task_operations_with_guidance
        test_on_unload_closes_runtime_and_releases_claim
+  R4 workspace-guard custody regressions:
+       test_guard_selects_current_database_and_never_leaks_across_dbs
+       test_uncertain_unbound_claim_never_rebinds_released_workspace
 """
 import contextlib
 import json
@@ -1809,6 +1814,217 @@ def test_concurrent_close_bounded_and_no_late_authority(covey, covey_bin, agent_
     assert rt.execute({"action": "start", "subtask_id": tid})["code"] == "closed"
 
 
+def test_teardown_budget_exhaustion_releases_cwd_routing(
+        covey, covey_bin, tmp_path, agent_for, make_runtime, monkeypatch):
+    # Bounded close while the runtime lock is held: the native claim
+    # truthfully stays with lease expiry (uncertain outcome — never
+    # fabricate a release), but cwd routing and the worktree flock are
+    # revoked NOW.  A stale cwd would route ordinary relative writes into
+    # the retired worktree (engine fences do not govern plain filesystem
+    # writes) and no late path may re-bind it.
+    from tools import terminal_tool
+    from model_tools import handle_function_call
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+    h = covey(db_path="/unused/placeholder.db")
+    mod = runtime_module(h)
+    agent = agent_for("teardown-budget")
+    rt = make_runtime(h, agent, lease_duration_ms=300000,
+                      renew_interval_ms=100, heartbeat_interval_ms=100,
+                      teardown_timeout=2.0)
+    meta_id, tid, _ = seed_worklist(covey_bin, rt.db_file)
+    _, workspace = linked_worktree(tmp_path)
+    prior = tmp_path / "prior-cwd"
+    prior.mkdir()
+    record_session_cwd(agent.session_id, str(prior))
+
+    ok(rt.execute({"action": "start", "subtask_id": tid,
+                   "workspace": str(workspace)}))
+    stop_background(rt)  # no renewal races against the assertion window
+    assert get_session_cwd(agent.session_id) == str(workspace)
+
+    # Park a second `_mutation` inside the runtime lock via the transport
+    # seam; teardown then exhausts its budget on lock acquisition.
+    in_flight, release = threading.Event(), threading.Event()
+    outcome = {}
+
+    def blocking(real, args, **kwargs):
+        if is_cmd(args, "subtask", "status"):
+            in_flight.set()
+            release.wait(20)
+        return real(args, **kwargs)
+
+    def worker():
+        outcome["result"] = rt.execute({"action": "start", "subtask_id": tid})
+
+    with intercepted(monkeypatch, mod, blocking):
+        th = threading.Thread(target=worker)
+        th.start()
+        try:
+            assert in_flight.wait(15), "in-flight status call never parked"
+            # Deterministic overlap around native cwd publication: park a
+            # guard pass at its record_session_cwd publication step and run
+            # close concurrently.  Pre-fix (no serialization) close restores
+            # prior cwd and returns while the parked publication then lands
+            # the retired workspace; with the fix close's revoke waits for
+            # the in-flight publication to land, then revokes it.
+            entered, resume = threading.Event(), threading.Event()
+            fired = {"once": False}
+            orig_record = terminal_tool.record_session_cwd
+
+            def pausing_record(key, value):
+                if value == str(workspace) and not fired["once"]:
+                    fired["once"] = True
+                    entered.set()
+                    resume.wait(20)
+                return orig_record(key, value)
+
+            def guard_worker():
+                guard_worker.outcome = rt.workspace_guard(
+                    "terminal", {"command": "ls"})
+
+            gw = threading.Thread(target=guard_worker)
+            close_worker = threading.Thread(target=rt.close)
+            with monkeypatch.context() as m:
+                m.setattr(terminal_tool, "record_session_cwd", pausing_record)
+                gw.start()
+                assert entered.wait(15), "guard publication never parked"
+                close_worker.start()
+                time.sleep(2.6)
+                resume.set()
+                close_worker.join(30)
+                gw.join(30)
+            assert not close_worker.is_alive()
+            assert not gw.is_alive()
+
+            # Budget exhausted while the claim stays uncertain: routing
+            # released, flock free, guard closed for good.
+            # No elapsed bound here: close's own deadline starts after the
+            # serialized publish revoke; its budgeted bound for a held
+            # runtime lock is asserted by
+            # test_concurrent_close_bounded_and_no_late_authority.
+            assert rt.closed is True
+            assert get_session_cwd(agent.session_id) == str(prior), \
+                "budget-exhausted close must restore cwd, not leave the retired workspace routing"
+            assert rt.workspace_guard("terminal", {"command": "ls"}) is None, \
+                "closed runtime must not guard or rebind"
+            peer_rt = mod.CoveyRuntime(agent_for("tdb-peer"), binary=covey_bin,
+                                       db_path=str(rt.db_file),
+                                       profile_home=str(tmp_path))
+            try:
+                assert peer_rt._acquire_workspace_lock(str(workspace)) is None, \
+                    "budget-exhausted close must release the worktree flock"
+            finally:
+                peer_rt.close()
+
+            # Real consumer: a native relative write resolves through the
+            # restored cwd and cannot land in the retired worktree.
+            rel = "after-close.py"
+            handle_function_call(
+                "write_file", {"path": rel, "content": "restored\n"},
+                session_id=agent.session_id,
+                task_id=getattr(agent, "_current_task_id", agent.session_id),
+                tool_call_id=uuid.uuid4().hex)
+            assert (prior / rel).read_text() == "restored\n"
+            assert not (workspace / rel).exists()
+        finally:
+            release.set()  # release the parked backend call
+            th.join(30)
+
+    # Late authority cannot re-bind: the parked request returned without
+    # publishing, and the guard stays closed after it lands.
+    assert not th.is_alive()
+    assert rt.workspace_guard("terminal", {"command": "ls"}) is None
+    assert get_session_cwd(agent.session_id) == str(prior)
+    # The claim was never fabricated-released: the native engine still
+    # carries this claim truthfully (engine lease expiry is the backstop).
+    task = fresh_covey(covey_bin, rt.db_file, "subtask", "status",
+                       "--subtask-id", tid)
+    assert task["claim"] is not None
+    assert task["subtask"]["state"] == "in_progress"
+    assert outcome["result"]["ok"] is False  # refused, not applied
+
+
+def test_claim_publication_atomic_against_close_revocation(
+        covey, covey_bin, tmp_path, agent_for, make_runtime, monkeypatch):
+    # The claim-application thread holds the runtime lock and passes the
+    # _closed check, then pauses at the _Claim construction seam; close
+    # revokes and its budget branch runs while the claim is still parked.
+    # Publication itself is atomic under the publish mutex, so after close
+    # the claim is either refused outright or (when publication landed
+    # first) close's revocation restores the authoritative cwd — the
+    # retired workspace can never remain the agent's cwd either way.
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+    h = covey(db_path="/unused/placeholder.db")
+    mod = runtime_module(h)
+    agent = agent_for("late-pub")
+    rt = make_runtime(h, agent, lease_duration_ms=300000,
+                      renew_interval_ms=100, heartbeat_interval_ms=100,
+                      teardown_timeout=2.0)
+    meta_id, tid, _ = seed_worklist(covey_bin, rt.db_file)
+    _, workspace = linked_worktree(tmp_path)
+    prior = tmp_path / "prior-cwd"
+    prior.mkdir()
+    record_session_cwd(agent.session_id, str(prior))
+
+    entered, resume = threading.Event(), threading.Event()
+    orig_claim_cls = mod._Claim
+
+    def pausing_claim(*args, **kwargs):
+        entered.set()
+        resume.wait(20)
+        return orig_claim_cls(*args, **kwargs)
+
+    def worker():
+        worker.result = rt.execute({"action": "start", "subtask_id": tid,
+                                    "workspace": str(workspace)})
+
+    with monkeypatch.context() as m:
+        m.setattr(mod, "_Claim", pausing_claim)
+        th = threading.Thread(target=worker)
+        th.start()
+        try:
+            assert entered.wait(20), "_Claim construction seam never reached"
+            close_worker = threading.Thread(target=rt.close)
+            close_worker.start()
+            # Deliberate test parking (NOT a subprocess wait): with the fix
+            # close blocks here until the in-flight publication lands, and
+            # the budget fixed BEFORE the publish guard then exhausts on
+            # the runtime lock.  Pre-fix close returns immediately while
+            # the claim is still parked and publishes into a revoked
+            # runtime once resumed.
+            time.sleep(2.6)
+            resume.set()
+            close_worker.join(30)
+            th.join(30)
+        finally:
+            resume.set()
+    assert not close_worker.is_alive()
+    assert not th.is_alive()
+    assert rt.closed is True
+    # The late claim result is refused, never applied as fresh authority.
+    assert worker.result["ok"] is False
+    # Whichever serialization order the fix chose, the retired workspace
+    # cannot remain routed: cwd is the restored authoritative prior.
+    assert get_session_cwd(agent.session_id) == str(prior), \
+        "claim publication raced close revocation and left the workspace as cwd"
+    # Guard state on a closed runtime is inert (the plugin registry evicted
+    # it) and conservative either way: workspace_guard_closed refuses
+    # mutations if force-called, and the retirement path that re-opened it
+    # never re-binds cwd.  The authoritative invariant is the cwd itself.
+    directive = rt.workspace_guard("terminal", {"command": "ls"})
+    assert directive is None or directive.get("code") == "workspace_guard_closed", directive
+    # The guard call itself must not (re)bind cwd either.
+    assert get_session_cwd(agent.session_id) == str(prior)
+
+    # The native claim truthfully stays with the engine (no fabricated
+    # release, no locally applied authority in a closed runtime).
+    task = fresh_covey(covey_bin, rt.db_file, "subtask", "status",
+                       "--subtask-id", tid)
+    assert task["claim"] is not None
+
+
 def test_uncertain_register_retry_reuses_principal_and_token(covey, tmp_path, agent_for, monkeypatch):
     # Review defect: uncertain requests must not wedge into permanent
     # outcome_unknown. After an orchestrator register timeout (the request never
@@ -2162,3 +2378,514 @@ def test_exception_text_redacted_in_warning_logs(covey, covey_bin, agent_for, ma
     assert secret not in json.dumps(out), out
     assert secret not in caplog.text, caplog.text
     assert "session_[redacted]" in caplog.text, caplog.text
+
+
+# ---------------------------------------------------------------------------
+# AC11: structured resumable handoff
+# ---------------------------------------------------------------------------
+
+HANDOFF = {
+    "objective": "fix flaky parser",
+    "changes": ["touched parser.py"],
+    "verification_refs": ["pytest tests/test_parser.py"],
+    "failed_approaches": ["regex patch"],
+    "remaining": ["handle unicode"],
+}
+
+
+def linked_worktree(tmp_path):
+    """A canonical REAL linked Git worktree (init+commit the main repo, then
+    git worktree add) so validation, cwd routing and the shared-identity
+    lock exercise actual Git metadata, not synthetic fixtures."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-C", str(repo)]
+    run(git + ["init", "-b", "main"])
+    (repo / "file.txt").write_text("base\n")
+    run(git + ["-c", "commit.gpgsign=false", "add", "file.txt"])
+    run(git + ["-c", "commit.gpgsign=false", "commit", "-m", "base"])
+    wt = tmp_path / "wt"
+    run(git + ["worktree", "add", "--detach", str(wt)])
+    return repo, wt
+
+
+def run(cmd):
+    import subprocess
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_handoff_codec_roundtrip_redaction_and_limits(covey, tmp_path, agent_for):
+    h = covey(db_path=str(tmp_path / "d.db"))
+    mod = runtime_module(h)
+    token = f"session_{'a1b2c3d4' * 4}"
+    bad = dict(HANDOFF, remaining=[f"check {token} on prod"])
+    summary = mod.encode_handoff(bad, str(tmp_path))
+    assert mod.HANDOFF_MARKER in summary
+    assert token not in summary and mod.REDACTED in summary
+    assert len(summary.encode()) <= mod.HANDOFF_MAX_BYTES
+    assert "\n" not in summary and "\t" not in summary
+    record = mod.decode_handoff(summary)
+    assert record is not None
+    assert record["objective"] == bad["objective"]
+    assert record["remaining"] == [f"check {mod.REDACTED} on prod"]
+    # malformed / unmarked inputs are never treated as validated records
+    assert mod.decode_handoff("plain text summary") is None
+    assert mod.decode_handoff("{not json") is None
+    assert mod.decode_handoff(json.dumps({"marker": "covey-handoff.v9"})) is None
+    stripped = {k: v for k, v in record.items() if k != "workspace"}
+    assert mod.decode_handoff(json.dumps(stripped)) is None
+    # byte limit enforced on the encoded bytes (multibyte payload)
+    huge = dict(HANDOFF, objective="é" * (mod.HANDOFF_MAX_BYTES))
+    with pytest.raises(mod.ActionReject) as excinfo:
+        mod.encode_handoff(huge, str(tmp_path))
+    assert excinfo.value.code == "invalid_arguments"
+
+
+def test_checkpoint_persists_marked_handoff_and_releases_claim(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "h.db"
+    h = covey(db_path=str(db))
+    wt = str(linked_worktree(tmp_path)[1])
+    _, tid, _ = seed_worklist(covey_bin, db)
+    agent = agent_for("w1")
+    ok(call(h, agent, action="start", subtask_id=tid, workspace=wt))
+    fin = ok(call(h, agent, action="checkpoint", subtask_id=tid,
+                   handoff=dict(HANDOFF, remaining=["next: run tests"])))
+    assert fin["state"] == "available"
+    shown = ok(call(h, agent_for("r"), action="resume", subtask_id=tid))
+    handoffs = shown["resume_handoffs"]
+    assert len(handoffs) == 1
+    assert handoffs[0]["validated_handoff"] is not None
+    assert handoffs[0]["validated_handoff"]["remaining"] == ["next: run tests"]
+    # provenance stays bound to the original claim/fence, token-free
+    assert handoffs[0]["outcome_kind"] == "retryable_failure"
+    assert isinstance(handoffs[0]["claim_id"], str)
+    assert handoffs[0]["fence_seq"] >= 1
+    assert shown["subtask"]["state"] == "available"
+    # the release happened atomically with the receipt
+    assert shown["ownership_health"] == "unclaimed"
+
+
+def test_checkpoint_evidence_policy_preserved(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "ev.db"
+    meta_id, _, orch = seed_worklist(covey_bin, db)
+    tid = fresh_covey(covey_bin, db, "subtask", "create",
+                      "--session-token", orch,
+                      "--meta-task-id", meta_id, "--title", "cp needs evidence",
+                      "--completion-policy", "direct",
+                      "--evidence-policy", "required",
+                      "--routing-key", "default")["subtask_id"]
+    h = covey(db_path=str(db))
+    agent = agent_for("a")
+    ok(call(h, agent, action="start", subtask_id=tid))
+    refused = err(call(h, agent, action="checkpoint", subtask_id=tid, handoff=HANDOFF))
+    assert refused["code"] == "evidence_required"
+    done = ok(call(h, agent, action="checkpoint", subtask_id=tid, handoff=HANDOFF,
+                   evidence_digest="blake3:abc"))
+    assert done["state"] == "available"
+
+
+def test_resume_returns_unmarked_summaries_unverified(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "r.db"
+    h = covey(db_path=str(db))
+    _, tid, _ = seed_worklist(covey_bin, db)
+    ok(call(h, agent_for("a"), action="start", subtask_id=tid))
+    ok(call(h, agent_for("a"), action="retry", subtask_id=tid,
+            summary="I fixed it (trust me)", failure_code="done"))
+    shown = ok(call(h, agent_for("b"), action="resume", subtask_id=tid))
+    handoff = shown["resume_handoffs"][0]
+    assert handoff["validated_handoff"] is None
+    assert handoff["unverified_summary"] == "I fixed it (trust me)"
+
+
+def test_workspace_start_refuses_non_worktree_paths(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "ws.db"
+    h = covey(db_path=str(db))
+    repo, wt = linked_worktree(tmp_path)
+    meta_id, tid, orch = seed_worklist(covey_bin, db)
+    plain = tmp_path / "plain"; plain.mkdir()
+    # Real non-Git path and REAL main checkout are both refused (the
+    # main-checkout gitdir == common-dir, which the guard rejects); a real
+    # linked worktree is accepted.
+    refused = err(call(h, agent_for("a"), action="start", subtask_id=tid,
+                       workspace=str(plain)))
+    assert refused["code"] == "workspace_invalid"
+    refused = err(call(h, agent_for("a"), action="start", subtask_id=tid,
+                       workspace=str(repo)))
+    assert refused["code"] == "workspace_invalid"
+    ok(call(h, agent_for("a"), action="start", subtask_id=tid, workspace=str(wt)))
+    # legacy unbound start still works (coordination-only), no global veto:
+    # the second seeded task starts on a different agent without a workspace
+    second = seed_task(covey_bin, db, orch, meta_id, "legacy")
+    ok(call(h, agent_for("b"), action="start", subtask_id=second))
+
+
+def test_workspace_guard_blocks_outside_mutation_then_closes(covey, covey_bin, tmp_path, agent_for,
+                                                             make_runtime):
+    # Real runtime + real claim: the guard runs on the ACTUAL
+    # _workspace_guard code path used by the registered pre_tool_call hook,
+    # with a real live claim installed via start(), then a REAL expiry of the
+    # real lease (honest short lease, engine expiry) flips it closed.
+    h = covey(db_path="/unused/placeholder.db")
+    _, wt = linked_worktree(tmp_path)
+    wt = str(wt)
+    rt = make_runtime(h, agent_for("g"), lease_duration_ms=400,
+                      renew_interval_ms=10000, heartbeat_interval_ms=10000)
+    meta_id, tid, _ = seed_worklist(covey_bin, rt.db_file)
+    started = ok(rt.execute({"action": "start", "subtask_id": tid, "workspace": wt}))
+    assert started["workspace"] == wt
+    # live claim: inside file + terminal allowed; outside file/patch refused
+    inside = f"{wt}/f.py"
+    assert rt.workspace_guard("write_file", {"path": inside}) is None
+    assert rt.workspace_guard("terminal", {"command": "pytest"}) is None
+    # relative targets resolve INSIDE the workspace (legitimate work)
+    assert rt.workspace_guard("write_file", {"path": "f.py"}) is None
+    # V4A headers are the actual patch targets patch_tool() mutates
+    v4a = (f"*** Begin Patch\n*** Update File: {tmp_path}/evil.py\n"
+           "+x\n*** End Patch\n")
+    assert rt.workspace_guard("patch", {"mode": "patch", "patch": v4a})["code"] \
+        == "workspace_mutation_outside"
+    assert rt.workspace_guard("write_file", {"path": str(tmp_path / "evil.py")})["code"] \
+        == "workspace_mutation_outside"
+    # REAL lease expiry: claim is retired truthfully, guard flips closed
+    stop_background(rt)
+    sleep_until_ms(started["lease_deadline_ms"] + 500)
+    rt.maintenance_once()  # maintenance notices the real expiry
+    assert rt.workspace_guard("terminal", {"command": "ls"})["code"] == "workspace_guard_closed"
+    assert rt.workspace_guard("write_file", {"path": inside})["code"] == "workspace_guard_closed"
+    # native read-only process actions stay exempt for truthful handoff
+    assert rt.workspace_guard("process_manage", {"action": "poll"}) is None
+
+
+def test_workspace_guard_never_engages_unbound_runtime(covey, covey_bin, tmp_path, agent_for,
+                                                       make_runtime):
+    h = covey(db_path="/unused/placeholder.db")
+    rt = make_runtime(h, agent_for("u"))
+    meta_id, tid, _ = seed_worklist(covey_bin, rt.db_file)
+    ok(rt.execute({"action": "start", "subtask_id": tid}))  # unbound claim
+    assert rt._guarded_workspace is None
+    assert rt.workspace_guard("terminal", {"command": "ls"}) is None
+
+
+def test_worktree_flock_serializes_start_across_runtimes(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "lock.db"
+    h = covey(db_path=str(db))
+    repo, wt = linked_worktree(tmp_path)
+    _, tid, _ = seed_worklist(covey_bin, db)
+    ok(call(h, agent_for("owner"), action="start", subtask_id=tid, workspace=str(wt)))
+    # machine-wide lock lives in the SHARED git identity (real gitdir), not per-profile
+    assert any(p.name == "covey-tasks.lock" for p in (repo / ".git").rglob("covey-tasks.lock"))
+    # the flock itself blocks peers on a DIFFERENT task while held
+    mod = runtime_module(h)
+    peer_rt = mod.CoveyRuntime(agent_for("peer"), binary=covey_bin, db_path=str(db),
+                               profile_home=str(tmp_path))
+    try:
+        busy = peer_rt._acquire_workspace_lock(str(wt))
+        assert busy is not None and busy["code"] == "workspace_busy"
+    finally:
+        peer_rt.close()
+
+
+def test_read_diagnostics_filters_and_bounds(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "diag.db"
+    h = covey(db_path=str(db))
+    for bad in ({"action": "candidates", "role": "manager"},
+                {"action": "candidates", "role": "executor", "limit": 9999},
+                {"action": "stuck", "older_than_ms": 0},
+                {"action": "stuck", "older_than_ms": 1, "limit": 500}):
+        assert err(call(h, agent_for("d"), **bad))["code"] == "invalid_arguments"
+    _, tid, _ = seed_worklist(covey_bin, db)
+    base = covey_events(covey_bin, db)
+    tok_before = db_tokens(db)
+    got = ok(call(h, agent_for("d"), action="candidates", role="executor"))
+    assert tid in [item["subtask_id"] for item in got["items"]]  # native flat rows projected
+    ok(call(h, agent_for("d"), action="availability"))
+    ok(call(h, agent_for("d"), action="stuck", older_than_ms=3600000))
+    assert db_tokens(db) == tok_before  # reads never register sessions
+    assert covey_events(covey_bin, db) == base  # reads never write events
+    # empty DB path still short-circuits without creating anything
+    empty = tmp_path / "empty.db"
+    h2 = covey(db_path=str(empty))
+    err4 = err(call(h2, agent_for("e"), action="candidates", role="executor"))
+    assert err4["code"] == "not_initialized"
+    assert not empty.exists()
+
+
+
+
+def test_bound_claim_guards_actual_native_file_dispatch(covey, covey_bin, tmp_path, agent_for, monkeypatch):
+    from agent.subagent_lifecycle import bind_subagent_parent
+    monkeypatch.chdir(tmp_path)
+
+    db = tmp_path / "dispatch.db"
+    h = covey(db_path=str(db))
+    _, workspace = linked_worktree(tmp_path)
+    _, task, _ = seed_worklist(covey_bin, db)
+    owner, peer = agent_for("dispatch-owner"), agent_for("dispatch-peer")
+    owner._current_task_id = "file-task-not-session"
+    ok(call(h, owner, action="start", subtask_id=task, workspace=str(workspace)))
+    owner._current_task_id = "rotated-file-task"
+    outside = tmp_path / "outside.py"
+
+    def dispatch(agent, name, arguments):
+        from model_tools import handle_function_call
+        with bind_subagent_parent(agent):
+            return handle_function_call(
+                name, arguments, session_id=agent.session_id,
+                task_id=getattr(agent, "_current_task_id", agent.session_id),
+                tool_call_id=uuid.uuid4().hex)
+
+    dispatch(owner, "write_file", {"path": "owned.py", "content": "inside\n"})
+    assert (workspace / "owned.py").read_text() == "inside\n"
+    dispatch(owner, "write_file", {"path": str(outside), "content": "escaped\n"})
+    assert not outside.exists()
+    patch = f"*** Begin Patch\n*** Add File: {outside}\n+escaped\n*** End Patch"
+    dispatch(owner, "patch", {"mode": "patch", "patch": patch})
+    assert not outside.exists()
+    ok(call(h, owner, action="finish", subtask_id=task, summary="guard exercise"))
+    dispatch(owner, "write_file", {"path": str(workspace / "owned.py"), "content": "stale owner\n"})
+    assert (workspace / "owned.py").read_text() == "inside\n"
+    dispatch(peer, "write_file", {"path": str(outside), "content": "independent peer\n"})
+    assert outside.read_text() == "independent peer\n"
+
+
+def test_bound_release_then_unbound_start_clears_stale_guard(covey, covey_bin, tmp_path,
+                                                             agent_for, make_runtime,
+                                                             monkeypatch):
+    # bound claim -> release (guard stays closed) -> SUCCESSFUL legacy unbound
+    # start (guard dropped, native writes legal again).  Same runtime, real
+    # covey, real native dispatch — no new binding is created for the old
+    # workspace.
+    from agent.subagent_lifecycle import bind_subagent_parent
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "lifecycle.db"
+    h = covey(db_path=str(db))
+    _, workspace = linked_worktree(tmp_path)
+    meta_id, task, seed_orch = seed_worklist(covey_bin, db)
+    rt = make_runtime(h, agent_for("lc"), db=db.name)
+    started = ok(rt.execute({"action": "start", "subtask_id": task,
+                             "workspace": str(workspace)}))
+    ok(rt.execute({"action": "release", "subtask_id": task}))
+    # the stale guard remains until a fresh start actually succeeds
+    assert rt._guarded_workspace == str(workspace)
+
+    second = seed_task(covey_bin, db, seed_orch, meta_id, "legacy follow-up")
+    ok(rt.execute({"action": "start", "subtask_id": second}))  # unbound legacy claim
+    assert rt._guarded_workspace is None  # previous binding NOT re-inherited
+
+    agent = agent_for("lc")
+    from model_tools import handle_function_call
+    outside = tmp_path / "legacy.py"
+    with bind_subagent_parent(agent):
+        handle_function_call(
+            "write_file", {"path": str(outside), "content": "legacy\n"},
+            session_id=agent.session_id,
+            task_id=getattr(agent, "_current_task_id", agent.session_id),
+            tool_call_id=uuid.uuid4().hex)
+    assert outside.read_text() == "legacy\n"
+
+
+def test_absent_cwd_records_cleared_on_release(covey, covey_bin, tmp_path, agent_for,
+                                               make_runtime):
+    # record_session_cwd ignores None/empty values, so absent records must be
+    # REMOVED via clear_session_cwd on release; restoring with None is a no-op
+    # and would leave the agent pinned to the released worktree.
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+    db = tmp_path / "cwd.db"
+    h = covey(db_path=str(db))
+    _, workspace = linked_worktree(tmp_path)
+    meta_id, task, _ = seed_worklist(covey_bin, db)
+    agent = agent_for("cwd-agent")
+    agent._current_task_id = "cwd-task"
+    record_session_cwd(agent.session_id, None)  # absent prior (record not created)
+    record_session_cwd(agent._current_task_id, None)
+    rt = make_runtime(h, agent, db=db.name)
+    ok(rt.execute({"action": "start", "subtask_id": task, "workspace": str(workspace)}))
+    assert get_session_cwd(agent.session_id) == str(workspace)
+    assert get_session_cwd(agent._current_task_id) == str(workspace)
+    ok(rt.execute({"action": "release", "subtask_id": task}))
+    assert get_session_cwd(agent.session_id) is None
+    assert get_session_cwd(agent._current_task_id) is None
+
+
+def test_prior_cwd_record_restored_on_release(covey, covey_bin, tmp_path, agent_for,
+                                              make_runtime):
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+    db = tmp_path / "cwd2.db"
+    h = covey(db_path=str(db))
+    _, workspace = linked_worktree(tmp_path)
+    meta_id, task, _ = seed_worklist(covey_bin, db)
+    agent = agent_for("prior-agent")
+    prior = str(tmp_path / "prior-cwd")
+    (tmp_path / "prior-cwd").mkdir()
+    record_session_cwd(agent.session_id, prior)
+    rt = make_runtime(h, agent, db=db.name)
+    ok(rt.execute({"action": "start", "subtask_id": task, "workspace": str(workspace)}))
+    assert get_session_cwd(agent.session_id) == str(workspace)
+    ok(rt.execute({"action": "release", "subtask_id": task}))
+    assert get_session_cwd(agent.session_id) == prior
+
+
+def test_guard_selects_current_database_and_never_leaks_across_dbs(
+        covey, covey_bin, tmp_path, agent_for, monkeypatch):
+    # Same profile, same live agent object: when the profile's current db_path
+    # changes, the pre-tool hook must follow the (agent, profile, canonical-db)
+    # key covey_tasks uses — never the runtime of a different database.
+    import yaml
+    from agent.subagent_lifecycle import bind_subagent_parent
+    from tools.terminal_tool import get_session_cwd
+    monkeypatch.chdir(tmp_path)
+
+    def blocked_by_guard(plugin, tool, args):
+        result = plugin.hook("pre_tool_call", tool_name=tool, args=args)
+        return result[0] if result else None
+
+    def use_db(plugin, path):
+        cfg = yaml.safe_load((plugin.home / "config.yaml").read_text())
+        cfg["plugins"]["entries"]["covey-tasks"]["settings"]["db_path"] = str(path)
+        (plugin.home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+    parent1 = tmp_path / "one"; parent1.mkdir()
+    parent2 = tmp_path / "two"; parent2.mkdir()
+    _, wt1 = linked_worktree(parent1)
+    _, wt2 = linked_worktree(parent2)
+    db1 = tmp_path / "a.db"
+    db2 = tmp_path / "b.db"
+    agent = agent_for("dual-db")
+
+    h = covey(db_path=str(db1))
+    _, t1, _ = seed_worklist(covey_bin, db1)
+    ok(call(h, agent, action="start", subtask_id=t1, workspace=str(wt1)))
+    outside = tmp_path / "other-db.py"
+
+    # Guard engages for the CURRENT database's bound claim.
+    with bind_subagent_parent(agent):
+        assert blocked_by_guard(h, "write_file",
+                                {"path": str(outside), "content": "x\n"})
+
+    # Switch the profile to the second database: the first database's guard
+    # must not block, and no stale cwd routing leaks into the new runtime.
+    use_db(h, db2)
+    _, t2, _ = seed_worklist(covey_bin, db2)
+    with bind_subagent_parent(agent):
+        assert blocked_by_guard(h, "write_file",
+                                {"path": str(outside), "content": "x\n"}) is None
+        # The old database's cwd routing must not be inherited by the new
+        # runtime before any claim exists there: switching DBs releases the
+        # released claim's cwd, and t2's start rebinds it to wt2 below.
+        assert get_session_cwd(agent.session_id) != str(wt1), \
+            "switching databases must not leak the retired workspace as cwd"
+        ok(call(h, agent, action="start", subtask_id=t2, workspace=str(wt2)))
+    assert get_session_cwd(agent.session_id) == str(wt2)
+    with bind_subagent_parent(agent):
+        assert blocked_by_guard(h, "write_file",
+                                {"path": str(outside), "content": "x\n"})
+
+    # Switch back: t1's claim is untouched and still releasable through the
+    # first database's runtime; the second database's live guard keeps working.
+    use_db(h, db1)
+    # Switching back must restore the live workspace association, not just
+    # leave the task claimable: the guard hook rebinds native cwd to wt1,
+    # while runtime2's claim/flock for db2 stays untouched.
+    with bind_subagent_parent(agent):
+        assert blocked_by_guard(h, "write_file",
+                                {"path": str(outside), "content": "x\n"})
+        assert get_session_cwd(agent.session_id) == str(wt1), \
+            "switching back to the claiming database must restore its workspace cwd"
+    released = ok(call(h, agent, action="release", subtask_id=t1))
+    assert released["state"] == "available"  # release returns the task to the pool
+    use_db(h, db2)
+
+    with bind_subagent_parent(agent):
+        assert blocked_by_guard(h, "write_file",
+                                {"path": str(outside), "content": "x\n"}), \
+            "switching databases must not disarm the live claim's guard"
+
+def test_uncertain_unbound_claim_never_rebinds_released_workspace(
+        covey, covey_bin, tmp_path, agent_for, monkeypatch):
+    # Bound start -> release (guard stays closed) -> unbound replacement whose
+    # `subtask start` times out (real CLI fault injected at the transport
+    # seam). The hook must never rebind the released workspace for an unbound
+    # claim; the authoritative cwd is restored. After the same request_id
+    # replays into a real successful start, native relative writes land
+    # outside the old worktree.
+    from agent.subagent_lifecycle import bind_subagent_parent
+    from model_tools import handle_function_call
+    from tools.terminal_tool import get_session_cwd, record_session_cwd
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "uncertain.db"
+    h = covey(db_path=str(db))
+    _, workspace = linked_worktree(tmp_path)
+    meta_id, task, orch = seed_worklist(covey_bin, db)
+    agent = agent_for("uncertain")
+    prior = str(tmp_path / "prior-cwd")
+    (tmp_path / "prior-cwd").mkdir()
+    record_session_cwd(agent.session_id, prior)
+
+    ok(call(h, agent, action="start", subtask_id=task, workspace=str(workspace)))
+    ok(call(h, agent, action="release", subtask_id=task))
+    second = seed_task(covey_bin, db, orch, meta_id, "unbound follow-up")
+
+    mod = runtime_module(h)
+    start_seen = False
+
+    def partial_start(real, args, **kwargs):
+        nonlocal start_seen
+        if tuple(args[:2]) == ("subtask", "start") and not start_seen:
+            start_seen = True
+            return TIMEOUT_ENVELOPE
+        return real(args, **kwargs)
+
+    rid = str(uuid.uuid4())
+    with intercepted(monkeypatch, mod, partial_start):
+        partial = err(call(h, agent, action="start", subtask_id=second, request_id=rid))
+    assert partial["code"] == "outcome_unknown", partial
+
+    with bind_subagent_parent(agent):
+        blocked = h.hook("pre_tool_call", tool_name="terminal", args={"command": "pytest"})
+    assert blocked and blocked[0]["message"], "retained guard must stay closed"
+    assert get_session_cwd(agent.session_id) == prior, \
+        "unbound replacement claim must not rebind the released workspace"
+
+    ok(call(h, agent, action="start", subtask_id=second, request_id=rid))
+
+    with bind_subagent_parent(agent):
+        passed = h.hook("pre_tool_call", tool_name="terminal", args={"command": "echo ok"})
+    assert not passed, "successful unbound start clears the stale guard"
+    assert get_session_cwd(agent.session_id) == prior
+
+    # The guard is open for the unbound claim, so native relative resolution
+    # is authoritative: a relative path resolves against the restored prior
+    # directory and must never execute inside the released old worktree.
+    rel = "follow-up.py"
+    with bind_subagent_parent(agent):
+        handle_function_call(
+            "write_file", {"path": rel, "content": "unbound\n"},
+            session_id=agent.session_id,
+            task_id=getattr(agent, "_current_task_id", agent.session_id),
+            tool_call_id=uuid.uuid4().hex)
+    assert (tmp_path / "prior-cwd" / rel).read_text() == "unbound\n"
+    assert not (workspace / rel).exists()
+
+def test_relative_gitdir_lock_resolves_from_worktree(covey, covey_bin, tmp_path, agent_for,
+                                                     monkeypatch):
+    # A linked worktree created with RELATIVE git metadata (gitdir: ../.git/...)
+    # must resolve its lock through the worktree's actual absolute gitdir, not
+    # against the Hermes process cwd.
+    db = tmp_path / "relgit.db"
+    h = covey(db_path=str(db))
+    repo, workspace = linked_worktree(tmp_path)
+    (repo / ".git" / "worktrees" / "wt" / "gitdir").write_text("../worktrees/wt/\n")
+    meta_id, task, _ = seed_worklist(covey_bin, db)
+    monkeypatch.chdir(tmp_path)  # process cwd is NOT the gitdir's parent
+    ok(call(h, agent_for("rel-owner"), action="start", subtask_id=task,
+            workspace=str(workspace)))
+    # A competing owner cannot acquire the same worktree identity
+    mod = runtime_module(h)
+    peer_rt = mod.CoveyRuntime(agent_for("rel-peer"), binary=covey_bin,
+                               db_path=str(db), profile_home=str(tmp_path))
+    try:
+        busy = peer_rt._acquire_workspace_lock(str(workspace))
+        assert busy is not None and busy["code"] == "workspace_busy"
+    finally:
+        peer_rt.close()

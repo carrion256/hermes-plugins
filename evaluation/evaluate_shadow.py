@@ -28,8 +28,10 @@ import urllib.request
 MODEL = "qwen3.8-flash-next"
 BASE_URL = "http://localhost:8001/v1"
 CLASSIFIER = "http://192.168.50.149:8787"
+SEED = 20261009
 LIMIT = 16384
 SECRETS = []
+ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh")
 _OBS_LOCK = threading.Lock()
 WORKFLOW = (" Work only in the current directory. Validate by running "
             "`python3 -m pytest -q` there. Never modify or delete test_public.py, "
@@ -160,7 +162,8 @@ def aggregate(results, *, mode):
     evaluable = [r for r in results if r.get("evaluable")]
     groups = {}
     for result in evaluable:
-        label = (result.get("classifier") or {}).get("verdict", "unobserved")
+        verdict = (result.get("classifier") or {}).get("verdict")
+        label = verdict if verdict is not None else "unclassified"
         row = groups.setdefault(label, {"n": 0, "correct": 0, "corrective_cycles": 0,
                                        "corrective_observations": 0,
                                        "latency_seconds": [], "tokens": [], "cost_available": 0})
@@ -206,6 +209,10 @@ def run_native(args, request):
     its conversation is never run. Child effort is the parent's reasoning dict
     verbatim (effort inheritance); the subagent-effort plugin observes only.
     """
+    effort = request.get("effort", "xhigh")
+    if effort not in ALLOWED_EFFORTS:
+        raise ValueError("unsupported requested effort")
+    seed = int(request.get("seed", SEED))  # caller-supplied paired seed; default unchanged
     workspace = Path(request["workspace"])
     home = Path(request["hermes_home"])
     home.mkdir(parents=True, exist_ok=True)
@@ -341,18 +348,114 @@ def run_native(args, request):
         if sid is None or sid not in rows:
             raise SystemExit(f"expected shadow row for child {sid!r} missing "
                              f"(have {sorted(rows)})")
-        return {"row": rows[sid], "payload": payload}
+        row = rows[sid]
+        # classification_state may be pending/unavailable: the row itself and
+        # its native usage/origin/cost are real child evidence regardless;
+        # never fabricate a verdict and never wait for classification
+        state = row.get("classification_state") or (
+            "classified" if row.get("verdict") is not None else "unavailable")
+        if state != "classified":
+            print(f"subagent-effort shadow row {sid}: classification not "
+                  f"complete ({state}); native evidence retained",
+                  file=sys.stderr)
+        row.setdefault("classification_state", state)
+        return {"row": row, "payload": payload}
 
     from run_agent import AIAgent
     from hermes_constants import parse_reasoning_effort
     parent = AIAgent(
         base_url=args.base_url, api_key=os.environ.get("LOCAL_MODEL_API_KEY") or "local",
         provider="lilith", api_mode="chat_completions", model=args.model,
-        reasoning_config=parse_reasoning_effort("xhigh"),
-        request_overrides={"max_tokens": 4096},
+        reasoning_config=parse_reasoning_effort(effort),
+        # native seed for paired reproducibility; paired arms share a seed, repeats differ
+        request_overrides={"max_tokens": 4096, "seed": seed},
         enabled_toolsets=["terminal", "file", "todo"],
         skip_background_review=True, skip_context_files=True, skip_memory=True,
         quiet_mode=True, platform="cli")
+    # Observe the SDK's final serialized HTTP body, not its requested config.
+    # No URL, headers, prompt, response content or credentials are persisted;
+    # seed and effort are safe request metadata. HTTP acceptance is NOT proof
+    # the backend honored an effort internally.
+    import httpx
+    from urllib.parse import urlsplit
+    endpoint = urlsplit(args.base_url)
+    wire = {"requested_effort": effort, "requests": [],
+            "backend_effective_effort": "unknown"}
+    send = httpx.Client.send
+    async_send = httpx.AsyncClient.send
+
+    def observe(http_request):
+        url = http_request.url
+        if (url.host != endpoint.hostname or url.port != endpoint.port
+                or not url.path.endswith(("/chat/completions", "/responses"))):
+            return None
+        row = {"sequence": len(wire["requests"]), "actually_sent_effort": None,
+               "status_code": None, "seed": None}
+        body = None
+        try:
+            body = json.loads(http_request.content)
+            values, sources = [], []
+            if isinstance(body.get("reasoning_effort"), str):
+                values.append(body["reasoning_effort"])
+                sources.append("reasoning_effort")
+            if isinstance((body.get("reasoning") or {}).get("effort"), str):
+                values.append((body.get("reasoning") or {}).get("effort"))
+                sources.append("reasoning.effort")
+            if isinstance((body.get("chat_template_kwargs") or {}).get("reasoning_effort"), str):
+                values.append((body.get("chat_template_kwargs") or {}).get("reasoning_effort"))
+                sources.append("chat_template_kwargs.reasoning_effort")
+            row["effort_sources"] = sources
+            row["sent_effort_raw"] = values[0] if values else None
+            row["effort_encoding_conflict"] = bool(len(set(values)) > 1)
+            row["actually_sent_effort"] = values[0] if len(set(values)) == 1 \
+                and values[0] in ALLOWED_EFFORTS else None
+        except (ValueError, TypeError, AttributeError, httpx.RequestNotRead):
+            row["metadata_unreadable"] = True
+        if isinstance(body, dict):
+            # provider-specific transmitted controls (safe integers/booleans):
+            # Lilith maps effort to thinking_budget/chat_template_kwargs/thinking_scaffold
+            row["thinking_budget"] = body.get("thinking_budget")
+            row["thinking_scaffold"] = (body.get("chat_template_kwargs") or {}).get("thinking_scaffold")
+            # safe metadata only: seed is an integer defined by the backend contract
+            if isinstance(body.get("seed"), int):
+                row["seed"] = body["seed"]
+        wire["requests"].append(row)
+        atomic(Path(args.output) / "wire.json", wire)
+        return row
+
+    def observed_send(client, http_request, **kwargs):
+        row = observe(http_request)
+        try:
+            response = send(client, http_request, **kwargs)
+            if row is not None:
+                row["status_code"] = response.status_code
+            return response
+        except Exception as exc:
+            if row is not None:
+                row["transport_error_type"] = type(exc).__name__
+            raise
+        finally:
+            if row is not None:
+                atomic(Path(args.output) / "wire.json", wire)
+
+    async def observed_async_send(client, http_request, **kwargs):
+        row = observe(http_request)
+        try:
+            response = await async_send(client, http_request, **kwargs)
+            if row is not None:
+                row["status_code"] = response.status_code
+            return response
+        except Exception as exc:
+            if row is not None:
+                row["transport_error_type"] = type(exc).__name__
+            raise
+        finally:
+            if row is not None:
+                atomic(Path(args.output) / "wire.json", wire)
+
+    atomic(Path(args.output) / "wire.json", wire)
+    httpx.Client.send = observed_send
+    httpx.AsyncClient.send = observed_async_send
     record_session_cwd(None, str(workspace))
     set_session_cwd(str(workspace))  # native explicit context pin
     try:
@@ -368,6 +471,8 @@ def run_native(args, request):
             entry["cost_usd"] = None  # unknown provenance: never present 0 as actual
         shadow = shadow_row()
     finally:
+        httpx.Client.send = send
+        httpx.AsyncClient.send = async_send
         clear_session_cwd(None)
         clear_runtime_cwd()
         # manager.unload(None) also removes observer registrations.
@@ -382,10 +487,15 @@ def run_native(args, request):
     row = shadow["row"]
     atomic(Path(args.output) / "native.json", {
         "native": entry, "status": entry.get("status"),
+        "requested_effort": effort,
+        "requested_seed": seed,
+        "actually_sent_efforts": sorted({r["actually_sent_effort"] for r in wire["requests"]
+                                        if r["actually_sent_effort"] is not None}),
         "classifier": {k: row.get(k) for k in
                        ("verdict", "suggested_effort", "clamped_effort",
                         "supported_efforts", "child_reasoning_config", "child_model",
-                        "child_provider", "outcome_status", "latency_ms")}
+                        "child_provider", "outcome_status", "latency_ms",
+                        "classification_state", "classification_reason")}
         | {"child_session_id": telemetry["child_session_id"]},
         "plugin_state": shadow["payload"]})
     atomic(Path(args.output) / "telemetry.json", telemetry)

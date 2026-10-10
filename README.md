@@ -1,227 +1,227 @@
 # hermes-plugins
 
-Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/carrion256/dsh-plugins) and [oh-my-pi](https://github.com/can1357/oh-my-pi). The integration target is the installed Hermes plugin SDK, not an approximation of its hooks.
+Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/carrion256/dsh-plugins) and [oh-my-pi](https://github.com/can1357/oh-my-pi). Plugins remain independently installable and reuse native todo, verification, review, MCP, Covey and papercuts stores.
 
-## Coding stack
+**This upgrade requires the accompanying Hermes host changes.** The base revision `b141dd1881499a98df0853d500e4d666c394a971` alone is insufficient. Local implementation and qualification do not install plugins, restart services or change an active profile.
 
-| Plugin | Implemented behavior |
+## Inventory
+
+| Plugin | Implemented contract |
 |---|---|
-| `tool-fff` | Optional `search_files` override delegates directly to Hermes's native handler: task CWD/backend, credential filtering, redaction, structured results, pagination and result cap are preserved. No fff acceleration is claimed; the unsupported CLI integration was removed. Disabled override leaves native search untouched. |
-| `rules` | Global/project YAML-frontmatter rules, agent/profile and path scopes, deterministic precedence, a discoverable rulebook, and one-time targeted guidance in the originating tool result. Never appends prose to executable arguments or file contents. |
-| `keyword-steering` | Configured prose keywords supply turn-local context. Fenced/inline code, quoted text, paths and identifiers do not activate keywords. |
-| `auto-answer-classifier` | Low-risk defaults are labelled `automatic_answers` in the original clarification result. Human responses are unchanged, each suggestion names its question, and approval/destructive questions remain human-owned. Multi-question defaults stay advisory: the native batch result cannot distinguish an explicit blank skip from a timeout. No injected user message or cross-session queue. |
-| `auto-review-classifier` | Advisory risk screening uses native `pre_tool_call` block/approve directives. Mutating `process_manage` actions are screened; read-only polling is exempt. `ask` requests real human approval. Classifier outages remain deliberately fail-open: this is not an authorization boundary or a code-quality reviewer. |
-| `loop-guard` | Repeated calls must return identical results before the next retry is blocked. Read-only polling is exempt and real final answers break tool streaks. Repeated final answers produce next-turn context, never a new parent/gateway task. All state is fenced to the native bound agent. |
-| `continuation` | Native todo criteria → fresh verification evidence → independent native `/review` → actionable findings → fixes/re-verification → clean review on current evidence. Uses same-turn `pre_verify` directives, not queued user messages. |
-| `prewalk` | Explicit parent arming and optional child prewalk; a real nonempty todo plan must precede successful edit/write handoff. The arming result contains the same-turn planning nudge. Native model switching rebuilds provider settings; no provider-ready request rewriting. Status/reset tools make the one-way handoff inspectable. |
-| `subagent-effort` | **Shadow only.** Records classification, the child's actual model/provider/effort, supported-effort information, latency, token usage, native estimated cost, verification observations and repeated-mutation counts. Never changes an explicit or inherited effort choice. `/subagent_effort` displays bounded, persisted observations. |
-| `covey-tasks` | One `covey_tasks` tool for durable finite worklists and fenced task ownership over the Covey CLI (explicit local DB and binary per profile). Native `todo_list` is left untouched; Covey completion is not native verification or review. See [Durable worklists](#durable-worklists-covey-tasks) and [setup](#covey-tasks-setup). |
+| `continuation` | Explicit requirement declarations and owned check observations bind native evidence IDs to source hashes, execution workspace and task. Independent review must assess coverage, not just notice a passing test. |
+| `prewalk` | Only `prewalk_ready` performs the model handoff, after a native todo plan and evidence-grounded execution brief. Scratch writes do not signal readiness. Optional replanning is bounded and off by default. |
+| `covey-tasks` | Native durable worklists, fenced claims, compact checkpoint/resume handoffs and native discovery diagnostics. Optional linked-worktree ownership guards prevent cooperative workers sharing one workspace. |
+| `rules` | Scoped rule delivery plus `rules_explain`: applicability, provenance, precedence, explicit conflicts, omitted entries and check references. Guidance is never executable authorization. |
+| `browser-bladebro` | Native MCP browsing and bounded, approval-aware runs. Local self-contained HTML scenarios can bind immutable artifact bytes and observed interactions to native verification evidence. Ordinary HTTP browsing is not build attestation. |
+| `loop-guard` | Bounded structured-error, failed-verification and short-cycle recovery. Delivered interventions, exact next-call hypotheses and matching recovery are distinguished from suppression or exhausted budgets. |
+| `auto-review-classifier` | Advisory screening of operation effects, resolved targets and missing context, with redacted egress and operation-specific native approvals. Selected risky approvals revalidate scope after consent. |
+| `tool-fff` | **Retired.** Use native `search_files`; no override consent, extra search registration or claimed acceleration. |
+| `tool-docling` | Content-addressed Python Docling conversion, source/converter provenance, selective retrieval and explicit missing extraction metadata. Publication is locked and atomic. |
+| `subagent-effort` | Shadow telemetry and separate paired experiments. Explicit effort choices remain unchanged; automatic routing is **NOT_QUALIFIED**. |
+| `auto-answer-classifier` | Evidence-supported ranking of all eligible conventional choices, scoped human-approved preferences, and per-question timeout provenance. Human answers and explicit skips remain authoritative. |
+| `keyword-steering` | Explicit configured modes reference existing skills/rules, expire with the turn, expose status and withhold conflicting guidance. No semantic classifier or implied effort switch. |
+| `papercuts` | Typed, redacted reports and native recurrence/triage. Opt-in authoritative tool-failure capture has a cross-process quota; the native binary continues owning the store. |
 
-The remaining adapters are included in the inventory but were **not repaired by this coding-stack change**:
+## Native prerequisites
 
-| Plugin | Current scope / known qualification gap |
-|---|---|
-| `browser-bladebro` | CLI wrapper for see/act/state/vision. Positional argument translation and stderr handling still need repair; native binary behavior is not qualified. |
-| `tool-docling` | Document conversion wrapper. Task-CWD handling and same-basename artifact collisions still need repair; this is not the DSH docling.rs implementation. |
-| `papercuts` | Native friction-report CLI/tool wrapper. Quoted arguments, severity examples and option forwarding still need repair. |
+The matching host source supplies these shared contracts; there is no substitute scheduler or evidence database in this repository:
 
-### Completion is evidence-bound
+- `agent.verification_evidence`: explicit row lookup, external evidence, source/artifact metadata, terminal evidence IDs, disabled-ledger refusal and a durable edit watermark. A later check cannot revive pre-edit evidence.
+- `hermes_cli.plugins` / `plugins_dispatch`: all callbacks run; block wins over approval; delivery/suppression receipts use unique directive identities. `post_tool_call_settled` fires exactly once after every `post_tool_call` dispatch, including when bounded observers are suppressed or time out, so call-observation reservations settle without being wedged forever. Modified operations are presented at approval. A selected internal `revalidate(final_args)` must return exactly `True` after consent or the operation is vetoed.
+- Native final-output transforms compose rather than overwrite each other's warnings; the original streamed text remains available for reconciliation.
+- `tools.clarify_tool`: each question reports `answered`, `skipped` or `timed_out` with its `qid`.
+- `PluginContext.call_mcp(..., replay_on_failure=False)`: trusted out-of-band no-replay policy and a host-minted token identifying the exact MCP connection. Remote result fields are not connection authority.
 
-`continuation` reuses Hermes's verification ledger, bounded verify-on-stop policy and independent review engine. It does not create a second reviewer framework.
+Install the complete corresponding host patch before enabling consumers, then construct new agents. Updating source or configuration does not hot-reload already imported modules. The implementation checkout used for qualification is `/home/common/projects/hermes-agent`; the installed host and active profiles were not modified.
 
-- `agent.verify_on_stop: true` enables native verification. The workspace must be recognized as a coding project and the executed check must qualify as native verification evidence. For example, this host recognizes `python3 -m pytest`, but not an absolute interpreter path with the same arguments. A markerless scratch directory is not automatically a coding project.
-- The reviewer receives the actual pre-LLM task/history excerpt, candidate response, changed paths and native verification evidence. This is labelled as a **partial capture**, not a fabricated full transcript.
-- The native reviewer must return a final canonical JSON object: `{"review_verdict":"clean","findings":[]}`, `{"review_verdict":"findings","findings":["actionable finding"]}`, or `{"review_verdict":"unverified","findings":["missing evidence"]}`.
-- A completed reviewer process alone is not a clean verdict. Missing/malformed verdicts, unavailable ledgers, pending work and findings keep completion unverified.
-- Changed evidence or a new user task invalidates the prior review. Findings remain visible until a clean renewed review.
-- `max_review_rounds` bounds independent reviews; native `agent.max_verify_nudges` bounds continuation. Exhaustion releases the turn with an explicit **Completion unverified** label, not a claim of success.
-- Detached forks and review children cannot recursively start completion reviews. Native empty-response and trailing-intent recovery remain Hermes's responsibility.
+### Installation
 
-### Plan before execution
-
-Configure `plugins.entries.prewalk.settings.target_model` to a model served by the planning model's **same provider/endpoint**. Leave it empty to keep handoff inactive; status reports this explicitly.
-
-Call `prewalk_arm`, create a nonempty native `todo_list`, then perform the first successful `patch` or `write_file`. The handoff uses Hermes's native `switch_model`. Failed/blocked/malformed writes and terminal commands do not trigger it. `prewalk_status` reports state; `prewalk_reset` explicitly permits re-arming. `child_prewalk` controls inherited child planning.
-
-Hermes may defer these tools behind its native tool catalog. Use `tool_search`/`tool_describe`, then the advertised `tool_call` schema. The current schema is `{"calls":[{"name":"prewalk_arm","arguments":{}}]}`; a bare `tool_name` field is not valid.
-
-### Scoped rules
-
-Global directories come from `plugins.entries.rules.settings.rule_dirs` (default `~/.hermes/rules`). Project discovery walks from the session's own workspace through ancestor `.cursor/rules`, `.windsurf/rules` and `.claude/rules` directories. A nearer project rule overrides an ancestor/global rule with the same filename stem.
-
-Rules are `.md` or `.mdc` with safe YAML frontmatter, for example:
-
-```markdown
----
-description: Python changes require behavioral verification
-agents: [sisyphus, sisyphus-junior]
-tools: [write_file, patch]
-globs: ["src/*.py"]
----
-Preserve the public contract and exercise the changed behavior before finishing.
-```
-
-`alwaysApply`, `enabled`, `description`, `agents`, `tools`, `globs` and `condition` are supported; legacy `applies: always` remains a rule-file dialect. Present scopes combine with AND semantics. Path-scoped rules never become unconditional prompt text. Invalid metadata is skipped rather than applied broadly. Tool guidance blocks once with a normal tool-error envelope; the model reads it and retries without modified arguments. Prompt budgets include complete entries and identify omitted rulebook entries for discovery.
-
-### Effort calibration
-
-Classification is observation, not evidence that a task was solved correctly. The shadow report distinguishes lifecycle completion from native verification observations. Repeated file mutations are a **proxy**, not measured rework. Per-child cost is captured from the live child's native accounting before close; `estimated`/`partial` provenance is retained, not represented as an actual invoice. Missing or unproven cost and unsupported provider capability tables stay `unknown`.
-
-Collect representative real tasks and compare correctness/verification, repeated work, latency and cost before enabling any automatic effort policy. This implementation intentionally has **no apply mode**. Tests establish data-path correctness with a controlled classifier, not classifier accuracy or a performance win.
-
-`evaluation/evaluate_shadow.py` provides a separate, explicit live evaluation. Without `--run`, it uses only the standard library to prove all six initial cases fail their public and held-out checks; it does not load credentials or call a model.
-
-```sh
-python evaluation/evaluate_shadow.py --output /tmp/shadow-baseline
-# Use an environment containing both Hermes and pytest for the live run:
-python evaluation/evaluate_shadow.py --run --output /tmp/shadow-live
-```
-
-The live runner reads only `CLASSIFIER_API_KEY` from `~/.hermes/.env`, passes it through a native-scrubbed auxiliary environment name, and isolates each child's Hermes home. It freezes the corpus/order and source hashes, preserves explicit `xhigh` effort for every child, and never gives the child the held-out oracle. Failed coding outcomes remain in the results; provider/runtime failures are recorded separately and prevent a complete evaluation. Rework means an observed failed native verification followed by a later source change—not merely repeated edits. Missing verification or monetary-cost evidence remains unknown.
-
-The defaults target the qualified local Qwen endpoint; `--model`, `--base-url`, and `--env-file` select another explicitly configured route. The backend must support `xhigh`; the runner does not silently change effort. This is a six-case observational study, not a matched lower-versus-higher-effort experiment or a basis for enabling automatic routing.
-
-#### Live observation: 2026-10-09
-
-The frozen run used Winnow-12B `b6ac22b0d51b` for classification and the locally served `qwen3.8-flash-next` for coding. [Raw outcomes and source snapshots](evaluation/results/2026-10-09/results.json), [runtime/corpus provenance](evaluation/results/2026-10-09/manifest.json), and [independent replay/accounting checks](evaluation/results/2026-10-09/verification.json) are retained.
-
-| Task | Classifier label | Held-out checks | Child latency | Input + output tokens | Verified corrective revisions |
-|---|---|---|---:|---:|---:|
-| Record-line parsing | simple | Passed | 7.05 s | 33,283 | 0 |
-| Atomic ledger batches | complex | Passed | 12.21 s | 45,935 | 0 |
-| Exact suffix removal | simple | Passed | 5.22 s | 24,685 | 0 |
-| Per-key single-flight memo | complex | Passed | 147.97 s | 195,083 | 0 |
-| Integer page count | simple | Passed | 7.02 s | 31,863 | 0 |
-| CSV catalog and CLI | complex | Passed | 24.59 s | 78,504 | 0 |
-
-Every child kept the fixed `xhigh` setting, and its public test stayed unchanged. Tokens are accumulated native usage across requests, not a monetary price. The local backend reported **unknown monetary cost for every case**. The memo task's repeated mutations targeted its scratch verification script, illustrating why that proxy must not be equated with production-code rework.
-
-**Decision: automatic routing remains NOT QUALIFIED.** This small sample distinguishes observed task workloads, but it does not establish that lower effort would preserve correctness or save money. The native capability table also reported `unknown` for this route. The [native pilot](evaluation/results/2026-10-09/qualification.json) succeeded with `xhigh` and was rejected with `high`; the endpoint advertised `medium` and `low` as its other supported values, but those settings were not exercised. No gateway configuration or effort policy was changed by the evaluation.
-
-### Durable worklists (`covey-tasks`)
-
-One tool, `covey_tasks`, backed by the Covey CLI. It does not replace or modify native `todo_list`. There are two kinds of todos: native todos are the conversation's own execution steps (and still feed `prewalk` and `continuation`); Covey tasks are durable shared work that survives sessions and processes. Covey reads and writes never create native plan items or native verification evidence, and a Covey `finish` is not review, landing or native verification.
-
-Actions (the full set; there is no update, delete or reopen): `status`, `lists`, `show`, `create`, `add`, `start`, `finish`, `retry`, `fail`, `release`, `abandon`. `lists` and worklist `show` page with `limit` (1–500, default 50) and `offset`; `show` takes exactly one of `meta_task_id` or `subtask_id`, and task `show` rejects pagination arguments.
-
-Workflow:
-
-1. `create(prompt)` a finite worklist, then `add(meta_task_id, title, priority)` **every known task before starting any**. Priority is an integer from 0 to 1000 (default 100), matching Covey's domain. A worklist closes when all its tasks are terminal; a completed worklist is history (add is refused), so create a new one.
-2. `start(subtask_id)` claims and starts that exact task (one active claim per live agent). Do the work and run real checks with native tools.
-3. `finish(subtask_id, summary[, evidence_digest])`, or `retry`/`fail` with `failure_code`, or `release`/`abandon`. A task whose persisted policy requires evidence is rejected without `evidence_digest`; governed tasks are outside this tool. State names are Covey's: closed is not all-success, so inspect `show` counts for failed/abandoned tasks.
-
-Mutations return a non-secret `request_id`. An `outcome_unknown` result (e.g. timeout after a possible commit) is **not** a rollback: `show` the task, reconcile, then repeat explicitly with the same `request_id` if needed.
-
-Ownership leases last 300 s. While, and only while, an agent holds a claim, a background thread heartbeats and renews every 60 s. Child stop, session reset/finalize and unload release or retire ownership within a bounded teardown deadline; after a crash the lease simply expires and a fresh claim (strictly newer fence) is required. An old owner cannot commit an outcome.
-
-Limits: session tokens are cooperative coordination handles, not a security boundary. They pass in the Covey CLI argv and live in the DB, so a same-user process can read them. The plugin redacts `session_…` tokens from tool results and logs but cannot hide them from `ps` or the DB file.
-
-## Installation and configuration
-
-Use a Hermes Python environment with these native SDK modules available. This work was exercised against Hermes `b141dd1881499a98df0853d500e4d666c394a971`; no host/core patch is required.
-
-Each directory in `plugins/` is independently installable. Install/link selected directories into the intended profile's `$HERMES_HOME/plugins/`, then enable them using that profile's normal plugin configuration. Do not silently install the unqualified adapters merely to enable the coding stack.
-
-For an unmanaged, runtime-owned profile:
+Install/link each selected directory containing `plugin.yaml` into the intended profile's `$HERMES_HOME/plugins/`, then use that profile's normal enable/configuration commands. For an unmanaged profile **after installing the required host**:
 
 ```sh
 hermes config set agent.verify_on_stop true
-hermes config get agent.verify_on_stop
 hermes plugins enable continuation
 hermes plugins enable prewalk
 ```
 
-Target a named profile using the existing `hermes -p <profile>` mechanism, or the service's explicit `HERMES_HOME`. Managed installations must change the authoritative managed configuration instead. Persistent configuration is read by newly constructed agents; changing source/configuration does not hot-reload already imported plugin modules or restart an in-flight turn.
+Use `hermes -p <profile>` or an explicit `HERMES_HOME`. Managed installations must change their authoritative managed configuration instead. Classifier keys come from the environment named by `api_key_env`, never from manifests. Missing services/credentials do not fabricate verdicts.
 
-The optional native search override requires operator capability consent (`tools.override`, or the host's legacy `plugins.entries.tool-fff.allow_tool_override` setting) plus `override_search_files: true`. Without it, the native built-in remains available unchanged.
+## Requirement-bound completion
 
-Classifier plugins read the environment variable named by `api_key_env` at call time. Never put credentials in plugin manifests. Their default endpoint is the existing local classifier service; absence/unavailability never fabricates a verdict.
+1. Create native todos for the actual requested outcomes.
+2. Use `acceptance declare` before verification. Each criterion identifies its observable, check kind/identity, relevant source paths and optional references. Match native todo IDs; every required completed todo needs a declaration.
+3. Run the declared check through native tool execution. Bind its actual `verification_evidence.id` with `acceptance bind`. Terminal command targets and execution cwd must match; a passing sibling package or unrelated lint run cannot substitute.
+4. Inspect `acceptance status`. Blocked/cancelled dispositions remain explicit; cancellation is not completion.
+5. Independent native `/review` receives the actual todo content/structure, criterion mapping, source/evidence identity and a labelled partial task/history capture. It must challenge relevance and return coverage for every criterion:
 
-### covey-tasks setup
-
-Prerequisites: a Covey binary built from the Covey checkout that supports `meta list` and subtask finish, and a Hermes host with the bundled bridge (`covey`/lifecycle support) available. An older binary with the same version string is **not** acceptable: the plugin probes capabilities and refuses operations on a stale one, so an installed `covey` on `PATH` may be unusable. Build and point at an explicit path:
-
-```sh
-(cd /home/common/projects/covey && cargo build --locked --bin covey)
+```json
+{"review_verdict":"clean","findings":[],"coverage":{"criterion-id":"covered"}}
 ```
 
-Install or link `plugins/covey-tasks` into the profile's `$HERMES_HOME/plugins/`, then configure exactly these two settings (no others exist; there is no ambient `COVEY_BIN`/legacy-config fallback and no default DB):
+Other verdicts are `findings` and `unverified`; coverage entries may be `gap` or `cancelled`. A finished reviewer process, malformed response, missing declaration or absent evidence is not a clean result. Source, task, todo or evidence changes invalidate prior review, including changes while a synchronous reviewer runs. Native compaction preserves same-agent declarations without accepting foreign-session observations.
+
+Native `agent.verify_on_stop` must be enabled, the cwd must be a recognized coding project, and terminal commands must qualify for the native ledger. For example, this host recognizes `python3 -m pytest`; an absolute interpreter path is not necessarily recognized as the same check. Browser evidence requires an actually observed owned `browser_capture`, not a caller-supplied row alone.
+
+`max_review_rounds` and native `agent.max_verify_nudges` bound intervention. Exhaustion releases the turn with **Completion unverified**, not a fabricated success. Review children/detached forks cannot recursively trigger reviews.
+
+Terminal `check_identity` is the **exact raw executed command**, including its launcher, selectors and options; native heuristic/full-suite classification cannot broaden it. Declarations pin the execution workspace, so moving to another task cwd requires redeclaration and fresh checks. Review mapping must fit the native 12,000-character message limit (including its prefix); overflow remains unverified rather than truncating away requirements.
+
+## Explicit planning handoff
+
+Set `plugins.entries.prewalk.settings.target_model` to an execution model served by the planner's **same provider/endpoint**. Empty means inactive. Call `prewalk_arm`, populate native todos, then call `prewalk_ready` with:
+
+- Located workspace-relative files and relevant symbols/callers. Files must be confined regular files; no callers requires a concrete `callers_absence_reason`.
+- Constraints, non-goals, chosen approach and rejected alternatives.
+- Falsification checks, replanning triggers and acceptance IDs; optional rule references.
+
+The tool validates the brief and invokes native `switch_model`; it does not claim to prove that every model-authored explanation is correct. `prewalk_status` and `prewalk_reset` expose state. `replan_enabled` defaults to false; when enabled, `prewalk_replan` allows one return to the original model with a concrete failed assumption/check.
+
+These tools may be deferred behind Hermes's native catalog. Discover the actual schema via `tool_search`/`tool_describe`; the bridge uses `{"calls":[{"name":"prewalk_arm","arguments":{}}]}`, not a bare `tool_name`.
+
+## Recoverable Covey work
+
+`covey_tasks` keeps durable shared work separate from native conversation todos. Its actions are `status`, `lists`, `show`, `create`, `add`, `start`, `finish`, `retry`, `fail`, `release`, `abandon`, `checkpoint`, `resume`, `candidates`, `availability` and `stuck`. Native diagnostics explain eligibility; this plugin does not schedule work. `finish` remains direct completion, **not governed review/apply, landing or verification**.
+
+Configure an explicit capable binary and absolute local DB:
 
 ```yaml
 plugins:
   entries:
     covey-tasks:
       settings:
-        binary: /home/common/projects/covey/target/debug/covey   # explicit path
-        db_path: /absolute/local/path/covey.db                   # absolute, no ".."
+        binary: /home/common/projects/covey/target/debug/covey
+        db_path: /absolute/local/path/covey.db
 ```
 
-Enable per profile only, explicitly (`hermes -p <profile> plugins enable covey-tasks`). Native `todo_list` and the older `covey`/`todo` plugins are unchanged. Reads never create a missing database: `status` reports configuration/capabilities, while `lists` and `show` return `not_initialized`; only an explicit `create` creates it.
+A version string alone is insufficient: capability probes reject stale binaries. Build from the qualified Covey checkout with `cargo build --locked --bin covey` if needed. There is no ambient `COVEY_BIN`/legacy-config fallback or default DB. Reads do not initialize a missing database; explicit `create` does.
 
-**Backup before first use.** A newer binary may migrate an existing DB when it opens it. Take a consistent copy with SQLite's backup API, not by copying the live file alone (WAL sidecars `-wal`/`-shm` would be missed or inconsistent):
+Create a finite worklist and add known tasks before starting. `start(subtask_id)` claims one task per live agent. Optional `workspace` must be a real linked Git worktree, not the main checkout. A lock in the resolved Git metadata directory reserves that workspace across processes. Native file/patch/terminal/process mutation guards enforce the live claim and task cwd. Release restores previous cwd state; a successful subsequent unbound start clears the obsolete workspace guard. This is **cooperative isolation, not a hostile-shell sandbox**.
+
+Change an agent's DB configuration only while its tool and claim operations are quiescent, preferably in a new session. Sequential DB selection restores cwd without transferring or releasing another DB's claims. Concurrent hot-switching for the same agent is not invocation-scoped cwd isolation; fixed-configuration parallel agents remain separately owned.
+
+`checkpoint` atomically saves a compact `covey-handoff.v1` receipt and retries/releases the task. Its handoff contains objective, changes, verification references, failed approaches and remaining work; workspace identity is attached by the runtime. `resume` obtains a fresh claim and returns `validated_handoff`: structurally checked recovery context, **not renewed proof that old checks remain valid**. Reverify current source. Native evidence requirements apply to checkpoint as well as finish.
+
+Mutations expose a non-secret `request_id`. `outcome_unknown` is not rollback: inspect the native task, reconcile, and explicitly reuse the same request ID if retrying. Leases last 300 seconds and renew every 60 seconds only while a claim exists. Normal teardown releases ownership; after process loss, the lease expires and a newer fence is required.
+
+Session tokens are cooperative handles, visible to same-user processes through CLI argv and the DB; redaction does not make them a security boundary. Back up an existing DB with SQLite's backup API before migration, not a copy that omits WAL sidecars. Disable the plugin/start a new session to roll back integration; never downgrade a migrated DB in place.
+
+## Rules and operating modes
+
+Rules use `rule_dirs` (default `~/.hermes/rules`) plus ancestor `.cursor/rules`, `.windsurf/rules` and `.claude/rules` directories. Nearer project rules override same-name ancestors/global rules. Existing scopes combine with AND semantics; path-specific guidance never becomes unconditional prompt text.
+
+```markdown
+---
+id: python-contract
+description: Exercise changed Python behavior
+agents: [sisyphus]
+tools: [write_file, patch]
+globs: ["src/*.py"]
+check_refs: ["tests/test_contract.py"]
+constraints:
+  api_compatibility: preserve
+---
+Preserve the public contract and exercise the changed behavior.
+```
+
+`rules_explain` exposes matching reasons/sources, precedence, explicit contradictory constraint values, check/verification references and budget omissions. Conflicts are declared metadata/content conflicts, not semantic understanding of arbitrary prose. References are data: neither prose nor check references execute commands or grant permission.
+
+`keyword-steering.settings.modes` maps each mode to `refs`, optional `triggers` and `conflicts_with`. References point to your existing skills/rules rather than copied prompts. Genuine prose triggers activate only for the current user turn; code, quoted text, paths and identifiers are excluded. Conflicting modes are both withheld, and `steering_status` explains requested/active/withheld state. No keyword changes model effort or permits deployment. Legacy `keywords` prompt-copy configuration is rejected rather than silently reinterpreted.
+
+## Failure-aware recovery and risk screening
+
+`loop-guard` records bounded exact call/result history, structured error identities and native failed checks. It detects repeated failures and short cycles without guessing that similar-looking edits are equivalent. Read-only polling is excluded. A blocker retains the failing operation: succeeding at an unrelated check does not clear it.
+
+`loop_recovery status` shows the blocker/history/budget. A hypothesis names one exact next operation intended to distinguish explanations; it never bypasses native approval. Only delivered interventions spend the budget; suppressed/diagnostic directives do not. Exhaustion labels the final answer with the unresolved blocker. Mid-stream model cancellation is still outside this plugin's capabilities.
+
+`auto-review-classifier` screens actual resolved targets/workspace, effects and unavailable context. Recognized credential arguments, flat assignments and nested secret-valued metadata are masked before native redaction and HTTP egress; unsupported nested or unparsed credential-bearing commands refuse screening before HTTP. This is bounded recognition, not a guarantee of detecting every arbitrary secret. Unsafe redaction or unavailable context is reported as unknown/un-screened, not safe. Approval scope includes the operation and target identity; retargeting after consent fails revalidation. This is an **advisory screen**: classifier failure remains deliberately fail-open, while deterministic host permissions and native approval remain authoritative.
+
+`auto-answer-classifier` provides `clarification_defaults recommend`, `record` and `list`. Recommendation uses explicit bounded repository evidence and one all-choice ranking; it never treats option zero as truth. Supported ordinary inputs are unambiguous repo-wide `.editorconfig` settings and supported top-level TOML/JSON scalar conventions. Conditional/conflicting/unset values, ambiguous domains and secret-bearing evidence cause abstention. File hashes and ownership are checked again after ranking and before application.
+
+A recorded convention requires an observed native human choice and a separate native **remember** consent. Only these approved scoped conventions can avoid the prompt outright. Repository recommendations stay advisory until a genuine eligible timeout; each derived answer retains provenance without overwriting human responses. Explicit skips, material choices, destructive decisions and approvals remain human-owned. `dry_run` never applies a default. Legacy batch results lacking per-row provenance remain advisory only.
+
+## Browser acceptance
+
+Configure the native MCP server and explicitly grant its name in `plugins.entries.browser-bladebro.mcp_allowlist`; `settings.server` defaults to `bladebro`. Access is denied by default. The old CLI/opaque argument wrapper is gone.
+
+Tools are `browser_open`, `browser_close`, `browser_run`, `browser_scenario`, `browser_capture` and `browser_screenshot` (renamed to avoid colliding with the host's built-in `browser_vision`; the plugin's version is Bladebro-backed and supplementary). Ordinary browsing remains available for HTTP sites, including authenticated surfaces, but login walls and inaccessible state are not success. Mutating nested runs retain native approval, bounded branching/iteration, atomic target selection/URL guarding and no automatic replay after an uncertain outcome. Host connection identity fences tab ownership across reconnects.
+
+For certifiable local scenarios, declare sources, a confined self-contained HTML artifact, initial/final predicates and the intended DOM interaction **before** execution. Direct HTML must itself be declared source. Generated artifacts require a real foreground native build and its passing owned evidence row. Capture transports exact producer-hashed bytes with a restrictive CSP into a fresh owned tab, then observes the declared sequence through native MCP. Source/artifact drift, missing/truncated framing, failed guards, missing connection identity or uncertain dispatch cannot mint passing evidence. The external ledger records both source revision and transported artifact digest; continuation independently checks the capture observation and binds the actual evidence ID.
+
+**Qualification boundary:** this is local self-contained-artifact proof, not attestation of arbitrary HTTP deployments, origin-dependent applications, multi-file dependency graphs or reproducible toolchains. The restrictive CSP is evidence invalidation, not a browser sandbox: page script can attempt side effects and the final URL guard invalidates evidence rather than preventing them. A byte-identical rebuilt artifact is reported `newly_generated=False`; qualifying a second build requires genuinely fresh output. A stale/degraded scenario is terminal and refuses rebuild — use a fresh scenario. Backend DOM/keyboard/accessibility/error observations must be described according to what was actually returned; text success and screenshots alone do not establish general accessibility or visual correctness. Unsupported predicates remain unverified rather than becoming model-declared passes.
+
+## Traceable documents and friction reports
+
+`docling_convert` uses **Python Docling**, qualified with CLI 2.137.0, not docling.rs. Set `tool-docling.settings.binary` to the intended executable. The source is resolved through native task cwd and sensitive-file policy. Identity includes source contents, input suffix (which can select a different parser), converter executable/version and options; source/converter drift refuses publication. Per-key locking, unique staging and atomic markers prevent partial or concurrent cache corruption. Format-unbound older cache entries are retained on disk but reconverted, not silently reused.
+
+Converter identity retains the complete bounded version report, including reported Docling component versions, rather than its platform footer. A reported package upgrade invalidates cache entries even if the Python launcher is unchanged. This is version-report provenance, not a hash of every transitive dependency. New artifacts use cache-owned `document.md`/`document.json` names distinct from the `artifact.json` marker; cache hits return the adopted marker's filenames.
+
+Results expose source hashes, Markdown/structured JSON artifacts, available `self_ref`/parent/page/section/table provenance and bounded page/section selection. HTML genuinely lacks page provenance: it is reported missing, never synthesized. Cache hits avoid reconversion but still validate identity. Failed conversions—including exit-zero runs without a valid artifact pair—do not overwrite good artifacts. Extracted document contents remain **untrusted source material**, not instructions or authorization.
+
+`papercuts` uses typed fields for category/severity, expected versus observed behavior, version/invocation/result context, reproduction and references. Native deduplication owns recurrence counts and statuses; list/stats/ack/resolve remain native operations. Every string is redacted before filing. Automatic capture defaults off and uses authoritative host failures/delivered loop blocks, not arbitrary text containing “error”; its 20/day quota is updated atomically only after a successful filing. It does not publish externally.
+
+Optional `time_lost_seconds` records **reported observed loss**, not an inferred duration. Native deduplication accumulates the known subtotal and `timed_report_count`; untimed reports remain unknown/partial. `list` with `sort: impact` ranks the complete backlog by severity, recurrence, known reported loss, timing coverage and stable ID before applying `limit`. An observed zero is distinct from missing timing. This is a transparent priority order, not a weighted score or monetary estimate.
+
+Concurrent writers additionally require the **patched native papercuts binary**, not merely the plugin quota lock. The isolated source snapshot is `/home/common/projects/papercuts-hermes-integration`, with sealed `preimage/` files and `lock.patch`. Set `papercuts.settings.binary` explicitly to that snapshot's `papercuts` when evaluating it. Its report/dedup/ack/resolve read-modify-write transactions share a POSIX file lock. Non-POSIX locking failure is explicit. The installed `/home/common/projects/papercuts/papercuts` was deliberately left unchanged; installing the native patch is a separate operator action.
+
+## Paired effort experiments
+
+`subagent-effort` remains shadow-only. Classification, lifecycle completion, actual wire controls, native verification, measured repair cycles and independent deterministic oracle results are separate observations. Missing prices are unknown, not zero. There is no automatic apply/escalation policy.
 
 ```sh
-sqlite3 /absolute/local/path/covey.db ".backup '/absolute/backup/covey-$(date +%F).db'"
+# Offline baseline/oracle checks; no model calls:
+python evaluation/evaluate_paired.py --output /tmp/paired-baseline
+# Explicit live run in an environment with Hermes and required case dependencies:
+python evaluation/evaluate_paired.py --run --efforts medium,xhigh --repeats 2 --seed 20261010 --output /tmp/paired-live
 ```
 
-**Rollback.** Remove or disable only `covey-tasks` for that profile (`hermes -p <profile> plugins disable covey-tasks`) and start a new session. Native todos and other plugins keep working. Owned claims release on normal unload; after a crash they recover when the lease expires. Never downgrade a migrated DB in place; restoring a verified backup is an operator action.
+Each pair starts from identical source, uses the same numeric seed, and has isolated workspace/HOME/HERMES_HOME. Seeds vary across repeats; arm order alternates within each case. The corpus carries six frozen cases (suffix removal, page count, JSONL record parsing, CSV catalog aggregation, cross-file memo state, ledger batches) plus four additive cases (YAML service config, SQLite migration, path-security asset fetch, slug control). The v4 run used a six-case plan; the current design plans all ten (40 arms per two-effort, two-repeat run). Public and hidden oracles have reference-positive and broken/mutant-negative controls. The runner retains failures, timeouts, sources, transmitted controls, cumulative execution/repair usage and deterministic assessment cost; it does **not** claim an independent model code review or known monetary total.
 
-### Configuration cutover
+The 2026-10-10 v4 run attempted 24 arms. One timeout pair and one mixed-effort-transmission pair were excluded, leaving 10 eligible comparisons. A broken path-security oracle and incomplete schema-rollback oracle were found during review; original artifacts remain unchanged. `evaluation/reassess_paired_v4.py` replays corrected oracles against hash-verified frozen candidates, in a separate output directory, without new model calls. These results are explicitly **retrospective**, not a preregistered rerun:
 
-- `tool-fff`: removed `binary`, `fff_search` and the unsupported fff CLI. Use native `search_files`; consumers retain its native arguments/result shape.
-- `rules`: replace the old single `rules_dir` setting with `rule_dirs`. Remove any expectations of tool-argument rewriting.
-- `continuation`: remove `max_steers_per_session`, `empty_stop` and `unexpected_stop`. Use `max_review_rounds` plus native verification/continuation settings.
-- `subagent-effort`: remove obsolete `subagent_prefixes` and any experimental apply-mode setting. The plugin is shadow-only.
-- No `register_goal_provider` SDK API is assumed. Middleware is declared with `provides_middleware` for the native validator; see the pinned-host loader/validator caveat below.
+| Eligible-arm observation | medium | xhigh |
+|---|---:|---:|
+| Correct under corrected deterministic oracles | 10/10 | 10/10 |
+| Cumulative native execution seconds | 305.16 | 405.19 |
+| Native input + output tokens | 445,385 | 596,349 |
+| Native API calls | 65 | 79 |
+
+Lilith transmitted `chat_template_kwargs.reasoning_effort`, budget fields 8192/65536 and scaffold flags false/true. The client profile sets `enable_thinking: true`; an executed sandboxed render of the deployed tokenizer's hash-matched template confirms that medium and xhigh produce distinct prompt prefixes. The same render proves that budget/scaffold fields do not change this template; their intended SGLang behavior is **not qualified on the deployed vLLM fork**. Runtime reasoning-budget enforcement remains unknown. Earlier v3 missing-effort observations were an instrumentation omission, not evidence of unsupported transmission. Durable receipts are under `/home/common/projects/hermes-plugins-qualification/2026-10-10/evidence`: `effort-template-support.json`, `paired-v4-closure/` and the unchanged `paired-live*` attempts. The closure receipt verifies all 24 arm provenance chains and 136 unchanged historical files. These small-sample descriptive totals establish neither general quality equivalence nor monetary savings. **Automatic routing remains NOT_QUALIFIED.**
+
+The earlier fixed-xhigh six-case observation remains frozen in [evaluation/results/2026-10-09](evaluation/results/2026-10-09). It is historical evidence, not a paired effort comparison.
+
+## Configuration cutover
+
+- Remove `tool-fff` installations/settings and any search override consent; native search retains backend isolation, credential filtering and bounded results. Native cross-file content offset paging is not an exhaustive/stable census.
+- Replace `rules_dir` with `rule_dirs`; use rule/check references, not argument rewriting.
+- Replace first-write prewalk assumptions with explicit `prewalk_ready` and its complete handoff.
+- Add explicit acceptance declarations and binding. Old clean review snapshots without requirement coverage are not completion authority.
+- Migrate steering `keywords` to `modes` referencing existing guidance.
+- Use typed browser/papercuts operations; old free-form CLI argument strings are not supported.
+- Remove obsolete continuation steering settings and experimental effort apply settings. No `register_goal_provider` API is assumed.
 
 ## Verification
 
-Run in a Python environment containing the **real Hermes package and pytest**:
+Run with the patched Hermes source and a Python environment containing pytest and the case dependency PyYAML. Do not alter the Nix store or a live profile:
 
 ```sh
-COVEY_TEST_BIN=/home/common/projects/covey/target/debug/covey python -m pytest tests -q
-```
-
-The suite loads plugins through Hermes's native manifest loader and manager in isolated profiles. It covers actual hook producers/consumers, parent/child identity, clarification ownership, scoped/remote search boundaries, generated `hermes_tools` consumers, model switching, verification freshness and durable review results. External classifier/model/backends are isolated; no production credentials or services are required.
-
-`tests/test_workflow_cli.py` additionally launches the actual Hermes CLI against a loopback HTTP model boundary. The real run arms prewalk through the deferred-tool bridge, creates todos, writes code/tests, consumes scoped rules, switches models, runs pytest, records native evidence, obtains an independent native review and finishes. This is an integration proof, not a benchmark of model coding ability.
-
-#### covey-tasks verification
-
-Resolve the SDK interpreter from the installed Hermes wrapper (the Nix store path changes between builds), add pytest to a disposable target rather than the store or global Python, and build Covey first:
-
-```sh
-HERMES_PYTHON=/path/to/hermes-agent-env/bin/python3   # current SDK interpreter
-TEST_DEPS=$(mktemp -d)
-uv pip install --python "$HERMES_PYTHON" --target "$TEST_DEPS" pytest
-(cd /home/common/projects/covey && cargo build --locked --bin covey)
+export HERMES_SOURCE=/home/common/projects/hermes-agent
 export COVEY_TEST_BIN=/home/common/projects/covey/target/debug/covey
-PYTHONPATH="$TEST_DEPS" "$HERMES_PYTHON" -m pytest tests -q
+export PAPERCUTS_BINARY=/home/common/projects/papercuts-hermes-integration/papercuts
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$HERMES_SOURCE${PYTHONPATH:+:$PYTHONPATH}" python -m pytest -p no:cacheprovider tests -q
 ```
 
-`COVEY_TEST_BIN` is a prerequisite only for `tests/test_covey_integration.py` and `tests/test_covey_cli.py`; those modules fail clearly without it rather than skipping. These tests use temporary databases and a loopback model boundary: no production DB, credentials or paid model call. Tests for other plugins need no Covey binary, e.g. `PYTHONPATH="$TEST_DEPS" "$HERMES_PYTHON" -m pytest tests/test_workflow_cli.py -q` or any single non-Covey module.
+The suite uses real native loaders/dispatchers and disposable profiles/databases, isolating external network/model boundaries. The actual Hermes CLI workflows exercise explicit planning, edits, failed verification, loop intervention/recovery, native evidence binding and independent review through a loopback model boundary. This proves integration, not model coding skill. Covey modules require the explicit capable binary rather than silently skipping.
 
-Manifest check, with a temporary home so no real profile is touched: `HERMES_HOME=$(mktemp -d) hermes plugins validate --json plugins/covey-tasks`.
+Real backend qualification is separate: native MCP browser scenarios, actual Docling conversion, native papercuts subprocesses/concurrent writers, live classifier protocol and retained paired-model experiments. Unit-test doubles do not establish backend compatibility. The matching host's verification/arbitration/output/clarify/MCP tests must also pass after installing its source changes.
 
-Structural validation is useful but not a substitute for these checks:
-
-```sh
-for d in plugins/*/; do
-  hermes plugins validate --json "$d"
-done
-```
-
-On the pinned Hermes build, validation rejects `tool-fff`'s deliberately declared `search_files` override as a built-in collision even when runtime override consent is configured. The runtime accepts this supported override; the integration suite exercises it. The same host's loader also warns about `provides_middleware`, although its validator requires that declaration. These are host validator/loader inconsistencies, not reasons to conceal plugin capabilities or remove operator consent.
-
-Native content search also does not guarantee cross-file ordering: `order` is ignored for content, and independent offset pages can overlap or omit matches when file traversal order changes. The adapter preserves that host contract rather than inventing stable pagination. Do not treat a set of cross-file offset pages as an exhaustive census; use bounded single-file searches when stable advancement is required.
+Validate every remaining plugin manifest in a disposable Hermes home with the patched host. The native loader warns about `provides_middleware` although the native validator requires it; retain the declaration rather than conceal middleware. This known loader/validator inconsistency does not grant capabilities.
 
 ## Original-feature boundaries
 
-- `dsh-jump`: GUI navigation hints remain out of scope; Hermes lacks the required UI element API.
-- `dsh-settings-panels`: use Hermes's native `config_schema` surfaces instead of a separate settings UI framework.
-- `dsh-task-prewalk`: not a separate implemented plugin; child planning is part of `prewalk`.
-- Mid-stream thinking/header-loop abort and retry still need a supported host cancellation seam; observers do not provide it.
-- DSH's browser/fff/Docling integrations are not interchangeable with OMP's native browser/search/Markit implementations.
+- `dsh-jump` GUI navigation and separate settings panels are not ported; use native configuration surfaces where available.
+- Child prewalk is part of `prewalk`, not a second plugin.
+- True mid-stream model cancellation still requires a supported host cancellation seam.
+- DSH browser/search/Docling backends are not interchangeable with OMP's native implementations.
 
 ## Attribution
 

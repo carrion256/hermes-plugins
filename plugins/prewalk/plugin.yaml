@@ -1,6 +1,6 @@
 name: prewalk
-version: 0.3.1
-description: "One-way model handoff: strong model plans, cheap model executes from the first planned, successful edit/write (native live switch; reset is explicit)."
+version: 0.5.0
+description: "One-way model handoff driven ONLY by prewalk_ready: strong model plans, validated evidence-backed handoff switches to the cheap execution model via the native live switch (no implicit first-write switch; optional bounded operator-enabled replan back to the original model)."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -8,8 +8,9 @@ provides_tools:
   - prewalk_arm
   - prewalk_status
   - prewalk_reset
+  - prewalk_ready
+  - prewalk_replan
 provides_hooks:
-  - post_tool_call
   - pre_llm_call
   - subagent_start
   - on_session_reset
@@ -30,4 +31,8 @@ config_schema:
   todo_gate:
     type: bool
     default: true
-    description: "Switching requires observing a non-empty todo_list plan first (observational gate)."
+    description: "prewalk_ready requires a non-empty native todo plan (real agent._todo_store) before it may switch."
+  replan_enabled:
+    type: bool
+    default: false
+    description: "Operator opt-in: one bounded prewalk_replan per session back to the ORIGINAL model, only with a concrete failed assumption/check. Default off; the handoff itself never oscillates."

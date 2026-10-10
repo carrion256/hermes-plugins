@@ -1,11 +1,16 @@
 name: continuation
-version: 0.2.0
-description: "Evidence-based completion: pre_verify stop gate holds coding turns until the native todo ledger is clear, verification evidence is fresh, and an independent native /review closed on the exact reviewed change."
+version: 0.4.0
+description: "Evidence-based completion: pre_verify stop gate holds coding turns until the native todo ledger is clear, verification evidence is fresh, and an independent native /review closed on the exact reviewed change; explicit acceptance ledger (declare/bind/status/disposition) binds real native evidence IDs and requires reviewer coverage assessment before clean completion."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
+provides_tools:
+  - acceptance
 provides_hooks:
   - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - post_tool_call_settled
   - pre_verify
   - transform_llm_output
   # on_session_reset/finalize and agent_loop_stopped clear session state;

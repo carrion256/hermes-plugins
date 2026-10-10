@@ -99,16 +99,27 @@ TOOL_SCHEMA = {
     "description": (
         "Durable shared task lists backed by Covey. Actions: status; "
         "lists(limit, offset) to discover worklists; show(meta_task_id) or "
-        "show(subtask_id) for authoritative state; create(prompt) for a new "
+        "show(subtask_id) for authoritative state; resume(subtask_id) for "
+        "prior-attempt recovery context (validated marked handoffs + "
+        "provenance, self-reported claims must be re-verified); "
+        "candidates(role, [meta_task_id, routing_key, limit]), availability "
+        "([meta_task_id, routing_key]) and stuck(older_than_ms, [limit]) "
+        "read-only scheduler diagnostics; create(prompt) for a new "
         "finite worklist; add(meta_task_id, title, priority) for a work task; "
-        "start(subtask_id) to claim+start the exact task; finish/retry/fail "
-        "(subtask_id, summary[, evidence_digest]); release(subtask_id); "
-        "abandon(subtask_id). Plan and add every known task BEFORE starting "
-        "execution; once a worklist is completed it stays history — create a "
-        "new one. Any direct work task can be started; the task's persisted "
-        "evidence policy is still enforced (a task that requires evidence "
-        "needs evidence_digest to finish), and governed tasks stay outside "
-        "this tool. Completion here is not review or landing verification."
+        "start(subtask_id, [workspace]) to claim+start the exact task, "
+        "optionally binding it to a canonical linked Git worktree (cooperative "
+        "workspace isolation: file/terminal cwd is routed there, explicit file "
+        "mutations outside it are refused); finish/retry/fail "
+        "(subtask_id, summary[, evidence_digest, handoff]); checkpoint "
+        "(subtask_id, handoff[, evidence_digest]) persists a marked resumable "
+        "handoff and returns the task to the pool via native retry; "
+        "release(subtask_id); abandon(subtask_id). Plan and add every known "
+        "task BEFORE starting execution; once a worklist is completed it stays "
+        "history — create a new one. Any direct work task can be started; the "
+        "task's persisted evidence policy is still enforced (a task that "
+        "requires evidence needs evidence_digest to finish), and governed "
+        "tasks stay outside this tool. Completion here is not review or "
+        "landing verification."
     ),
     "parameters": {
         "type": "object",
@@ -116,7 +127,9 @@ TOOL_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": ["status", "lists", "show", "create", "add", "start",
-                         "finish", "retry", "fail", "release", "abandon"],
+                         "finish", "retry", "fail", "release", "abandon",
+                         "checkpoint", "resume", "candidates", "availability",
+                         "stuck"],
             },
             "meta_task_id": {"type": "string"},
             "subtask_id": {"type": "string"},
@@ -126,6 +139,23 @@ TOOL_SCHEMA = {
             "failure_code": {"type": "string"},
             "evidence_digest": {"type": "string"},
             "request_id": {"type": "string"},
+            "workspace": {"type": "string"},
+            "handoff": {
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string"},
+                    "changes": {"type": "array", "items": {"type": "string"}},
+                    "verification_refs": {"type": "array", "items": {"type": "string"}},
+                    "failed_approaches": {"type": "array", "items": {"type": "string"}},
+                    "remaining": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["objective", "changes", "verification_refs",
+                             "failed_approaches", "remaining"],
+                "additionalProperties": False,
+            },
+            "role": {"type": "string", "enum": ["executor", "reviewer"]},
+            "routing_key": {"type": "string"},
+            "older_than_ms": {"type": "integer", "minimum": 1},
             "priority": {"type": "integer", "minimum": 0, "maximum": 1000},
             "limit": {"type": "integer"},
             "offset": {"type": "integer"},
@@ -206,6 +236,17 @@ def register(ctx) -> None:
             except Exception as exc:
                 logger.warning("covey-tasks: runtime close failed (%s)", type(exc).__name__)
 
+    def _selected_entry(key, agent):
+        # Caller holds entries' lock. Switching databases changes cwd routing,
+        # not claim ownership: keep the other runtime's lease and flock alive.
+        for other_key, other in entries.items():
+            if other_key != key and other.ref is not None and other.ref() is agent:
+                # ponytail: DB changes must be quiescent for this agent.
+                # This restores sequential routing without releasing claims;
+                # concurrent hot-switching needs invocation-scoped native cwd.
+                other.runtime._restore_session_cwd()
+        return entries.get(key)
+
     def _runtime_for(agent, profile: str, binary: str, db_path: str, canonical_db: str):
         """Runtime for `agent` (None => read-only diagnostic runtime)."""
         ref = None
@@ -223,7 +264,7 @@ def register(ctx) -> None:
                     entries.pop(k, None)
                     if not entry.runtime.closed:
                         stale.append(entry.runtime)
-            entry = entries.get(key)
+            entry = _selected_entry(key, agent)
             if entry is not None and (agent is None or entry.ref() is agent):
                 runtime = entry.runtime
             else:
@@ -285,6 +326,43 @@ def register(ctx) -> None:
         handler=covey_tasks,
         description="Durable Covey worklists: create/add/start/finish with fenced ownership.",
     )
+
+
+    # Cooperative workspace lease guard (NOT a security sandbox — a shell can
+    # deliberately escape): live claim routes file/terminal cwd to the bound
+    # worktree and refuses explicitly path-bearing mutations outside it;
+    # after definite claim loss the guard stays open (file AND terminal
+    # mutations refused, read-only process polling exempt) until a fresh
+    # valid start.  Unbound workspaces (legacy coordination-only starts)
+    # never engage the guard.
+    def workspace_guard(tool_name="", args=None, **_kw):
+        # Same ownership rules as covey_tasks: the guard engages ONLY the
+        # runtime owned by the CURRENT live agent for the CURRENT profile
+        # (the profile selects the canonical database).  A stale runtime for
+        # a different database is never selected, one expired bound task can
+        # never block an unrelated agent/profile, and no runtime is created
+        # for this read-only path.
+        agent = _bound_agent()
+        if agent is None:
+            return None
+        profile = _profile_home()
+        try:
+            _, _, canonical_db = _read_settings(ctx)
+        except ValueError:
+            return None  # no current runtime identity; never inherit another DB's guard
+        with lock:
+            entry = _selected_entry((id(agent), profile, canonical_db), agent)
+            runtime = entry.runtime if entry is not None and entry.ref() is agent else None
+        if runtime is None or not getattr(runtime, "profile_home", profile):
+            return None
+        directive = runtime.workspace_guard(
+            str(tool_name), args if isinstance(args, dict) else {})
+        if directive is None:
+            return None
+        return {"action": "block",
+                "message": str(directive.get("message") or "covey workspace guard")}
+
+    ctx.register_hook("pre_tool_call", workspace_guard)
 
     # subagent_stop fires with the CHILD's live session_id
     # (delegate_tool_results.py:365-371); finalize/reset with the session's

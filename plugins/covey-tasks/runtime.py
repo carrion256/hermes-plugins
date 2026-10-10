@@ -11,11 +11,13 @@ token grammar.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -38,7 +40,8 @@ I64_MAX = 2**63 - 1
 SESSION_TOKEN_RE = re.compile(r"session_[0-9a-fA-F]+")
 REDACTED = "session_[redacted]"
 NORMAL_TIMEOUT = 30.0  # exceeds Covey's 5s SQLite busy timeout + migration margin
-TASK_OPERATIONS = {"create", "add", "start", "finish", "retry", "fail", "release", "abandon"}
+TASK_OPERATIONS = {"create", "add", "start", "finish", "retry", "fail", "release",
+                   "abandon", "checkpoint", "resume", "candidates", "availability", "stuck"}
 TERMINAL_STATES = {
     "finish": "completed",
     "retry": "available",
@@ -46,12 +49,32 @@ TERMINAL_STATES = {
     "abandon": "abandoned",
     "release": "available",
 }
+
+
+# Structured resumable handoff carried in subtask_attempt_outcomes.summary.
+HANDOFF_MARKER = "covey-handoff.v1"
+HANDOFF_MAX_BYTES = 4096  # the native validate_attempt_summary byte limit
+HANDOFF_LIST_FIELDS = ("changes", "verification_refs", "failed_approaches", "remaining")
+
+GUARDED_FILE_TOOLS = frozenset({"write_file", "patch"})
+GUARDED_TERMINAL_TOOLS = frozenset({"terminal", "process_manage"})
+READ_ONLY_PROCESS_ACTIONS = frozenset({"poll", "log", "wait", "list"})
+FILE_PATH_KEYS = ("path", "file", "file_path")
+WORKSPACE_LOCK_NAME = "covey-tasks.lock"
+
 UNCERTAIN_CODES = {"timeout", "empty_output", "invalid_json", "invalid_envelope"}
 # Engine-rendered verdicts (CoveyError -> conflict/not_found/permission_denied
 # with exit codes 1..5) are the only codes that prove authority is gone.
 # Bridge-level faults (binary_not_found, OS permission_denied, exit_N,
 # internal_error/DatabaseError such as SQLITE_BUSY) prove nothing.
 DEFINITE_LOSS_CODES = {"conflict", "not_found", "session_not_active"}
+# Flat SubtaskCandidate fields projected to plugin consumers.
+CANDIDATE_KEYS = (
+    "subtask_id", "meta_task_id", "title", "kind", "state",
+    "completion_policy", "routing_key", "priority", "effective_priority",
+    "is_repair_followup", "blocked_dependents_count", "created_at", "updated_at",
+)
+
 # SessionNotActive / IllegalTransition(Session) / unknown session are all
 # rendered by the backend as conflict or not_found; only the message tells
 # them apart from claim-level conflicts.
@@ -119,6 +142,40 @@ class AddAction:
 class StartAction:
     subtask_id: str
     request_id: str
+    workspace: str = ""  # canonical linked-worktree root; "" = unbound (legacy)
+
+
+@dataclass(frozen=True)
+class CheckpointAction:
+    subtask_id: str
+    handoff: dict
+    evidence_digest: str | None = None
+    request_id: str = ""
+
+
+@dataclass(frozen=True)
+class ResumeAction:
+    subtask_id: str
+
+
+@dataclass(frozen=True)
+class CandidatesAction:
+    role: str
+    meta_task_id: str = ""
+    routing_key: str = ""
+    limit: int = 50
+
+
+@dataclass(frozen=True)
+class AvailabilityAction:
+    meta_task_id: str = ""
+    routing_key: str = ""
+
+
+@dataclass(frozen=True)
+class StuckAction:
+    older_than_ms: int
+    limit: int = 50
 
 
 @dataclass(frozen=True)
@@ -127,6 +184,7 @@ class FinishAction:
     summary: str
     evidence_digest: str | None
     request_id: str
+    handoff: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +195,7 @@ class RetryFailAction:
     evidence_digest: str | None
     request_id: str
     op: str = ""
+    handoff: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -245,23 +304,38 @@ def parse_action(arguments: dict) -> Any:
             request_id=_parse_request_id(args.get("request_id")),
         )
     if action == "start":
-        _check_unknown(args, {"subtask_id", "request_id"})
+        _check_unknown(args, {"subtask_id", "request_id", "workspace"})
+        workspace = args.get("workspace")
         return StartAction(
             subtask_id=_require(args, "subtask_id"),
             request_id=_parse_request_id(args.get("request_id")),
+            workspace="" if workspace is None else _parse_str(workspace, "workspace"),
         )
     if action == "finish":
-        _check_unknown(args, {"subtask_id", "summary", "evidence_digest", "request_id"})
+        _check_unknown(args, {"subtask_id", "summary", "evidence_digest", "request_id", "handoff"})
         digest = args.get("evidence_digest")
+        handoff = args.get("handoff")
         return FinishAction(
             subtask_id=_require(args, "subtask_id"),
             summary=_require(args, "summary"),
             evidence_digest=None if digest is None else _parse_str(digest, "evidence_digest"),
             request_id=_parse_request_id(args.get("request_id")),
+            handoff=None if handoff is None else _validate_handoff(handoff),
+        )
+    if action == "checkpoint":
+        _check_unknown(args, {"subtask_id", "handoff", "evidence_digest", "request_id"})
+        digest = args.get("evidence_digest")
+        return CheckpointAction(
+            subtask_id=_require(args, "subtask_id"),
+            handoff=_validate_handoff(args.get("handoff")),
+            evidence_digest=None if digest is None else _parse_str(digest, "evidence_digest"),
+            request_id=_parse_request_id(args.get("request_id")),
         )
     if action in ("retry", "fail"):
-        _check_unknown(args, {"subtask_id", "summary", "failure_code", "evidence_digest", "request_id"})
+        _check_unknown(args, {"subtask_id", "summary", "failure_code", "evidence_digest",
+                              "request_id", "handoff"})
         digest = args.get("evidence_digest")
+        handoff = args.get("handoff")
         return RetryFailAction(
             subtask_id=_require(args, "subtask_id"),
             summary=_require(args, "summary"),
@@ -269,6 +343,7 @@ def parse_action(arguments: dict) -> Any:
             evidence_digest=None if digest is None else _parse_str(digest, "evidence_digest"),
             request_id=_parse_request_id(args.get("request_id")),
             op=action,
+            handoff=None if handoff is None else _validate_handoff(handoff),
         )
     if action in ("release", "abandon"):
         _check_unknown(args, {"subtask_id", "request_id"})
@@ -276,7 +351,212 @@ def parse_action(arguments: dict) -> Any:
             subtask_id=_require(args, "subtask_id"),
             request_id=_parse_request_id(args.get("request_id")),
         )
+    if action == "resume":
+        _check_unknown(args, {"subtask_id"})
+        return ResumeAction(subtask_id=_require(args, "subtask_id"))
+    if action == "candidates":
+        _check_unknown(args, {"role", "meta_task_id", "routing_key", "limit"})
+        role = _require(args, "role")
+        if role not in ("executor", "reviewer"):
+            raise ActionReject("invalid_arguments", "role must be executor or reviewer")
+        return CandidatesAction(
+            role=role,
+            meta_task_id=_parse_str(args.get("meta_task_id"), "meta_task_id")
+            if args.get("meta_task_id") is not None else "",
+            routing_key=_parse_str(args.get("routing_key"), "routing_key")
+            if args.get("routing_key") is not None else "",
+            limit=_parse_int(args.get("limit", 50), "limit", lo=1, hi=50),
+        )
+    if action == "availability":
+        _check_unknown(args, {"meta_task_id", "routing_key"})
+        return AvailabilityAction(
+            meta_task_id=_parse_str(args.get("meta_task_id"), "meta_task_id")
+            if args.get("meta_task_id") is not None else "",
+            routing_key=_parse_str(args.get("routing_key"), "routing_key")
+            if args.get("routing_key") is not None else "",
+        )
+    if action == "stuck":
+        _check_unknown(args, {"older_than_ms", "limit"})
+        return StuckAction(
+            older_than_ms=_parse_int(args.get("older_than_ms", 3600000), "older_than_ms",
+                                      lo=1, hi=I64_MAX),
+            limit=_parse_int(args.get("limit", 50), "limit", lo=1, hi=50),
+        )
     raise ActionReject("invalid_arguments", f"unknown action {action!r}")
+
+
+def _validate_handoff(value: Any) -> dict:
+    """Strictly parse an inbound handoff payload; the marker is added by the
+    caller so a model cannot forge it."""
+    if not isinstance(value, dict):
+        raise ActionReject("invalid_arguments", "handoff must be an object")
+    _check_unknown(value, {"objective", *HANDOFF_LIST_FIELDS})
+    handoff = {"objective": _parse_str(value.get("objective"), "handoff.objective")}
+    for field_name in HANDOFF_LIST_FIELDS:
+        items = value.get(field_name)
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise ActionReject(
+                "invalid_arguments",
+                f"handoff.{field_name} must be a list of strings",
+            )
+        handoff[field_name] = items
+    return handoff
+
+
+def encode_handoff(handoff: dict, workspace: str) -> str:
+    """Encode a validated handoff as the marked single-line summary the
+    native receipt column carries (compact JSON, <=4096 bytes, token-redacted)."""
+    record = {
+        "marker": HANDOFF_MARKER,
+        "workspace": workspace,
+        **_validate_handoff(handoff),
+    }
+    summary = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    summary = _redact(summary)
+    if len(summary.encode()) > HANDOFF_MAX_BYTES:
+        raise ActionReject(
+            "invalid_arguments",
+            f"handoff exceeds the {HANDOFF_MAX_BYTES}-byte receipt limit; trim it before checkpointing",
+        )
+    return summary
+
+
+def decode_handoff(summary: Any) -> dict | None:
+    """Parse only marked, validated handoff records.  Plain text, malformed
+    JSON and incomplete records return None: summary text is NEVER verified
+    proof, and unmarked receipts stay visible but untrusted."""
+    if not isinstance(summary, str) or HANDOFF_MARKER not in summary:
+        return None
+    try:
+        record = json.loads(summary)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("marker") != HANDOFF_MARKER:
+        return None
+    if not isinstance(record.get("workspace"), str):
+        return None
+    if not isinstance(record.get("objective"), str):
+        return None
+    for field_name in HANDOFF_LIST_FIELDS:
+        items = record.get(field_name)
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            return None
+    return record
+
+
+def _git_output(workspace: str, *args: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workspace, *args],
+            capture_output=True, text=True, timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _validate_workspace(value: str) -> str:
+    """Canonical REAL LINKED worktree root, or None.  The main checkout is
+    refused by comparing its absolute GITDIR to the common dir (for the main
+    checkout they coincide inside the checkout, e.g. <repo>/.git);
+    superprojects, submodules and non-Git paths too.  Absolute Git metadata
+    paths are resolved by git itself, so `git worktree add --relative-paths`
+    entries anchor correctly.  This is cooperative isolation, not a security
+    sandbox."""
+    canonical = os.path.realpath(value)
+    if canonical != value or not os.path.isdir(canonical):
+        return None
+    root = _git_output(canonical, "rev-parse", "--show-toplevel")
+    gitdir = _git_output(canonical, "rev-parse", "--absolute-git-dir")
+    common = _git_output(canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if root is None or gitdir is None or common is None:
+        return None
+    if os.path.realpath(root) != canonical:
+        return None
+    if _git_output(canonical, "rev-parse", "--show-superproject-working-tree"):
+        return None
+    if os.path.realpath(gitdir) == os.path.realpath(common):
+        return None  # gitdir IS the common dir: main checkout, not a linked worktree
+    return canonical
+
+
+def _file_targets(tool_name: str, args: dict) -> "list[str] | None":
+    """Targets a file-mutation tool may write, or None when indeterminate.
+
+    patch(mode='patch') carries its targets in V4A headers; reuse the native
+    extractor so the guard inspects the same paths patch_tool() mutates
+    (including move/delete targets).  Indeterminate extractions refuse."""
+    if tool_name == "patch" and args.get("mode") == "patch" and isinstance(args.get("patch"), str):
+        try:
+            from tools.file_tools import _collect_v4a_header_paths
+        except Exception:
+            return None  # host seam unavailable: refuse, not inspect-and-guess
+        headers = _collect_v4a_header_paths(args["patch"])
+        if isinstance(headers, str):
+            return None  # Native dispatch reports malformed paths
+        return headers[0]
+    targets = [args[k] for k in FILE_PATH_KEYS
+               if isinstance(args.get(k), str) and args.get(k)]
+    if tool_name == "patch" and not targets:
+        return None
+    return targets
+
+
+def _workspace_guard(workspace: str, claim: Any, tool_name: str, args: dict) -> dict | None:
+    """Cooperative workspace lease guard for a guarded (bound) workspace.
+
+    live claim: terminal checks run normally (optionally in the bound
+    workspace cwd); explicit file/patch targets outside the workspace —
+    including V4A header targets — are refused.  claim gone (definite loss
+    or expired lease): ALL guarded file AND terminal/process mutations are
+    refused until a fresh valid start; native read-only process actions
+    (poll/log/wait/list) stay exempt so a truthful handoff can inspect
+    already-running checks."""
+    live = (claim is not None and getattr(claim, "workspace", "") == workspace
+            and not claim.uncertain
+            and claim.lease_deadline_ms > int(time.time() * 1000))
+    if tool_name in GUARDED_TERMINAL_TOOLS:
+        if live:
+            return None  # terminal checks MUST run normally while claimed
+        if (tool_name == "process_manage"
+                and isinstance(args, dict)
+                and args.get("action") in READ_ONLY_PROCESS_ACTIONS):
+            return None
+        return _envelope_failure(
+            "workspace_guard_closed",
+            f"workspace {workspace} is under Covey workspace-guard: the owning claim was "
+            f"released or lost, so terminal/process mutations are refused until a fresh "
+            "valid start on this agent (read-only poll/log/wait/list are allowed)",
+        )
+    if tool_name not in GUARDED_FILE_TOOLS:
+        return None
+    if not live:
+        return _envelope_failure(
+            "workspace_guard_closed",
+            f"workspace {workspace} is under Covey workspace-guard: the owning claim was "
+            f"released or lost, so file mutations are refused until a fresh valid start",
+        )
+    if not isinstance(args, dict):
+        return None
+    targets = _file_targets(tool_name, args)
+    if targets is None:
+        return _envelope_failure(
+            "workspace_mutation_unverified",
+            f"{tool_name} carries no verifiable target paths inside a Covey-bound workspace; "
+            "pass explicit paths or release the task first",
+        )
+    for raw in targets:
+        candidate = raw if os.path.isabs(raw) else os.path.join(workspace, raw)
+        target = os.path.realpath(candidate)
+        if target != workspace and not target.startswith(workspace + os.sep):
+            return _envelope_failure(
+                "workspace_mutation_outside",
+                f"{tool_name} targets {raw}, outside the Covey-bound workspace {workspace}; "
+                "operate inside the bound worktree or release the task first",
+            )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +688,7 @@ class _Claim:
     uncertain: bool = False
     request_id: str = ""  # request that created this claim (partial-start replay)
     started: bool = False
+    workspace: str = ""  # canonical linked-worktree root bound at claim time
 
 
 @dataclass
@@ -469,6 +750,10 @@ class CoveyRuntime:
         self._close_started = False
         self._last_heartbeat_mono = 0.0
         self._last_renew_mono = 0.0
+        self._replaced_guard = None  # previous workspace guard dropped only on successful start
+        self._ws_lock = None  # machine-wide flock handle on the bound worktree
+        self._cwd_backup: dict[str, object] = {}
+        self._guarded_workspace: str | None = None  # guard stays open until next valid start
         self._validate_config(binary)
 
     # -- config / capabilities ---------------------------------------------
@@ -530,6 +815,105 @@ class CoveyRuntime:
     def _task_operations_supported(self) -> bool:
         caps = self._probe_capabilities()
         return all(caps.values())
+
+    # -- workspace binding (cooperative isolation, not security sandbox) ----
+
+    def _acquire_workspace_lock(self, workspace: str) -> dict | None:
+        """Machine-wide advisory lock on the worktree's shared git identity
+        (.git dir for the main checkout; the linked gitdir for worktrees),
+        so two plugin runtimes/profiles on this machine serialize claims on
+        one worktree.  flock is cooperative, not enforcement against a
+        deliberate escape."""
+        # Resolve the gitdir via Git itself (absolute), so linked-worktree
+        # metadata written with relative paths (`gitdir: ../.git/worktrees/x`)
+        # is anchored to the WORKTREE, not to the Hermes process cwd.
+        gitdir = _git_output(workspace, "rev-parse", "--absolute-git-dir")
+        if gitdir is None:
+            return _envelope_failure(
+                "workspace_invalid", f"{workspace}: gitdir could not be resolved")
+        lock_path = os.path.join(os.path.realpath(gitdir), WORKSPACE_LOCK_NAME)
+        handle = None
+        try:
+            handle = open(lock_path, "a+", encoding="utf-8")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if handle is not None:
+                handle.close()
+            if isinstance(exc, BlockingIOError):
+                return _envelope_failure(
+                    "workspace_busy",
+                    f"worktree {workspace} is held by another covey-tasks claim on this machine; "
+                    "wait for it to finish or use a different worktree",
+                )
+            return _envelope_failure("workspace_invalid", f"cannot lock {workspace}: {exc}")
+        self._ws_lock = handle
+        return None
+
+    def _release_workspace_lock(self) -> None:
+        handle = self._ws_lock
+        self._ws_lock = None
+        if handle is not None:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+        self._restore_session_cwd()
+
+    def _bind_session_cwd(self, workspace: str) -> None:
+        """Route the agent's native file/terminal cwd to the workspace under
+        BOTH identity keys file tools consume: session_id (terminal/session
+        surface) and _current_task_id (turn-facade generates a fresh task
+        UUID when run_conversation has none; file tools resolve relative
+        paths through the task_id key)."""
+        agent = self.agent_ref() if self.agent_ref is not None else None
+        keys = [k for k in (getattr(agent, "session_id", None),
+                            getattr(agent, "_current_task_id", None))
+                if isinstance(k, str) and k]
+        if not keys:
+            return
+        try:
+            from tools.terminal_tool import get_session_cwd, record_session_cwd
+            for key in keys:
+                if key not in self._cwd_backup:
+                    self._cwd_backup[key] = get_session_cwd(key)
+                record_session_cwd(key, workspace)
+        except Exception:
+            pass  # host seam unavailable: file/terminal cwd routing degrades to unbound
+
+    def _restore_session_cwd(self) -> None:
+        try:
+            from tools.terminal_tool import clear_session_cwd, record_session_cwd
+            for key, prior in self._cwd_backup.items():
+                if prior is None:
+                    clear_session_cwd(key)
+                else:
+                    record_session_cwd(key, prior)
+        except Exception:
+            pass
+        self._cwd_backup.clear()
+
+    def workspace_guard(self, tool_name: str, args: Any) -> dict | None:
+        """pre_tool_call directive for this runtime's guarded workspace."""
+        with self._close_guard:
+            # Check-then-publish (and the cwd restore below) is serialized
+            # against close()'s authority revocation on the close guard: a
+            # guard pass can never (re)bind cwd after close restored the
+            # authoritative value.  The guard is held only for these host
+            # calls — never across the runtime lock, a subprocess, or an
+            # exit attempt, so close never waits on them.
+            if self._guarded_workspace is None:
+                return None
+            claim = self._claim
+            if claim is not None and claim.workspace == self._guarded_workspace:
+                # Native task IDs can rotate between turns while the claim stays live.
+                self._bind_session_cwd(self._guarded_workspace)
+            elif self._cwd_backup:
+                # An unbound replacement claim never owns this retained guard.
+                # Restore the authoritative cwd instead of rebinding released cwd.
+                self._restore_session_cwd()
+            return _workspace_guard(self._guarded_workspace, self._claim,
+                                    tool_name, args if isinstance(args, dict) else {})
 
     # -- transport ----------------------------------------------------------
 
@@ -605,7 +989,9 @@ class CoveyRuntime:
         try:
             if isinstance(action, StatusAction):
                 return self._status()
-            if isinstance(action, (ListsAction, ShowMetaAction, ShowTaskAction)):
+            if isinstance(action, (ListsAction, ShowMetaAction, ShowTaskAction,
+                                   ResumeAction, CandidatesAction, AvailabilityAction,
+                                   StuckAction)):
                 # Reads against a nonexistent DB short-circuit before any
                 # transport call: the engine would auto-create+migrate the
                 # path, and reads must not create or register anything.
@@ -619,6 +1005,14 @@ class CoveyRuntime:
                 return self._lists(action)
             if isinstance(action, (ShowMetaAction, ShowTaskAction)):
                 return self._show(action)
+            if isinstance(action, ResumeAction):
+                return self._resume(action)
+            if isinstance(action, CandidatesAction):
+                return self._candidates(action)
+            if isinstance(action, AvailabilityAction):
+                return self._availability(action)
+            if isinstance(action, StuckAction):
+                return self._stuck(action)
             requested = action.op if isinstance(action, RetryFailAction) else str(arguments.get("action") or "")
             return self._mutation(action, requested)
         except Exception as exc:  # unexpected defects stay visible, sanitized
@@ -765,6 +1159,94 @@ class CoveyRuntime:
                 "observed_at": observed_at,
             }
         )
+
+    def _resume(self, action: ResumeAction) -> dict:
+        """Token-free recovery view: original task/outcome/fence provenance
+        plus VALIDATED marked handoff records.  Summary text is never proof;
+        unmarked or malformed summaries stay visible but unverified."""
+        shown = self._show_task(ShowTaskAction(subtask_id=action.subtask_id))
+        if shown.get("ok") is not True:
+            return shown
+        data = shown["data"]
+        handoffs = []
+        for outcome in data["attempt_outcomes"]:
+            record = decode_handoff(outcome.get("summary"))
+            handoffs.append({
+                "claim_id": outcome["claim_id"],
+                "fence_seq": outcome["fence_seq"],
+                "outcome_kind": outcome["outcome_kind"],
+                "failure_code": outcome["failure_code"],
+                "evidence_digest": outcome["evidence_digest"],
+                "recorded_at": outcome["recorded_at"],
+                "validated_handoff": record,         # structurally validated marked record
+                "unverified_summary": record is None and outcome.get("summary"),
+            })
+        data["resume_handoffs"] = handoffs
+        data["note"] = ("validated_handoff is a structurally validated record only: "
+                        "its claims (objective/changes/verification refs) are the prior "
+                        "attempt's self-report and must be re-verified, not trusted")
+        return self._ok(data)
+
+    def _candidates(self, action: CandidatesAction) -> dict:
+        argv = ["subtask", "candidates", _opt("--role", action.role),
+                _opt("--limit", action.limit)]
+        if action.meta_task_id:
+            argv.append(_opt("--meta-task-id", action.meta_task_id))
+        if action.routing_key:
+            argv.append(_opt("--routing-key", action.routing_key))
+        payload = self._call(argv, data_list=True)
+        if payload.get("ok") is not True:
+            return _map_transport_failure(payload)
+        rows = payload.get("data")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return self._fail("invalid_envelope", "subtask candidates returned malformed rows")
+        # Native SubtaskCandidate rows are FLAT (subtask_id/title/state at the
+        # top level, no wrapper, no evidence_policy): project them as-is —
+        # wrapping or filtering on a nested "subtask" silently empties the
+        # result even when claimable work exists.
+        items = []
+        for row in rows:
+            if "subtask_id" not in row or "state" not in row:
+                return self._fail("invalid_envelope",
+                                  "subtask candidate row had unexpected shape")
+            items.append({k: row[k] for k in CANDIDATE_KEYS if k in row})
+        return self._ok({"items": items, "limit": action.limit, "role": action.role,
+                         "total": len(items)})
+
+    def _availability(self, action: AvailabilityAction) -> dict:
+        argv = ["subtask", "availability"]
+        if action.meta_task_id:
+            argv.append(_opt("--meta-task-id", action.meta_task_id))
+        if action.routing_key:
+            argv.append(_opt("--routing-key", action.routing_key))
+        payload = self._call(argv)
+        if payload.get("ok") is not True or not isinstance(payload.get("data"), dict):
+            return _map_transport_failure(payload)
+        return self._ok(payload["data"])
+
+    def _stuck(self, action: StuckAction) -> dict:
+        payload = self._call(
+            ["subtask", "stuck", _opt("--older-than-ms", action.older_than_ms),
+             _opt("--limit", action.limit)],
+            data_list=True,
+        )
+        if payload.get("ok") is not True:
+            return _map_transport_failure(payload)
+        rows = payload.get("data")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return self._fail("invalid_envelope", "subtask stuck returned malformed rows")
+        items = []
+        for row in rows:
+            subtask = row.get("subtask")
+            if isinstance(subtask, dict):
+                items.append({
+                    "subtask": _project_task(subtask),
+                    "claim": row.get("claim"),
+                    "session": row.get("session"),
+                    "idle_for_ms": row.get("idle_for_ms"),
+                })
+        return self._ok({"items": items, "limit": action.limit,
+                         "older_than_ms": action.older_than_ms, "total": len(items)})
 
     # -- request idempotency ---------------------------------------------------
 
@@ -983,7 +1465,7 @@ class CoveyRuntime:
 
     @staticmethod
     def _started_data(claim: _Claim) -> dict:
-        return {
+        data = {
             "subtask_id": claim.subtask_id,
             "claim_id": claim.claim_id,
             "fence_seq": claim.fence_seq,
@@ -991,6 +1473,14 @@ class CoveyRuntime:
             "state": "in_progress",
             "guidance": START_GUIDANCE,
         }
+        if claim.workspace:
+            data["workspace"] = claim.workspace
+            data["workspace_guidance"] = (
+                f"native file/terminal cwd is routed to {claim.workspace}; file mutations "
+                "targeting paths outside it are refused. This is cooperative workspace "
+                "isolation, not a security sandbox."
+            )
+        return data
 
     def _do_start(self, action: StartAction, state: _RequestState) -> dict:
         # Existing local claim: check its authoritative status first.
@@ -1025,6 +1515,7 @@ class CoveyRuntime:
                     # ownership: truthful completion, never a second claim.
                     if persisted == "in_progress":
                         claim.started = True  # the earlier start did commit
+                        self._drop_replaced_guard()
                         claim.uncertain = False
                         return self._ok(self._started_data(claim), action.request_id)
                     if persisted == "claimed":
@@ -1085,8 +1576,28 @@ class CoveyRuntime:
                 action.request_id,
                 data={"subtask_id": action.subtask_id, "completion_policy": task["completion_policy"]},
             )
+        bound_workspace = ""
+        if action.workspace:
+            # Workspace binding is refused BEFORE any claim/subprocess side
+            # effect: the target must be this machine's canonical LINKED Git
+            # worktree (main checkout and superprojects are rejected).
+            bound_workspace = _validate_workspace(action.workspace)
+            if bound_workspace is None:
+                return self._fail(
+                    "workspace_invalid",
+                    f"workspace {action.workspace!r} is not a canonical linked Git worktree "
+                    "on this machine (main checkouts, superprojects and non-Git paths are "
+                    "refused); pass the real linked worktree root",
+                    action.request_id,
+                )
+            busy = self._acquire_workspace_lock(bound_workspace)
+            if busy is not None:
+                return self._with_request_id(busy, action.request_id)
         token, error = self._ensure_role("executor", state, action)
         if token is None:
+            # Registration failed/timed out BEFORE the claim was published:
+            # never strand the worktree flock on an unpublished start.
+            self._release_workspace_lock()
             return error
         # Try to exit a retired pending token once, on the action thread.
         pending = self._retired.get("executor")
@@ -1105,22 +1616,37 @@ class CoveyRuntime:
             fence_seq = claim_data.get("fence_seq")
             lease_deadline = claim_data.get("lease_deadline")
             if not (isinstance(claim_id, str) and _is_int(fence_seq) and _is_int(lease_deadline)):
+                # Malformed claim response: the claim may exist natively but
+                # was never installed locally; drop our unpublished lock so
+                # a retry or peer is not blocked by this runtime's handle.
+                self._release_workspace_lock()
                 return self._fail(
                     "invalid_envelope", "claim response had unexpected shape", action.request_id
                 )
         else:
             # A reaped idle executor (SessionNotActive) is retired here so the
             # next explicit start registers a fresh principal.
-            return self._failure_or_uncertain(
+            env = self._failure_or_uncertain(
                 claim_payload, state, action.request_id, "subtask claim", role="executor",
             )
-        if self._closed:
-            # Late in-flight success must not publish authority; lease expiry
-            # is the backstop for the unpublished claim.
+            self._release_workspace_lock()
+            return env
+        # Publication is atomic: _set_claim refuses under the same guard that
+        # serializes close()'s revocation, so a claim whose backend response
+        # passed every earlier _closed check can still never publish into a
+        # revoked runtime (the thread holds the runtime lock and can pass
+        # any check-then-check pattern close's budget branch).
+        if not self._set_claim(claim_id, fence_seq, lease_deadline,
+                               action.subtask_id, action.request_id,
+                               bound_workspace):
+            # The native claim truthfully stays with lease expiry; only local
+            # handles (flock/cwd routing) are released, nothing is published.
+            self._release_workspace_lock()
             return self._fail(
-                "closed", "runtime closed before the claim could be applied", action.request_id
+                "closed",
+                "runtime closed before the claim could be applied",
+                action.request_id,
             )
-        self._set_claim(claim_id, fence_seq, lease_deadline, action.subtask_id, action.request_id)
         return self._issue_start(action, token, self._claim)
 
     def _issue_start(self, action: StartAction, token: str, claim: _Claim) -> dict:
@@ -1134,6 +1660,8 @@ class CoveyRuntime:
             if self._closed:
                 # Teardown already revoked state; do not publish authority.
                 self._claim = None
+                self._release_workspace_lock()
+                self._guarded_workspace = claim.workspace or self._guarded_workspace
                 self._stop_event.set()
                 return self._fail(
                     "closed",
@@ -1141,6 +1669,7 @@ class CoveyRuntime:
                     action.request_id,
                 )
             claim.started = True
+            self._drop_replaced_guard()
             claim.uncertain = False
             return self._ok(self._started_data(claim), action.request_id)
         # Truthful partial state: the claim exists; report the PERSISTED state.
@@ -1223,7 +1752,7 @@ class CoveyRuntime:
         # Required evidence applies to receipt operations only (finish/retry/fail);
         # abandon/release carry no evidence.
         evidence = getattr(action, "evidence_digest", None)
-        if evidence is None and hasattr(action, "summary"):
+        if evidence is None and isinstance(action, (FinishAction, RetryFailAction, CheckpointAction)):
             status = self._read_task_state(action.subtask_id)
             if status is not None and status["subtask"].get("evidence_policy") == "required":
                 # Required evidence is an error, never an invented digest.
@@ -1234,14 +1763,33 @@ class CoveyRuntime:
                     action.request_id,
                 )
         requested = str(getattr(action, "op", requested) or requested or "")
-        if requested == "retry":
-            op, argv_tail = "retry", [_opt("--summary", action.summary), _opt("--failure-code", action.failure_code)]
+        if requested == "checkpoint":
+            # Explicit checkpoint = native `retry`: ONE transaction persists
+            # the marked handoff receipt and releases the claim atomically.
+            op = "retry"
+            summary = encode_handoff(action.handoff, claim.workspace)
+            argv_tail = [_opt("--summary", summary), _opt("--failure-code", "checkpointed")]
             expected_kind = "retryable_failure"
-        elif requested == "fail":
-            op, argv_tail = "fail", [_opt("--summary", action.summary), _opt("--failure-code", action.failure_code)]
+        elif requested == "retry" and isinstance(action, RetryFailAction):
+            summary = action.summary
+            if action.handoff is not None:
+                summary = encode_handoff(action.handoff, claim.workspace)
+            op = "retry"
+            argv_tail = [_opt("--summary", summary), _opt("--failure-code", action.failure_code)]
+            expected_kind = "retryable_failure"
+        elif requested == "fail" and isinstance(action, RetryFailAction):
+            summary = action.summary
+            if action.handoff is not None:
+                summary = encode_handoff(action.handoff, claim.workspace)
+            op = "fail"
+            argv_tail = [_opt("--summary", summary), _opt("--failure-code", action.failure_code)]
             expected_kind = "terminal_failure"
         elif isinstance(action, FinishAction):
-            op, argv_tail = "finish", [_opt("--summary", action.summary)]
+            summary = action.summary
+            if action.handoff is not None:
+                summary = encode_handoff(action.handoff, claim.workspace)
+            op = "finish"
+            argv_tail = [_opt("--summary", summary)]
             expected_kind = "succeeded"
         elif isinstance(action, ReleaseAbandonAction) and requested == "abandon":
             op, argv_tail = "abandon", []
@@ -1281,24 +1829,23 @@ class CoveyRuntime:
                 confirmed, "persisted outcome contradicts the reported result", action.request_id,
                 data={"subtask_id": claim.subtask_id},
             )
-        outcome = None
-        if receipt_kind is not None:
-            outcome = _project_outcome(
-                {
-                    "claim_id": claim.claim_id,
-                    "subtask_id": claim.subtask_id,
-                    "fence_seq": claim.fence_seq,
-                    "outcome_kind": expected_kind,
-                    "summary": getattr(action, "summary", None),
-                    "evidence_digest": evidence,
-                    "failure_code": getattr(action, "failure_code", None),
-                    "recorded_at": None,
-                }
-            )
-        # Definite terminal outcome clears the claim before maintenance can
-        # renew it; the executor token retires (exit releases held claims).
+        # Revoke ownership before projecting a confirmed committed receipt:
+        # a projection failure must never retain its claim or worktree lock.
         released = self._clear_claim_and_retire_executor()
         state.uncertain = False
+        outcome = None
+        if receipt_kind is not None:
+            outcome = _project_outcome({
+                "claim_id": claim.claim_id,
+                "subtask_id": claim.subtask_id,
+                "fence_seq": claim.fence_seq,
+                "summary": summary,
+                "outcome_kind": expected_kind,
+                "evidence_digest": evidence,
+                "failure_code": "checkpointed" if isinstance(action, CheckpointAction)
+                                else getattr(action, "failure_code", None),
+                "recorded_at": None,
+            })
         env = self._ok(
             {"subtask_id": claim.subtask_id, "state": TERMINAL_STATES.get(op, "released"),
              "outcome": outcome},
@@ -1387,18 +1934,54 @@ class CoveyRuntime:
 
     # -- claim authority / maintenance ---------------------------------------------
 
+    def _drop_replaced_guard(self) -> None:
+        """Successful unbound claim: the previous workspace guard is dropped
+        (legacy coordination-only work is no longer bound); the fresh claim
+        itself has no workspace, so nothing is guarded.  Never drops the
+        guard of a claim that carries its own workspace."""
+        claim = self._claim
+        if self._replaced_guard is not None and claim is not None and not claim.workspace:
+            self._guarded_workspace = None
+            self._replaced_guard = None
+
     def _set_claim(self, claim_id: str, fence_seq: int, lease_deadline_ms: int,
-                   subtask_id: str, request_id: str) -> None:
-        if self._closed:
-            return  # revoked: never publish authority after teardown began
-        self._claim = _Claim(
-            subtask_id=subtask_id, claim_id=claim_id, fence_seq=fence_seq,
-            lease_deadline_ms=lease_deadline_ms, request_id=request_id,
-        )
-        self._lost_reason = None
-        self._last_heartbeat_mono = time.monotonic()
-        self._last_renew_mono = time.monotonic()
-        self._start_maintenance()
+                   subtask_id: str, request_id: str, workspace: str = "") -> bool:
+        # Publication is atomic against close()'s revocation on the same
+        # _close_guard used by workspace_guard and the revoke block: an
+        # in-flight action thread holds the runtime lock, so close's budget
+        # branch cannot rely on checks OUTSIDE this guard — the thread can
+        # pass any _closed check and continue publishing.  Inside the guard,
+        # either the claim publishes and close's revoke then restores cwd
+        # (revocation follows every publication), or the claim is refused.
+        # The critical section holds host updates only — never the runtime
+        # lock wait, a subprocess, or an exit attempt.
+        with self._close_guard:
+            if self._closed:
+                return False  # revoked: never publish authority after revocation
+            self._claim = _Claim(
+                subtask_id=subtask_id, claim_id=claim_id, fence_seq=fence_seq,
+                lease_deadline_ms=lease_deadline_ms, request_id=request_id,
+                workspace=workspace,
+            )
+            if workspace:
+                # Fresh valid start on a bound workspace: the guard ENGAGES for it
+                # (live claim: path-checked; claim lost: all guarded mutations
+                # refused until the next valid start) and the agent's native
+                # file/terminal cwd is routed there.
+                self._guarded_workspace = workspace
+                self._bind_session_cwd(workspace)
+            else:
+                # Unbound claims must never re-inherit the PREVIOUS workspace
+                # guard.  It is dropped only when the new claim actually STARTS
+                # (see _issue_start); a partial/failed start is still a live
+                # claim, so its stale guard stays closed until the same request
+                # completes or the claim is retired.
+                self._replaced_guard = self._guarded_workspace
+            self._lost_reason = None
+            self._last_heartbeat_mono = time.monotonic()
+            self._last_renew_mono = time.monotonic()
+            self._start_maintenance()
+        return True
 
     def _start_maintenance(self) -> None:
         if self._closed:
@@ -1555,7 +2138,11 @@ class CoveyRuntime:
     def _retire_executor(self, reason: str) -> None:
         """Definite authority loss: retire the executor TOKEN itself, record
         one pending exit, stop maintenance, and never act on it again."""
+        claim = self._claim
         self._claim = None
+        self._release_workspace_lock()
+        if claim is not None and claim.workspace and self._guarded_workspace is None:
+            self._guarded_workspace = claim.workspace  # open guard until fresh valid start
         self._lost_reason = reason
         self._stop_event.set()
         token = self._token.pop("executor", None)
@@ -1566,7 +2153,11 @@ class CoveyRuntime:
     def _clear_claim_and_retire_executor(self) -> dict | None:
         """Definite outcome cleared: clear claim, stop renewals, retire token
         with one bounded best-effort exit attempt on the action thread."""
+        claim = self._claim
         self._claim = None
+        self._release_workspace_lock()
+        if claim is not None and claim.workspace and self._guarded_workspace is None:
+            self._guarded_workspace = claim.workspace  # open guard until fresh valid start
         self._stop_event.set()
         token = self._token.pop("executor", None)
         diagnostics = None
@@ -1591,9 +2182,17 @@ class CoveyRuntime:
     # -- teardown --------------------------------------------------------------
 
     def close(self) -> None:
-        """Bounded, idempotent teardown.  Revokes local authority FIRST without
-        waiting on any lock, then exits each role once within a single total
-        monotonic deadline that also covers thread join and lock acquisition."""
+        """Bounded, idempotent teardown.  Revokes local authority first —
+        the short publish mutex may wait for an in-flight publication's
+        atomic host updates (never for a subprocess or the runtime lock),
+        and the wait is charged to the budget — then exits each role once
+        within a single total monotonic deadline that also covers thread
+        join and lock acquisition."""
+        # The total teardown budget is fixed BEFORE the publish-revoke guard:
+        # time waiting for an in-flight publication (host updates only) is
+        # charged against the budget and cannot grant a fresh deadline to
+        # the join/lock/backend operations that follow.
+        deadline = time.monotonic() + max(0.1, self.teardown_timeout)
         with self._close_guard:
             if self._close_started:
                 return
@@ -1601,18 +2200,31 @@ class CoveyRuntime:
             self._closed = True  # gates every action, tick and backend call
             self._epoch += 1
             self._stop_event.set()
-        deadline = time.monotonic() + max(0.1, self.teardown_timeout)
+            self._guarded_workspace = None  # closed runtime guards nothing;
+            # fresh runtime decides.  Cwd routing is revoked together with
+            # authority: a late `workspace_guard` can then never re-bind, and
+            # the budget-exhausted branch below is the last chance to stop
+            # stale cwd from routing ordinary relative writes into a retired
+            # worktree (engine fences do not govern plain filesystem writes).
         thread = self._thread
         if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            # An in-flight command consumed the budget: stay revoked; lease
-            # expiry is the backstop.  The in-flight thread sees `_closed` and
-            # publishes nothing.
+            # The in-flight command consumed the budget: stay revoked — the
+            # native claim outcome is uncertain, so it truthfully stays with
+            # lease expiry (never fabricate a release).  But cwd routing and
+            # the worktree flock are LOCAL and ours to release now: this
+            # runtime is evicted from the plugin registry, nothing else will
+            # clean the cwd record, and the quiescent-config boundary cannot
+            # repair a retired runtime.  The late in-flight thread sees
+            # `_closed` (the workspace_guard and _set_claim checks under the
+            # publish guard refuse publication) and cannot re-bind.
+            self._release_workspace_lock()
             logger.warning("covey-tasks teardown budget exhausted before exit; relying on lease expiry")
             return
         try:
             self._claim = None
+            self._release_workspace_lock()
             # exit_session releases held claims and clears active_subtask_id;
             # no redundant claim-release call.
             for role in ("executor", "orchestrator"):

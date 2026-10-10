@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "note": "Additive corpus for categories the frozen shadow_cases.json cannot supply. Frozen corpus stays byte-identical; concurrency (memo-flight) and cross-file (ledger-batches, catalog-csv) cases are referenced from it by id, never copied or modified here.",
+  "categories": [
+    "dependency-api",
+    "migration-atomicity",
+    "path-security",
+    "control"
+  ],
+  "cases": [
+    {
+      "id": "yaml-service-config",
+      "categories": [
+        "dependency-api"
+      ],
+      "difficulty_rationale": "Requires reading the installed PyYAML API correctly (yaml.safe_load over raw string scanning); naive hand-rolled parsing passes shallow smoke checks but corrupts nested structure.",
+      "expected_behavioral_oracle": "load_config reads the YAML file with PyYAML and returns the parsed document unchanged, including nested mappings; returns {} for an empty file; raises ValueError('invalid config') for unparseable input.",
+      "user_goal": "Fix load_config(path) in service_config.py. The file is YAML and PyYAML is installed. Return the parsed document exactly as PyYAML produces it, including nested mappings and scalar coercion. Return {} for an empty file. Raise ValueError('invalid config') when the content is not valid YAML or does not parse to a mapping (a bare scalar or sequence parses successfully but is invalid here). Do not special-case keys or parse lines yourself; use the installed library. Keep the signature load_config(path) and read with encoding utf-8.",
+      "initial_files": {
+        "service_config.py": "import yaml\n\n\ndef load_config(path):\n    data = {}\n    with open(path, encoding=\"utf-8\") as stream:\n        for line in stream:\n            line = line.strip()\n            if not line or line.startswith(\"#\") or \":\" not in line:\n                continue\n            key, value = line.split(\":\", 1)\n            data[key.strip()] = value.strip()\n    return data\n",
+        "app.yaml": "service:\n  name: ledger\n  workers: 4\ndebug: false\nfeatures:\n  retry: true\n"
+      },
+      "public_check": "import service_config\nconfig = service_config.load_config(\"app.yaml\")\nassert isinstance(config.get(\"service\"), dict), config\nassert config[\"service\"] == {\"name\": \"ledger\", \"workers\": 4}, config[\"service\"]\nassert config.get(\"debug\") is False, config\nassert config.get(\"features\") == {\"retry\": True}, config\n",
+      "heldout_assert_script": "import pathlib, tempfile, yaml\nimport service_config\nwith tempfile.TemporaryDirectory() as root:\n    root = pathlib.Path(root)\n    empty = root / \"empty.yaml\"\n    empty.write_text(\"\", encoding=\"utf-8\")\n    assert service_config.load_config(str(empty)) == {}\n    comments = root / \"c.yaml\"\n    comments.write_text(\"# nothing\\n\\n\", encoding=\"utf-8\")\n    assert service_config.load_config(str(comments)) == {}\n    doc = yaml.safe_load(\"{a: 1, b: {c: null}}\")\n    good = root / \"g.yaml\"\n    good.write_text(\"a: 1\\nb:\\n  c:\\n\", encoding=\"utf-8\")\n    assert service_config.load_config(str(good)) == doc, service_config.load_config(str(good))\n    scalar = root / \"s.yaml\"\n    scalar.write_text(\"hello\\n\", encoding=\"utf-8\")\n    try:\n        service_config.load_config(str(scalar))\n    except ValueError as exc:\n        assert str(exc) == \"invalid config\", str(exc)\n    else:\n        raise AssertionError(\"bare scalar must raise ValueError('invalid config')\")\n    seq = root / \"q.yaml\"\n    seq.write_text(\"- 1\\n- 2\\n\", encoding=\"utf-8\")\n    try:\n        service_config.load_config(str(seq))\n    except ValueError as exc:\n        assert str(exc) == \"invalid config\", str(exc)\n    else:\n        raise AssertionError(\"sequence must raise ValueError('invalid config')\")\n    broken = root / \"b.yaml\"\n    broken.write_text(\"a: [1,\\n\", encoding=\"utf-8\")\n    try:\n        service_config.load_config(str(broken))\n    except ValueError as exc:\n        assert str(exc) == \"invalid config\", str(exc)\n    else:\n        raise AssertionError(\"unparseable YAML must raise ValueError('invalid config')\")\n",
+      "_baseline_expected": {
+        "public": "assertion_failure",
+        "heldout": "expected_failure"
+      }
+    },
+    {
+      "id": "sqlite-schema-migration",
+      "categories": [
+        "migration-atomicity"
+      ],
+      "difficulty_rationale": "Atomicity and idempotency failures are invisible to the happy-path public check; correctness requires transaction rollback and migration-version bookkeeping under stdlib sqlite3.",
+      "expected_behavioral_oracle": "migrate upgrades schema_version 1 rows to carry a nullable email column, returns the number of migrations applied this run, is idempotent across repeated calls, and rolls the WHOLE run back (successful step included: schema, data and version all restored) when a later migration statement raises; per-statement commits fail this oracle.",
+      "user_goal": "Fix migrate(db_path) in migrate.py for the stdlib sqlite3 versioning pattern. The database has table accounts(id INTEGER PRIMARY KEY, name TEXT) at schema_version 1. Migration 2 adds column email TEXT to accounts and records the new version. The migration list lives in the module (list of (version, sql) tuples) and future versions must work the same way. Read the current version from schema_meta (single row, table exists before migrate is called). Apply migrations strictly in ascending version order, only those newer than the current version, each inside ONE transaction covering the whole run, updating schema_meta last so a rollback restores both data and version. Return the number of migrations applied (0 if already current). Calling migrate twice in a row must return 0 on the second call and leave data intact. If any statement raises, the database must be exactly as it was before the call (no partial schema change, no partial version bump) and the original exception propagates. Use only the standard library.",
+      "initial_files": {
+        "migrate.py": "import sqlite3\n\nMIGRATIONS = [\n    (2, \"ALTER TABLE accounts ADD COLUMN email TEXT\"),\n]\n\n\ndef migrate(db_path):\n    connection = sqlite3.connect(db_path)\n    applied = 0\n    for target, sql in MIGRATIONS:\n        connection.execute(sql)\n        applied += 1\n    connection.commit()\n    connection.close()\n    return applied\n",
+        "init_db.py": "import sqlite3\nimport sys\n\n\ndef init(db_path):\n    connection = sqlite3.connect(db_path)\n    connection.executescript(\n        \"CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT);\\n\"\n        \"CREATE TABLE schema_meta (version INTEGER);\\n\"\n        \"INSERT INTO accounts (id, name) VALUES (1, 'ada');\\n\"\n        \"INSERT INTO schema_meta (version) VALUES (1);\\n\"\n    )\n    connection.commit()\n    connection.close()\n\n\nif __name__ == \"__main__\":\n    init(sys.argv[1])\n"
+      },
+      "public_check": "import pathlib, sqlite3, tempfile\nimport migrate\nimport init_db\nwith tempfile.TemporaryDirectory() as root:\n    db = str(pathlib.Path(root) / \"t.db\")\n    init_db.init(db)\n    try:\n        applied = migrate.migrate(db)\n    except Exception as exc:\n        raise AssertionError(f\"migrate failed outright: {exc!r}\") from exc\n    assert applied == 1, applied\n    connection = sqlite3.connect(db)\n    assert connection.execute(\"SELECT version FROM schema_meta\").fetchone()[0] == 2\n    assert connection.execute(\"SELECT email FROM accounts WHERE id = 1\").fetchone()[0] is None\n    connection.close()\n    assert migrate.migrate(db) == 0\n",
+      "heldout_assert_script": "import pathlib, sqlite3, tempfile\nimport migrate\nimport init_db\nwith tempfile.TemporaryDirectory() as root:\n    root = pathlib.Path(root)\n    db = str(root / \"t.db\")\n    init_db.init(db)\n    applied = migrate.migrate(db)\n    assert applied == 1, applied\n    assert migrate.migrate(db) == 0\n    assert migrate.migrate(db) == 0\n    # DDL before DML detects implicit transactions that leave schema changes\n    # committed even when the later data changes roll back.\n    original = list(migrate.MIGRATIONS)\n    migrate.MIGRATIONS.clear()\n    migrate.MIGRATIONS.extend([\n        (3, \"ALTER TABLE accounts ADD COLUMN phone TEXT\"),\n        (4, \"INSERT INTO accounts (id, name) VALUES (2, 'grace')\"),\n        (5, \"INSERT INTO nope (x) VALUES (1)\"),\n    ])\n    try:\n        migrate.migrate(db)\n    except Exception:\n        pass\n    else:\n        raise AssertionError(\"failing migration run must propagate its error\")\n    connection = sqlite3.connect(db)\n    assert connection.execute(\"SELECT version FROM schema_meta\").fetchone()[0] == 2\n    assert [row[1] for row in connection.execute(\"PRAGMA table_info(accounts)\")] == [\"id\", \"name\", \"email\"], \"failed run left a schema change\"\n    assert connection.execute(\n        \"SELECT name, email FROM accounts WHERE id = 1\").fetchone() == (\"ada\", None)\n    assert connection.execute(\n        \"SELECT COUNT(*) FROM accounts WHERE id = 2\").fetchone()[0] == 0\n    connection.close()\n    migrate.MIGRATIONS[:] = original\n    assert migrate.migrate(db) == 0\n    connection = sqlite3.connect(db)\n    assert connection.execute(\"SELECT name, email FROM accounts WHERE id = 1\").fetchone() == (\"ada\", None)\n    connection.close()\n",
+      "_baseline_expected": {
+        "public": "assertion_failure",
+        "heldout": "expected_failure"
+      }
+    },
+    {
+      "id": "asset-fetch-boundary",
+      "categories": [
+        "path-security"
+      ],
+      "difficulty_rationale": "The unsafe behavior (path traversal) is demonstrated by the baseline itself; the fix must reject escapes without weakening legitimate reads, with no production filesystem involved.",
+      "expected_behavioral_oracle": "fetch_asset(base_dir, requested_path) returns bytes only for regular files that live strictly underneath base_dir after symlink resolution, and raises ValueError('invalid path') for absolute paths, traversal above base_dir, missing files, and directories, without opening any file outside the sandbox; the heldout discriminates unsafe candidates both by their wrong result for escaping requests and by an audit hook that records any attempt to open an owned file outside base_dir.",
+      "user_goal": "Fix fetch_asset(base_dir, requested_path) in asset_fetch.py. requested_path comes from a remote caller and must never escape base_dir. Absolute requested_path, traversal segments that leave base_dir, and anything that resolves outside base_dir (including via symlinks) must raise ValueError('invalid path'). The target must exist and be a regular file (directories and missing paths raise ValueError('invalid path')). Read the resolved file and return its bytes. Only a resolved path that stays inside base_dir may be opened or read. Use only the standard library.",
+      "initial_files": {
+        "asset_fetch.py": "import os\n\n\ndef fetch_asset(base_dir, requested_path):\n    target = os.path.join(base_dir, requested_path)\n    with open(target, \"rb\") as stream:\n        return stream.read()\n"
+      },
+      "public_check": "import pathlib, tempfile\nimport asset_fetch\nwith tempfile.TemporaryDirectory() as root:\n    root = pathlib.Path(root)\n    base = root / \"assets\"\n    base.mkdir()\n    (base / \"nested\").mkdir()\n    secret = root / \"secret.txt\"\n    secret.write_bytes(b\"SECRET\")\n    (base / \"notes.txt\").write_bytes(b\"hello\")\n    assert asset_fetch.fetch_asset(str(base), \"notes.txt\") == b\"hello\"\n    # Every probe, even an absolute or escaping request, is owned by this test.\n    for bad in (\"../secret.txt\", \"nested/../../secret.txt\", str(secret),\n                \"missing.txt\", \".\"):\n        try:\n            asset_fetch.fetch_asset(str(base), bad)\n        except ValueError as exc:\n            assert str(exc) == \"invalid path\", str(exc)\n        except Exception as exc:\n            raise AssertionError(f\"{bad!r} raised {type(exc).__name__}, must raise ValueError('invalid path')\") from exc\n        else:\n            raise AssertionError(f\"{bad!r} must raise ValueError('invalid path')\")\n",
+      "heldout_assert_script": "import os, pathlib, sys, tempfile\nimport asset_fetch\nwith tempfile.TemporaryDirectory() as root:\n    root = pathlib.Path(root)\n    base = root / \"assets\"\n    base.mkdir()\n    sentinel = root / \"sentinel.txt\"\n    sentinel.write_bytes(b\"SECRET\")\n    (base / \"d\").mkdir()\n    (base / \"d\" / \"inner.bin\").write_bytes(b\"\\x00\\x01\")\n    os.symlink(sentinel, base / \"escape\")\n    os.symlink(base / \"d\" / \"inner.bin\", base / \"inside\")\n    outside_reads = []\n    def observe_open(event, args):\n        if event == \"open\" and isinstance(args[0], (str, bytes, os.PathLike)):\n            target = pathlib.Path(os.fsdecode(args[0])).resolve()\n            if target.is_relative_to(root) and not target.is_relative_to(base):\n                outside_reads.append(str(target))\n    sys.addaudithook(observe_open)\n    # Missing paths must raise ValueError, not escape an AssertionError-only preamble.\n    for bad in (\"sentinel.txt\", \"../sentinel.txt\", \"d/../../sentinel.txt\",\n                str(sentinel), str(base / \"d\" / \"inner.bin\"), \"escape\", \"d\", \".\"):\n        try:\n            asset_fetch.fetch_asset(str(base), bad)\n        except ValueError as exc:\n            assert str(exc) == \"invalid path\", str(exc)\n        else:\n            raise AssertionError(f\"{bad!r} must raise ValueError('invalid path')\")\n        assert not outside_reads, f\"opened outside base before rejecting: {outside_reads}\"\n    assert asset_fetch.fetch_asset(str(base), \"d/inner.bin\") == b\"\\x00\\x01\"\n    assert asset_fetch.fetch_asset(str(base), \"inside\") == b\"\\x00\\x01\"\n",
+      "_baseline_expected": {
+        "public": "assertion_failure",
+        "heldout": "expected_failure"
+      }
+    },
+    {
+      "id": "slugify",
+      "categories": [
+        "control"
+      ],
+      "difficulty_rationale": "Trivially simple single-function fix; included as a control arm to detect effort-level differences on tasks well inside any model's baseline capability.",
+      "expected_behavioral_oracle": "slugify('Hello, World!') returns 'hello-world'; repeated punctuation collapses to one hyphen; leading/trailing punctuation is dropped.",
+      "user_goal": "Fix slugify(text) in slugify.py. Convert ASCII text to lowercase and replace every run of non-alphanumeric characters with a single hyphen. Leading and trailing non-alphanumeric characters are dropped entirely; the empty string and all-non-alphanumeric input produce ''. Keep the signature slugify(text) and use only the standard library.",
+      "initial_files": {
+        "slugify.py": "import re\n\n\ndef slugify(text):\n    return re.sub(r\"[^a-z0-9]+\", \"-\", text.lower())\n"
+      },
+      "public_check": "import slugify\nassert slugify.slugify(\"Hello, World!\") == \"hello-world\", slugify.slugify(\"Hello, World!\")\nassert slugify.slugify(\"a  b--c\") == \"a-b-c\"\n",
+      "heldout_assert_script": "import slugify\nassert slugify.slugify(\"!!\") == \"\"\nassert slugify.slugify(\"\") == \"\"\nassert slugify.slugify(\"  trimmed  \") == \"trimmed\"\nassert slugify.slugify(\"keep_underscore too\") == \"keep-underscore-too\"\nassert slugify.slugify(\"x1y2z3\") == \"x1y2z3\"\n",
+      "_baseline_expected": {
+        "public": "assertion_failure",
+        "heldout": "expected_failure"
+      }
+    }
+  ]
+}

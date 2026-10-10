@@ -1,26 +1,31 @@
 name: loop-guard
-version: 0.2.0
-description: "Result-aware tool loop blocks and next-turn answer reminders; never injects another session's task."
+version: 0.3.0
+description: "Bounded exact-repeat, short-cycle and structured-failure recovery; budgets count delivered native directives only."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
+provides_tools:
+  - loop_recovery
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - post_tool_directive
   - post_llm_call
   - pre_llm_call
+  - pre_verify
+  - transform_llm_output
   - on_session_reset
   - on_session_finalize
 config_schema:
   tool_call_streak:
     type: int
     default: 5
-    description: "Identical calls with identical results before blocking the next retry. Read-only polling is exempt."
+    description: "Identical outcomes or the same structured failure before recovery; clamped to 2–24 observations. Read-only polling is exempt."
   answer_repetition:
     type: int
     default: 3
-    description: "Repeated final answers before a targeted reminder on the next genuine turn."
+    description: "Repeated final answers before one next-turn reminder; guidance is not counted as a delivered tool veto."
   redirect_cap:
     type: int
     default: 2
-    description: "Maximum interventions per detector and live agent; zero disables interventions."
+    description: "Maximum delivered tool vetoes per live turn. Exhausted failures remain visible at stop; zero disables intervention."

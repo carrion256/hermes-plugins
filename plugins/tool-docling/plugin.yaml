@@ -1,13 +1,13 @@
 name: tool-docling
-version: 0.1.0
-description: "Local document conversion via docling CLI: PDF/DOCX/PPTX/XLSX/HTML → Markdown or structured JSON."
+version: 0.2.0
+description: "Qualified backend (Python Docling CLI) local document conversion: content-addressed cache, provenance anchors, bounded page/section selection."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_tools:
   - docling_convert
 external_dependencies:
-  - "docling CLI on PATH (pip: docling)"
+  - "docling CLI on PATH (pip: docling; qualified backend, version reported per call)"
 config_schema:
   binary:
     type: str

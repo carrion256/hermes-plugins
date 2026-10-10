@@ -1,20 +1,24 @@
 name: auto-answer-classifier
-version: 0.2.0
-description: "Question-bound derived defaults in the originating clarification result; never changes human answers or grants approvals."
+version: 0.4.0
+description: "Approved conventional defaults resolve upstream; persistence requires an observed human answer and native consent to remember; repository evidence is hash-bound and secret-redacted; human answers/skips remain authoritative."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
+provides_tools:
+  - clarification_defaults
+provides_hooks:
+  - post_tool_call
 provides_middleware:
   - tool_execution
 config_schema:
   enabled:
     type: bool
     default: true
-    description: "Endorse low-risk single-question timeouts; multi-question batches remain advisory and human answers/skips always win."
+    description: "Resolve approved conventional questions before clarify and apply hash-backed defaults only on genuine timeouts; multi-question legacy ambiguity remains advisory."
   dry_run:
     type: bool
     default: false
-    description: "Record recommendations as unapplied suggestions without selecting defaults."
+    description: "Recommend defaults without applying them or claiming a human answer."
   endpoint:
     type: str
     default: "http://192.168.50.149:8787"

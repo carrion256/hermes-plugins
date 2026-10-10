@@ -1,11 +1,14 @@
 name: papercuts
-version: 0.1.0
-description: "Exposes the local papercuts CLI through Hermes: report/list/ack/resolve/stats without leaving the agent loop."
+version: 0.3.0
+description: "Typed, redacted papercuts reporting: native binary owns dedup/recurrence/status; opt-in auto-capture; typed observed time_lost_seconds and list --sort impact."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_tools:
   - papercuts
+provides_hooks:
+  - post_tool_directive
+  - post_tool_call
 external_dependencies:
   - "papercuts binary (default: /home/common/projects/papercuts/papercuts)"
 config_schema:
@@ -13,3 +16,7 @@ config_schema:
     type: str
     default: "/home/common/projects/papercuts/papercuts"
     description: "Path to the papercuts CLI binary."
+  auto_capture:
+    type: bool
+    default: false
+    description: "Opt-in automatic filing of loop-guard blocks and tool errors (natively deduped, max 20/day)."

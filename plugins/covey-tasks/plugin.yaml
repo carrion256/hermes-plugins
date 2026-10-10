@@ -10,6 +10,7 @@ provides_hooks:
   - on_session_finalize
   - on_session_reset
   - subagent_stop
+  - pre_tool_call
 config_schema:
   binary:
     type: str

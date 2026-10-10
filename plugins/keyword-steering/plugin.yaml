@@ -1,16 +1,18 @@
 name: keyword-steering
-version: 0.2.0
-description: "Magic-keyword prompt steering: config-driven keyword table injected once per user turn via pre_llm_call; matches genuine prose only (code, quotes, identifiers excluded)."
+version: 0.3.0
+description: "Explicit steering modes: config-defined modes referencing skill/rule paths or identifiers, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded); declared conflicts surface and withhold both sides; inspectable via steering_status. Guidance-only."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
+provides_tools:
+  - steering_status
 provides_hooks:
   - pre_llm_call
   - on_session_reset
   - on_session_finalize
   - agent_loop_stopped
 config_schema:
-  keywords:
+  modes:
     type: dict
     default: {}
-    description: "Mapping of trigger keyword -> steering text injected as context once per user turn when the message mentions the keyword (case-insensitive, whole-word; fenced code, inline code, quoted text, and identifier/path contexts are ignored)."
+    description: "Mapping of mode name -> {refs: [skill/rule path or identifier], triggers: [activation phrases, default: mode name], conflicts_with: [mode names]}. Activated when a trigger appears in genuine prose (fenced code, inline code, quoted text, identifier/path contexts ignored); guidance names the refs as consult pointers (text is never copied). Mutually conflicting modes in one turn are both withheld and the conflict is surfaced. Legacy 'keywords' prompt-copy config is rejected: migrate each entry to a mode."

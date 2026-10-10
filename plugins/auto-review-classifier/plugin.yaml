@@ -1,6 +1,6 @@
 name: auto-review-classifier
-version: 0.2.0
-description: "Advisory risk screen using Hermes's native block/approve directives; mutating process actions are screened. Classifier outages remain fail-open."
+version: 0.4.0
+description: "Effect-aware risk screen with native egress redaction, resolved target/backend context, and approval rule keys bound to the exact operation; incomplete safe evidence remains unknown while native permissions stay authoritative."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1

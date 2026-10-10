@@ -1,23 +1,25 @@
 name: browser-bladebro
-version: 0.1.0
-description: "Registers bladebro browser tools (see/act/state/vision) over the bladebro CLI --json interface, plus text-first steering."
+version: 0.3.1
+description: "Direct-artifact browser acceptance on the qualified native run shape: pinned source snapshots + bounded confined HTML artifacts, initial/interaction/final flow observed by the native backend, backend see/console observations supplementary, real evidence rows with bound/failed/unbound truth."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_tools:
-  - bladebro_see
-  - bladebro_act
-  - bladebro_state
-  - bladebro_vision
+  - browser_open
+  - browser_close
+  - browser_run
+  - browser_scenario
+  - browser_capture
+  - browser_screenshot
 provides_hooks: []
 external_dependencies:
-  - "bladebro CLI on PATH or configured binary"
+  - "operator-granted plugins.entries.browser-bladebro.mcp_allowlist containing the bladebro MCP server"
 config_schema:
-  binary:
+  server:
     type: str
-    default: ""
-    description: "bladebro executable (empty = detect on PATH; tool hidden when absent)."
+    default: "bladebro"
+    description: "MCP server name; access is gated by the operator-granted mcp_allowlist (default deny)."
   timeout:
     type: int
-    default: 120
-    description: "Per-call timeout in seconds."
+    default: 60
+    description: "Per-call MCP timeout in seconds (clamped 1-600 natively)."

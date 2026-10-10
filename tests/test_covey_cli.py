@@ -79,6 +79,8 @@ def test_cli_covey_task_with_native_verification_and_resume(tmp_path, covey_bin)
     (home / "plugins").mkdir(parents=True)
     workspace.mkdir()
     (workspace / "pyproject.toml").write_text('[tool.pytest.ini_options]\ntestpaths = ["."]\n')
+    (workspace / "cliwidget.py").write_text("CLI_ANSWER = 0\n")
+    (workspace / "test_cliwidget.py").write_text(TEST_SOURCE)
     names = ["continuation", "prewalk", "covey-tasks"]
     plugin_root = Path(__file__).resolve().parents[1] / "plugins"
     for name in names:
@@ -135,9 +137,6 @@ def test_cli_covey_task_with_native_verification_and_resume(tmp_path, covey_bin)
     def done_widget(results):
         return (workspace / "cliwidget.py").read_text() == WIDGET if (workspace / "cliwidget.py").exists() else False
 
-    def done_test_source(results):
-        return (workspace / "test_cliwidget.py").read_text() == TEST_SOURCE if (workspace / "test_cliwidget.py").exists() else False
-
     def done_pytest(results):
         for result in results:
             text = json.dumps(result)
@@ -171,9 +170,25 @@ def test_cli_covey_task_with_native_verification_and_resume(tmp_path, covey_bin)
         (["covey_tasks", {"action": "start",
                           "subtask_id": lambda: observed["covey"]["add"]["data"]["subtask_id"]}], done_start),
         (todo_call("in_progress"), done_todo_in_progress),
+        (["acceptance", {"action": "declare", "id": "work",
+                         "observable": "CLI_ANSWER equals 42 under the unchanged test",
+                         "check_kind": "terminal", "check_identity": "python3 -m pytest -q",
+                         "paths": ["cliwidget.py", "test_cliwidget.py"]}],
+         lambda results: any(r.get("success") is True and r.get("id") == "work"
+                             for r in results)),
+        (["prewalk_ready", {
+            "files": ["cliwidget.py", "test_cliwidget.py"], "symbols": ["cliwidget.CLI_ANSWER"],
+            "callers": ["test_cliwidget.test_cli_answer"], "constraints": ["Keep the test unchanged"],
+            "non_goals": ["No unrelated changes"], "chosen_approach": "Correct the constant",
+            "rejected_approaches": ["Weakening the test"], "falsification_checks": ["python3 -m pytest -q"],
+            "replan_triggers": ["The focused test fails"], "acceptance_ids": ["work"]}],
+         lambda results: any(r.get("handed_off") is True for r in results)),
         (["write_file", {"path": "cliwidget.py", "content": WIDGET}], done_widget),
-        (["write_file", {"path": "test_cliwidget.py", "content": TEST_SOURCE}], done_test_source),
         (["terminal", {"command": "python3 -m pytest -q", "timeout": 60}], done_pytest),
+        (["acceptance", {"action": "bind", "id": "work",
+                         "evidence_id": lambda: observed["evidence"][-1]["id"]}],
+         lambda results: any(r.get("success") is True and r.get("id") == "work"
+                             and isinstance(r.get("evidence_id"), int) for r in results)),
         (todo_call("completed"), done_todo_completed),
         (["covey_tasks", {"action": "finish",
                           "subtask_id": lambda: observed["covey"]["add"]["data"]["subtask_id"],
@@ -240,19 +255,25 @@ def test_cli_covey_task_with_native_verification_and_resume(tmp_path, covey_bin)
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             messages = request.get("messages", [])
+            reviewer = "You were spawned by the /review command." in json.dumps(messages)
             with lock:
-                observed["models"].append(request["model"])
-                if observed["models"][-1] == "covey-executor" and observed["executor_after"] is None:
-                    observed["executor_after"] = done_todo_in_progress(list(tool_results(messages)))
-                if process["n"] >= 1:
-                    observed["resume_requests"] += 1
-                    capture_resume(messages)
-                    call, content = next_resume_action(messages)
+                if reviewer:
+                    call, content = None, json.dumps({"review_verdict": "clean", "findings": [],
+                                                     "coverage": {"work": "covered"}})
+                elif not request.get("tools"):
+                    # Title/summary requests are not agent execution turns and
+                    # must never consume a scripted tool action.
+                    call, content = None, "Covey workflow qualification"
                 else:
-                    call, content = next_action(messages)
-            reviewer = "You were spawned by the /review command." in json.dumps(messages[-1:])
-            if reviewer:
-                call, content = None, json.dumps({"review_verdict": "clean", "findings": []})
+                    observed["models"].append(request["model"])
+                    if observed["models"][-1] == "covey-executor" and observed["executor_after"] is None:
+                        observed["executor_after"] = done_todo_in_progress(list(tool_results(messages)))
+                    if process["n"] >= 1:
+                        observed["resume_requests"] += 1
+                        capture_resume(messages)
+                        call, content = next_resume_action(messages)
+                    else:
+                        call, content = next_action(messages)
             if call is None:
                 time.sleep(0.25)  # Native async verify/review must publish before the final answer.
             advertised = {tool["function"]["name"] for tool in request.get("tools", [])}
