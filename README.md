@@ -106,7 +106,7 @@ Actions (the full set; there is no update, delete or reopen): `status`, `lists`,
 
 Workflow:
 
-1. `create(prompt)` a finite worklist, then `add(meta_task_id, title, priority)` **every known task before starting any**. A worklist closes when all its tasks are terminal; a completed worklist is history (add is refused), so create a new one.
+1. `create(prompt)` a finite worklist, then `add(meta_task_id, title, priority)` **every known task before starting any**. Priority is an integer from 0 to 1000 (default 100), matching Covey's domain. A worklist closes when all its tasks are terminal; a completed worklist is history (add is refused), so create a new one.
 2. `start(subtask_id)` claims and starts that exact task (one active claim per live agent). Do the work and run real checks with native tools.
 3. `finish(subtask_id, summary[, evidence_digest])`, or `retry`/`fail` with `failure_code`, or `release`/`abandon`. A task whose persisted policy requires evidence is rejected without `evidence_digest`; governed tasks are outside this tool. State names are Covey's: closed is not all-success, so inspect `show` counts for failed/abandoned tasks.
 

@@ -126,7 +126,7 @@ TOOL_SCHEMA = {
             "failure_code": {"type": "string"},
             "evidence_digest": {"type": "string"},
             "request_id": {"type": "string"},
-            "priority": {"type": "integer"},
+            "priority": {"type": "integer", "minimum": 0, "maximum": 1000},
             "limit": {"type": "integer"},
             "offset": {"type": "integer"},
         },

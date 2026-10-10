@@ -34,7 +34,6 @@ except ImportError:  # unsupported host; surfaced as a clear error at execute()
 
 logger = logging.getLogger(__name__)
 
-I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
 SESSION_TOKEN_RE = re.compile(r"session_[0-9a-fA-F]+")
 REDACTED = "session_[redacted]"
@@ -45,8 +44,22 @@ TERMINAL_STATES = {
     "retry": "available",
     "fail": "failed",
     "abandon": "abandoned",
+    "release": "available",
 }
 UNCERTAIN_CODES = {"timeout", "empty_output", "invalid_json", "invalid_envelope"}
+# Engine-rendered verdicts (CoveyError -> conflict/not_found/permission_denied
+# with exit codes 1..5) are the only codes that prove authority is gone.
+# Bridge-level faults (binary_not_found, OS permission_denied, exit_N,
+# internal_error/DatabaseError such as SQLITE_BUSY) prove nothing.
+DEFINITE_LOSS_CODES = {"conflict", "not_found", "session_not_active"}
+# SessionNotActive / IllegalTransition(Session) / unknown session are all
+# rendered by the backend as conflict or not_found; only the message tells
+# them apart from claim-level conflicts.
+SESSION_INACTIVE_RE = re.compile(
+    r"is not active; current state is|illegal transition on session\b|"
+    r"invalid session token|session not found",
+    re.IGNORECASE,
+)
 CREATE_GUIDANCE = (
     "Plan/add all currently known tasks before starting execution. When every "
     "task is terminal Covey closes the worklist, even if some failed; a closed "
@@ -152,6 +165,9 @@ def _parse_int(value: Any, name: str, *, lo: int, hi: int) -> int:
 def _parse_str(value: Any, name: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str) or (not value.strip() and not allow_empty):
         raise ActionReject("invalid_arguments", f"{name} must be a non-empty string")
+    if "\x00" in value:
+        # argv cannot carry NUL; reject before transport, never per-character filter.
+        raise ActionReject("invalid_arguments", f"{name} must not contain NUL")
     return value
 
 
@@ -225,7 +241,7 @@ def parse_action(arguments: dict) -> Any:
         return AddAction(
             meta_task_id=_require(args, "meta_task_id"),
             title=_require(args, "title"),
-            priority=_parse_int(args.get("priority", 100), "priority", lo=I64_MIN, hi=I64_MAX),
+            priority=_parse_int(args.get("priority", 100), "priority", lo=0, hi=1000),
             request_id=_parse_request_id(args.get("request_id")),
         )
     if action == "start":
@@ -268,6 +284,15 @@ def parse_action(arguments: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _opt(flag: str, value: Any) -> str:
+    """One-token ``--flag=value`` CLI option.
+
+    clap treats a separate token beginning with '-' as a flag, for example
+    a title like '- x'; the attached form always binds it as the value.
+    """
+    return f"{flag}={value}"
+
+
 def _redact(value: Any) -> Any:
     """Redact backend session tokens (own and foreign) from every output string."""
     if isinstance(value, str):
@@ -300,6 +325,25 @@ def _map_transport_failure(payload: dict) -> dict:
         exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
         suggestions=payload.get("suggestions") if isinstance(payload.get("suggestions"), list) else None,
     )
+
+
+def _is_session_inactive(payload: dict) -> bool:
+    """Backend proves the session itself is reaped/exited/unknown."""
+    code = str(payload.get("code") or "")
+    if code == "session_not_active":
+        return True
+    return code in ("conflict", "not_found") and bool(
+        SESSION_INACTIVE_RE.search(str(payload.get("message") or ""))
+    )
+
+
+def _is_definite_authority_loss(payload: dict) -> bool:
+    """True only for an authoritative backend refusal; transient transport,
+    OS and database faults stay uncertain until reconciliation."""
+    code = str(payload.get("code") or "")
+    if code in DEFINITE_LOSS_CODES:
+        return True
+    return code == "permission_denied" and payload.get("exit_code") == 3
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +406,8 @@ class _Claim:
     fence_seq: int
     lease_deadline_ms: int
     uncertain: bool = False
+    request_id: str = ""  # request that created this claim (partial-start replay)
+    started: bool = False
 
 
 @dataclass
@@ -415,6 +461,12 @@ class CoveyRuntime:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._epoch = 0
+        # Every token/principal ever retired: never re-minted or replayed.
+        self._dead_tokens: set[str] = set()
+        self._dead_principals: set[str] = set()
+        self._token_principal: dict[str, str] = {}
+        self._close_guard = threading.Lock()
+        self._close_started = False
         self._last_heartbeat_mono = 0.0
         self._last_renew_mono = 0.0
         self._validate_config(binary)
@@ -482,7 +534,11 @@ class CoveyRuntime:
     # -- transport ----------------------------------------------------------
 
     def _call(self, command_args: list, timeout: float = NORMAL_TIMEOUT, *,
-              data_list: bool = False) -> dict:
+              data_list: bool = False, teardown: bool = False) -> dict:
+        # A closed runtime issues no backend calls except teardown exits, so a
+        # late in-flight action cannot keep acting on revoked authority.
+        if self._closed and not teardown:
+            return {"ok": False, "code": "closed", "message": "runtime is closed"}
         # Explicit binary+db on every call (background calls included); the
         # transport never sees ambient config because we always pass both.
         payload = run_covey_command(
@@ -549,6 +605,16 @@ class CoveyRuntime:
         try:
             if isinstance(action, StatusAction):
                 return self._status()
+            if isinstance(action, (ListsAction, ShowMetaAction, ShowTaskAction)):
+                # Reads against a nonexistent DB short-circuit before any
+                # transport call: the engine would auto-create+migrate the
+                # path, and reads must not create or register anything.
+                if not os.path.exists(self.db_path):
+                    return self._fail(
+                        "not_initialized",
+                        "the configured Covey database does not exist; create a worklist "
+                        "first (reads never initialize the DB)",
+                    )
             if isinstance(action, ListsAction):
                 return self._lists(action)
             if isinstance(action, (ShowMetaAction, ShowTaskAction)):
@@ -556,7 +622,7 @@ class CoveyRuntime:
             requested = action.op if isinstance(action, RetryFailAction) else str(arguments.get("action") or "")
             return self._mutation(action, requested)
         except Exception as exc:  # unexpected defects stay visible, sanitized
-            logger.warning("covey-tasks runtime internal error: %s", exc)
+            logger.warning("covey-tasks runtime internal error: %s", _redact(str(exc)))
             return self._fail("internal_error", f"unexpected runtime error: {exc}")
 
     # -- reads ----------------------------------------------------------------
@@ -600,7 +666,10 @@ class CoveyRuntime:
                 ),
                 "ownership_healthy": claim is not None and not claim.uncertain,
                 "lost_reason": _redact(self._lost_reason) if self._lost_reason else None,
-                "maintenance_running": self._thread is not None and self._thread.is_alive(),
+                "maintenance_running": (
+                    self._thread is not None and self._thread.is_alive()
+                    and not self._stop_event.is_set()
+                ),
                 "closed": self._closed,
             }
         )
@@ -609,7 +678,7 @@ class CoveyRuntime:
         # The meta list envelope carries its rows as a JSON list directly in
         # data (never a wrapped dict), so data_list=True for the parse gate.
         payload = self._call(
-            ["meta", "list", "--limit", str(action.limit), "--offset", str(action.offset)],
+            ["meta", "list", _opt("--limit", action.limit), _opt("--offset", action.offset)],
             data_list=True,
         )
         if payload.get("ok") is not True:
@@ -635,7 +704,7 @@ class CoveyRuntime:
         return self._show_task(action)
 
     def _show_meta(self, action: ShowMetaAction) -> dict:
-        payload = self._call(["meta", "status", "--meta-task-id", action.meta_task_id])
+        payload = self._call(["meta", "status", _opt("--meta-task-id", action.meta_task_id)])
         if payload.get("ok") is not True or not isinstance(payload.get("data"), dict):
             return _map_transport_failure(payload)
         data = payload["data"]
@@ -669,7 +738,7 @@ class CoveyRuntime:
         return int(time.time() * 1000)
 
     def _show_task(self, action: ShowTaskAction) -> dict:
-        payload = self._call(["subtask", "status", "--subtask-id", action.subtask_id])
+        payload = self._call(["subtask", "status", _opt("--subtask-id", action.subtask_id)])
         if payload.get("ok") is not True or not isinstance(payload.get("data"), dict):
             return _map_transport_failure(payload)
         data = payload["data"]
@@ -715,14 +784,12 @@ class CoveyRuntime:
                 f"request_id {request_id} was already used for different content; "
                 "use a new request_id",
             )
-        if state.uncertain:
-            raise ActionReject(
-                "outcome_unknown",
-                f"a previous attempt of request_id {request_id} is unresolved; "
-                "inspect with lists/show and reconcile before continuing",
-            )
+        # An unresolved earlier attempt (timeout/malformed result) is resolved
+        # by replaying this SAME request: the retained principal/subkeys make
+        # the backend answer from its idempotency record or perform the effect
+        # once.  Never a permanent lockout, never a fresh-key retry.
         for role, token in state.tokens.items():
-            if self._retired.get(role) is not None and self._token.get(role) != token:
+            if token in self._dead_tokens:
                 raise ActionReject(
                     "replay_refused",
                     f"the session token used for request_id {request_id} was retired; "
@@ -745,19 +812,44 @@ class CoveyRuntime:
             # session/profile, so a crashed principal is never reused.
             principal = f"hermes-covey-tasks:{role}:{uuid.uuid4()}"
             state.principals[role] = principal
+        elif principal in self._dead_principals:
+            return role, None, _envelope_failure(
+                "replay_refused",
+                "the principal registered for this request_id was retired; "
+                "issue a new explicit action with a fresh request_id",
+            )
         payload = self._call(
             [
                 "session", "register",
-                "--agent-principal-id", principal,
-                "--agent-instance-id", f"{self.instance_id}:{role}",
-                "--role", role,
-                "--idempotency-key", f"{principal}:register",
+                _opt("--agent-principal-id", principal),
+                _opt("--agent-instance-id", f"{self.instance_id}:{role}"),
+                _opt("--role", role),
+                _opt("--idempotency-key", f"{principal}:register"),
             ]
         )
         if payload.get("ok") is True and isinstance(payload.get("data"), dict):
             token = payload["data"].get("session_token")
             if isinstance(token, str) and token:
+                if token in self._dead_tokens:
+                    # Idempotent register replay handed back a token we already
+                    # retired; never remint retired authority.
+                    self._dead_principals.add(principal)
+                    return role, None, _envelope_failure(
+                        "replay_refused",
+                        "registration replay returned a retired session; "
+                        "issue a new explicit action with a fresh request_id",
+                    )
+                if self._closed:
+                    # Late in-flight registration must not publish authority.
+                    self._attempt_exit(
+                        role, token, max(0.1, min(self.teardown_timeout, NORMAL_TIMEOUT)),
+                        teardown=True,
+                    )
+                    return role, None, _envelope_failure(
+                        "closed", "runtime closed during session registration"
+                    )
                 self._token[role] = token
+                self._token_principal[token] = principal
                 state.tokens[role] = token
                 return role, token, None
             return role, None, _envelope_failure(
@@ -782,13 +874,15 @@ class CoveyRuntime:
         caps_error = self._require_capabilities()
         if caps_error is not None:
             return self._with_request_id(caps_error, request_id)
-        try:
-            state = self._request_state(action)
-        except ActionReject as reject:
-            return self._fail(reject.code, reject.message, request_id)
         # Serialize whole logical mutations with teardown/maintenance state.
         with self._lock:
+            if self._closed:
+                return self._fail(
+                    "closed", "runtime is closed; host will create a fresh runtime", request_id
+                )
             try:
+                state = self._request_state(action)
+                state.uncertain = False  # re-derived by this (replay) attempt
                 if isinstance(action, CreateAction):
                     return self._with_request_id(self._do_create(action, state), request_id)
                 if isinstance(action, AddAction):
@@ -822,8 +916,8 @@ class CoveyRuntime:
         if token is None:
             return error
         payload = self._call(
-            ["meta", "submit", "--session-token", token, "--prompt-text", action.prompt,
-             "--idempotency-key", f"{token}:meta-submit:{action.request_id}"]
+            ["meta", "submit", _opt("--session-token", token), _opt("--prompt-text", action.prompt),
+             _opt("--idempotency-key", f"{token}:meta-submit:{action.request_id}")]
         )
         if payload.get("ok") is True and isinstance(payload.get("data"), dict):
             meta_task_id = payload["data"].get("meta_task_id")
@@ -836,7 +930,8 @@ class CoveyRuntime:
                     },
                     action.request_id,
                 )
-        return self._failure_or_uncertain(payload, state, action.request_id, "meta submit")
+        return self._failure_or_uncertain(payload, state, action.request_id, "meta submit",
+                                          role="orchestrator")
 
     def _do_add(self, action: AddAction, state: _RequestState) -> dict:
         token, error = self._ensure_role("orchestrator", state, action)
@@ -847,15 +942,15 @@ class CoveyRuntime:
         # with a conflict; we never reopen or silently roll over.
         payload = self._call(
             ["subtask", "create",
-             "--session-token", token,
-             "--meta-task-id", action.meta_task_id,
-             "--title", action.title,
-             "--kind", "work",
-             "--priority", str(action.priority),
-             "--completion-policy", "direct",
-             "--evidence-policy", "optional",
-             "--routing-key", "default",
-             "--idempotency-key", f"{token}:subtask-create:{action.request_id}"]
+             _opt("--session-token", token),
+             _opt("--meta-task-id", action.meta_task_id),
+             _opt("--title", action.title),
+             _opt("--kind", "work"),
+             _opt("--priority", action.priority),
+             _opt("--completion-policy", "direct"),
+             _opt("--evidence-policy", "optional"),
+             _opt("--routing-key", "default"),
+             _opt("--idempotency-key", f"{token}:subtask-create:{action.request_id}")]
         )
         if payload.get("ok") is True and isinstance(payload.get("data"), dict):
             subtask_id = payload["data"].get("subtask_id")
@@ -870,21 +965,40 @@ class CoveyRuntime:
                     },
                     action.request_id,
                 )
-        return self._failure_or_uncertain(payload, state, action.request_id, "subtask create")
+        return self._failure_or_uncertain(payload, state, action.request_id, "subtask create",
+                                          role="orchestrator")
+
+    def _live_claim_matches(self, live: Any, claim: _Claim, token: str | None) -> bool:
+        """Strictly typed check that the persisted claim is this executor's live one."""
+        return (
+            token is not None
+            and isinstance(live, dict)
+            and live.get("claim_id") == claim.claim_id
+            and _is_int(live.get("fence_seq"))
+            and live["fence_seq"] == claim.fence_seq
+            and live.get("owner_session_token") == token
+            and _is_int(live.get("lease_deadline"))
+            and live["lease_deadline"] > self._observed_now_ms()
+        )
+
+    @staticmethod
+    def _started_data(claim: _Claim) -> dict:
+        return {
+            "subtask_id": claim.subtask_id,
+            "claim_id": claim.claim_id,
+            "fence_seq": claim.fence_seq,
+            "lease_deadline_ms": claim.lease_deadline_ms,
+            "state": "in_progress",
+            "guidance": START_GUIDANCE,
+        }
 
     def _do_start(self, action: StartAction, state: _RequestState) -> dict:
         # Existing local claim: check its authoritative status first.
         claim = self._claim
         if claim is not None:
-            if claim.subtask_id != action.subtask_id:
-                return self._fail(
-                    "active_claim_held",
-                    f"this agent already owns {claim.subtask_id}; finish, retry, fail, "
-                    "release or abandon it before starting another task",
-                    action.request_id,
-                    data={"active_subtask_id": claim.subtask_id},
-                )
-            status = self._read_task_state(action.subtask_id)
+            # Authority of the CURRENT claim is established first, against its
+            # own subtask; only then is a different requested task considered.
+            status = self._read_task_state(claim.subtask_id)
             if status is None:
                 return self._fail(
                     "outcome_unknown",
@@ -892,22 +1006,56 @@ class CoveyRuntime:
                     action.request_id,
                 )
             live_claim = status["claim"]
-            if (
-                isinstance(live_claim, dict)
-                and live_claim.get("claim_id") == claim.claim_id
-                and int(live_claim.get("fence_seq", -1)) == claim.fence_seq
-                and live_claim.get("owner_session_token") == self._token.get("executor")
-                and int(live_claim.get("lease_deadline", 0)) > self._observed_now_ms()
-            ):
+            if live_claim is not None and not isinstance(live_claim, dict):
+                return self._fail(
+                    "invalid_envelope", "subtask status claim had unexpected shape",
+                    action.request_id,
+                )
+            token = self._token.get("executor")
+            if self._live_claim_matches(live_claim, claim, token):
+                claim.lease_deadline_ms = live_claim["lease_deadline"]
+                persisted = status["subtask"].get("state")
+                if (
+                    claim.subtask_id == action.subtask_id
+                    and not claim.started
+                    and claim.request_id == action.request_id
+                    and state.tokens.get("executor") == token
+                ):
+                    # Partial start of THIS request under the same valid
+                    # ownership: truthful completion, never a second claim.
+                    if persisted == "in_progress":
+                        claim.started = True  # the earlier start did commit
+                        claim.uncertain = False
+                        return self._ok(self._started_data(claim), action.request_id)
+                    if persisted == "claimed":
+                        return self._issue_start(action, token, claim)
+                if claim.subtask_id != action.subtask_id:
+                    # Valid live authority is never stolen or released here.
+                    return self._fail(
+                        "active_claim_held",
+                        f"this agent already owns {claim.subtask_id}; finish, retry, fail, "
+                        "release or abandon it before starting another task",
+                        action.request_id,
+                        data={"active_subtask_id": claim.subtask_id},
+                    )
                 return self._fail(
                     "active_claim_held",
                     f"this agent still holds the live claim on {claim.subtask_id}",
                     action.request_id,
-                    data={"active_subtask_id": claim.subtask_id, "state": "claimed"},
+                    data={"active_subtask_id": claim.subtask_id, "state": persisted},
                 )
             # Local claim authority is gone: retire the old token (never reuse
-            # it, even if exit fails) and fall through to a fresh claim.
+            # it, even if exit fails).  A fresh claim under a replacement
+            # token is a NEW explicit action, never a replay of this request.
+            old_token = self._token.get("executor")
             self._retire_executor("local claim authority lost or expired")
+            if old_token is not None and state.tokens.get("executor") == old_token:
+                raise ActionReject(
+                    "replay_refused",
+                    f"the session token used for request_id {action.request_id} was retired; "
+                    "inspect state with lists/show and issue a new explicit action "
+                    "with a fresh request_id",
+                )
             claim = None
 
         status = self._read_task_state(action.subtask_id)
@@ -915,12 +1063,19 @@ class CoveyRuntime:
             return self._fail("outcome_unknown", "subtask status could not be read", action.request_id)
         task = status["subtask"]
         if task["state"] != "available":
-            return self._fail(
-                "invalid_transition",
-                f"subtask {action.subtask_id} is in state {task['state']}; start requires available",
-                action.request_id,
-                data={"subtask_id": action.subtask_id, "state": task["state"]},
-            )
+            # A persisted claimed/in_progress state with no local authority is
+            # an expired claim: `subtask claim` reclaims it inline (engine
+            # expires stale claims before validating), so fall through to a
+            # fresh claim rather than refusing. Terminal states are refused
+            # here; the engine remains authoritative for everything else.
+            if task["state"] not in ("claimed", "in_progress"):
+                return self._fail(
+                    "invalid_transition",
+                    f"subtask {action.subtask_id} is in state {task['state']}; "
+                    "start requires available",
+                    action.request_id,
+                    data={"subtask_id": action.subtask_id, "state": task["state"]},
+                )
         if task["completion_policy"] != "direct":
             # Governed tasks refuse adapter execution; no policy changes.
             return self._fail(
@@ -940,9 +1095,9 @@ class CoveyRuntime:
             self._attempt_exit("executor", pending, NORMAL_TIMEOUT)
 
         claim_payload = self._call(
-            ["subtask", "claim", "--session-token", token, "--subtask-id", action.subtask_id,
-             "--lease-duration-ms", str(self.lease_duration_ms),
-             "--idempotency-key", f"{token}:claim:{action.request_id}"]
+            ["subtask", "claim", _opt("--session-token", token), _opt("--subtask-id", action.subtask_id),
+             _opt("--lease-duration-ms", self.lease_duration_ms),
+             _opt("--idempotency-key", f"{token}:claim:{action.request_id}")]
         )
         if claim_payload.get("ok") is True and isinstance(claim_payload.get("data"), dict):
             claim_data = claim_payload["data"]
@@ -954,53 +1109,65 @@ class CoveyRuntime:
                     "invalid_envelope", "claim response had unexpected shape", action.request_id
                 )
         else:
-            failure = self._failure_or_uncertain(
-                claim_payload, state, action.request_id, "subtask claim",
-                allow_authoritative=True, subtask_id=action.subtask_id,
+            # A reaped idle executor (SessionNotActive) is retired here so the
+            # next explicit start registers a fresh principal.
+            return self._failure_or_uncertain(
+                claim_payload, state, action.request_id, "subtask claim", role="executor",
             )
-            return failure
-        self._set_claim(claim_id, fence_seq, lease_deadline, action.subtask_id)
+        if self._closed:
+            # Late in-flight success must not publish authority; lease expiry
+            # is the backstop for the unpublished claim.
+            return self._fail(
+                "closed", "runtime closed before the claim could be applied", action.request_id
+            )
+        self._set_claim(claim_id, fence_seq, lease_deadline, action.subtask_id, action.request_id)
+        return self._issue_start(action, token, self._claim)
+
+    def _issue_start(self, action: StartAction, token: str, claim: _Claim) -> dict:
+        """Issue (or replay with the retained key) `subtask start` for a held claim."""
         start_payload = self._call(
-            ["subtask", "start", "--session-token", token, "--claim-id", claim_id,
-             "--fence-seq", str(fence_seq),
-             "--idempotency-key", f"{token}:start:{action.request_id}"]
+            ["subtask", "start", _opt("--session-token", token), _opt("--claim-id", claim.claim_id),
+             _opt("--fence-seq", claim.fence_seq),
+             _opt("--idempotency-key", f"{token}:start:{action.request_id}")]
         )
         if start_payload.get("ok") is True and isinstance(start_payload.get("data"), dict):
-            with self._lock:
-                if self._closed:
-                    # Late in-flight success must not publish authority; the
-                    # teardown already revoked state and lease expiry is the
-                    # backstop.
-                    return self._fail(
-                        "closed",
-                        "runtime closed before the start result could be applied",
-                        action.request_id,
-                    )
-                return self._ok(
-                    {
-                        "subtask_id": action.subtask_id,
-                        "claim_id": claim_id,
-                        "fence_seq": fence_seq,
-                        "lease_deadline_ms": lease_deadline,
-                        "state": "in_progress",
-                        "guidance": START_GUIDANCE,
-                    },
+            if self._closed:
+                # Teardown already revoked state; do not publish authority.
+                self._claim = None
+                self._stop_event.set()
+                return self._fail(
+                    "closed",
+                    "runtime closed before the start result could be applied",
                     action.request_id,
                 )
-        # Truthful partial state: the claim exists but start failed.
+            claim.started = True
+            claim.uncertain = False
+            return self._ok(self._started_data(claim), action.request_id)
+        # Truthful partial state: the claim exists; report the PERSISTED state.
         message = str(start_payload.get("message") or "subtask start failed")
+        code = str(start_payload.get("code") or "transport_error")
+        status = self._read_task_state(claim.subtask_id)
+        persisted = status["subtask"].get("state") if status is not None else None
         data = {
             "subtask_id": action.subtask_id,
-            "claim_id": claim_id,
-            "fence_seq": fence_seq,
-            "claim_state": "claimed",
-            "started": False,
-            "note": "claim succeeded but start failed; release the claim or retry start "
-                    "with the same request_id after inspecting state",
+            "claim_id": claim.claim_id,
+            "fence_seq": claim.fence_seq,
+            "state": persisted if persisted is not None else "unknown",
+            "claim_state": persisted if persisted is not None else "unknown",
+            "started": (persisted == "in_progress") if persisted is not None else None,
+            "note": "claim succeeded but start did not complete; retry with the same "
+                    "request_id to re-issue start, or release the claim",
         }
-        code = str(start_payload.get("code") or "transport_error")
+        if _is_session_inactive(start_payload):
+            self._retire_executor(f"executor session inactive during start: {message}")
+            data["note"] = "the executor session is no longer active; the claim was lost"
+            return self._fail(
+                code, message, action.request_id,
+                exit_code=start_payload.get("exit_code") if isinstance(start_payload.get("exit_code"), int) else None,
+                data=data,
+            )
         if code in UNCERTAIN_CODES:
-            self._claim.uncertain = True
+            claim.uncertain = True
             return self._fail(
                 "outcome_unknown",
                 f"{message} (the claim may exist; reconcile before continuing)",
@@ -1014,7 +1181,7 @@ class CoveyRuntime:
         )
 
     def _read_task_state(self, subtask_id: str) -> dict | None:
-        payload = self._call(["subtask", "status", "--subtask-id", subtask_id])
+        payload = self._call(["subtask", "status", _opt("--subtask-id", subtask_id)])
         if payload.get("ok") is True and isinstance(payload.get("data"), dict):
             data = payload["data"]
             task = data.get("subtask")
@@ -1033,6 +1200,14 @@ class CoveyRuntime:
             )
         if claim.uncertain:
             if not self._reconcile():
+                if self._claim is None:
+                    return self._fail(
+                        "not_claimed",
+                        f"ownership of {action.subtask_id} was lost "
+                        f"({self._lost_reason or 'reconciliation found no live claim'}); "
+                        "start the task again with a new request",
+                        action.request_id,
+                    )
                 return self._fail(
                     "ownership_uncertain",
                     "the previous maintenance outcome is unresolved and reconciliation has not "
@@ -1043,6 +1218,7 @@ class CoveyRuntime:
         if token is None:
             return self._fail("executor_unregistered", "executor session token is unavailable",
                               action.request_id)
+        state.tokens["executor"] = token  # request is scoped to this token
 
         # Required evidence applies to receipt operations only (finish/retry/fail);
         # abandon/release carry no evidence.
@@ -1059,13 +1235,13 @@ class CoveyRuntime:
                 )
         requested = str(getattr(action, "op", requested) or requested or "")
         if requested == "retry":
-            op, argv_tail = "retry", ["--summary", action.summary, "--failure-code", action.failure_code]
+            op, argv_tail = "retry", [_opt("--summary", action.summary), _opt("--failure-code", action.failure_code)]
             expected_kind = "retryable_failure"
         elif requested == "fail":
-            op, argv_tail = "fail", ["--summary", action.summary, "--failure-code", action.failure_code]
+            op, argv_tail = "fail", [_opt("--summary", action.summary), _opt("--failure-code", action.failure_code)]
             expected_kind = "terminal_failure"
         elif isinstance(action, FinishAction):
-            op, argv_tail = "finish", ["--summary", action.summary]
+            op, argv_tail = "finish", [_opt("--summary", action.summary)]
             expected_kind = "succeeded"
         elif isinstance(action, ReleaseAbandonAction) and requested == "abandon":
             op, argv_tail = "abandon", []
@@ -1075,14 +1251,23 @@ class CoveyRuntime:
             expected_kind = "released"
         receipt_kind = expected_kind if expected_kind in ("succeeded", "retryable_failure",
                                                           "terminal_failure") else None
-        argv = ["subtask", op, "--session-token", token, "--claim-id", claim.claim_id,
-                "--fence-seq", str(claim.fence_seq), *argv_tail]
-        if evidence is not None:
-            argv.extend(["--evidence-digest", evidence])
-        argv.extend(["--idempotency-key", f"{token}:{op}:{action.request_id}"])
+        if op == "release":
+            # Release lives under `claim`, not `subtask` (no SubtaskCommand::Release).
+            argv = ["claim", "release", _opt("--session-token", token), _opt("--claim-id", claim.claim_id),
+                    _opt("--fence-seq", claim.fence_seq),
+                    _opt("--idempotency-key", f"{token}:{op}:{action.request_id}")]
+        else:
+            argv = ["subtask", op, _opt("--session-token", token), _opt("--claim-id", claim.claim_id),
+                    _opt("--fence-seq", claim.fence_seq), *argv_tail]
+            if evidence is not None:
+                argv.append(_opt("--evidence-digest", evidence))
+            argv.append(_opt("--idempotency-key", f"{token}:{op}:{action.request_id}"))
         payload = self._call(argv)
         if payload.get("ok") is not True or not isinstance(payload.get("data"), dict):
-            return self._failure_or_uncertain(payload, state, action.request_id, f"subtask {op}")
+            return self._failure_or_uncertain(
+                payload, state, action.request_id, f"{'claim' if op == 'release' else 'subtask'} {op}",
+                role="executor",
+            )
         confirmed = self._confirm_outcome(claim, op, receipt_kind)
         if confirmed is not True:
             if confirmed is None:
@@ -1146,34 +1331,48 @@ class CoveyRuntime:
             )
             if not receipt_ok:
                 return "receipt_mismatch"
-        if status.get("claim") is not None:
+        live = status.get("claim")
+        if live is not None:
+            # After release/retry the task is claimable again, so a DIFFERENT
+            # live claim means another agent already took it; that is fine.
+            if (
+                op in ("release", "retry")
+                and isinstance(live, dict)
+                and live.get("claim_id") != claim.claim_id
+            ):
+                return True
             return "claim_still_held"
-        if op == "release":
-            # release verified by claim absence; subtask state is unchanged.
-            return True
         if status["subtask"].get("state") != TERMINAL_STATES.get(op):
             return "state_mismatch"
         return True
 
     def _failure_or_uncertain(self, payload: dict, state: _RequestState,
                               request_id: str, failed_op: str, *,
-                              allow_authoritative: bool = False,
-                              subtask_id: str | None = None) -> dict:
-        code = str(payload.get("code") or "transport_error")
+                              role: str | None = None) -> dict:
+        # An ok envelope that reached here failed the per-operation shape
+        # check: the effect may have committed, so it is unknown, not failed.
+        code = "invalid_envelope" if payload.get("ok") is True else str(
+            payload.get("code") or "transport_error")
         if code in UNCERTAIN_CODES:
             state.uncertain = True
             return self._fail(
                 "outcome_unknown",
                 f"{failed_op} produced no conclusive result ({code}); the effect may have "
-                f"committed. Inspect with lists/show and reconcile before another action; "
-                "the request_id above replays exactly once when retried.",
+                f"committed. Inspect with lists/show, or retry the same request_id to replay "
+                "it with the same idempotency key (never a fresh key).",
                 request_id,
             )
-        if allow_authoritative and code in ("conflict", "not_found", "invalid_args",
-                                            "permission_denied", "internal_error"):
-            # For claim contention the engine is authoritative; surface its code.
-            return _map_transport_failure(payload)
-        return _map_transport_failure(payload)
+        env = _map_transport_failure(payload)
+        if role is not None and _is_session_inactive(payload):
+            # Reaped/exited session: report the failed action, retire the role
+            # token so the next explicit action registers fresh, no replay.
+            self._retire_role(role, f"{role} session is no longer active ({failed_op})")
+            env["data"] = {
+                "retired_role": role,
+                "note": "the session was no longer active and was retired; "
+                        "issue a new explicit action",
+            }
+        return env
 
     def _uncertain_result(self, state: _RequestState, *, request_id: str, failed_op: str) -> dict:
         if state.uncertain:
@@ -1188,10 +1387,13 @@ class CoveyRuntime:
 
     # -- claim authority / maintenance ---------------------------------------------
 
-    def _set_claim(self, claim_id: str, fence_seq: int, lease_deadline_ms: int, subtask_id: str) -> None:
+    def _set_claim(self, claim_id: str, fence_seq: int, lease_deadline_ms: int,
+                   subtask_id: str, request_id: str) -> None:
+        if self._closed:
+            return  # revoked: never publish authority after teardown began
         self._claim = _Claim(
             subtask_id=subtask_id, claim_id=claim_id, fence_seq=fence_seq,
-            lease_deadline_ms=lease_deadline_ms,
+            lease_deadline_ms=lease_deadline_ms, request_id=request_id,
         )
         self._lost_reason = None
         self._last_heartbeat_mono = time.monotonic()
@@ -1199,21 +1401,28 @@ class CoveyRuntime:
         self._start_maintenance()
 
     def _start_maintenance(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self._closed:
             return
-        self._stop_event.clear()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and not self._stop_event.is_set():
+            return
+        # Each loop owns its OWN stop event: a still-draining loop that was
+        # told to stop can never veto or inherit a new claim's maintenance.
+        stop = threading.Event()
+        self._stop_event = stop
         self._thread = threading.Thread(
-            target=self._maintenance_loop, name=f"covey-tasks-maint-{self.instance_id}", daemon=True
+            target=self._maintenance_loop, args=(stop,),
+            name=f"covey-tasks-maint-{self.instance_id}", daemon=True,
         )
         self._thread.start()
 
-    def _maintenance_loop(self) -> None:
-        interval = max(self.heartbeat_interval_ms, 1000) / 1000.0
-        while not self._stop_event.wait(interval):
+    def _maintenance_loop(self, stop: threading.Event) -> None:
+        interval = max(min(self.heartbeat_interval_ms, self.renew_interval_ms), 50) / 1000.0
+        while not stop.wait(interval):
             try:
                 self.maintenance_once()
             except Exception as exc:  # keep the daemon alive; report next status
-                logger.warning("covey-tasks maintenance tick failed: %s", exc)
+                logger.warning("covey-tasks maintenance tick failed: %s", _redact(str(exc)))
 
     def maintenance_once(self) -> None:
         """One maintenance tick; shared with the background thread (test seam)."""
@@ -1228,17 +1437,25 @@ class CoveyRuntime:
                 self._retired["executor"] = None
                 self._stop_event.set()
                 return
-            now = time.monotonic()
             claim = self._claim
             if claim.uncertain:
-                self._reconcile()
+                # Proof first: no heartbeat/renew until an authoritative status
+                # confirms this executor's live claim (or proves it lost).
+                if not self._reconcile():
+                    return
                 claim = self._claim
                 if claim is None:
                     return
+            token = self._token.get("executor")
+            if token is None:
+                return
+            now = time.monotonic()
             heartbeat_due = (now - self._last_heartbeat_mono) * 1000 >= self.heartbeat_interval_ms
             renew_due = (now - self._last_renew_mono) * 1000 >= self.renew_interval_ms
             if heartbeat_due:
-                hb = self._call(["session", "heartbeat", "--session-token", self._token["executor"]])
+                hb = self._call(["session", "heartbeat", _opt("--session-token", token)])
+                if self._closed:
+                    return  # a result returning after teardown publishes nothing
                 self._last_heartbeat_mono = time.monotonic()
                 if hb.get("ok") is not True:
                     self._handle_heartbeat_failure(hb)
@@ -1248,14 +1465,20 @@ class CoveyRuntime:
                 self._renew_once(claim)
 
     def _handle_heartbeat_failure(self, hb: dict) -> None:
-        message = str(hb.get("message") or "")
-        code = str(hb.get("code") or "")
-        if code in UNCERTAIN_CODES:
-            self._claim.uncertain = True  # reconcile next tick; renew only after proof
+        claim = self._claim
+        if claim is None:
             return
-        # SessionNotActive or heartbeat IllegalTransition(Session) from an
-        # external reaper = definite authority loss; retire without replay.
-        self._retire_executor(f"executor session heartbeat failed: {message}")
+        if _is_definite_authority_loss(hb):
+            # SessionNotActive / heartbeat IllegalTransition(Session) from an
+            # external reaper = definite authority loss; retire without replay.
+            self._retire_executor(
+                f"executor session heartbeat failed: {str(hb.get('message') or '')}"
+            )
+            return
+        # Timeout, malformed output, DB busy/internal error, missing binary...:
+        # not proof of loss.  Stay uncertain; the next tick reconciles
+        # authoritatively before any renew.
+        claim.uncertain = True
 
     def _renew_once(self, claim: _Claim) -> None:
         token = self._token.get("executor")
@@ -1267,9 +1490,11 @@ class CoveyRuntime:
                                   self.lease_duration_ms))
         # Fresh key every tick: never replay a previous tick's idempotency key.
         payload = self._call(
-            ["claim", "renew", "--session-token", token, "--claim-id", claim.claim_id,
-             "--fence-seq", str(claim.fence_seq), "--extend-by-ms", str(extend_by_ms)]
+            ["claim", "renew", _opt("--session-token", token), _opt("--claim-id", claim.claim_id),
+             _opt("--fence-seq", claim.fence_seq), _opt("--extend-by-ms", extend_by_ms)]
         )
+        if self._closed:
+            return
         self._last_renew_mono = time.monotonic()
         if payload.get("ok") is True and isinstance(payload.get("data"), dict):
             deadline = payload["data"].get("lease_deadline")
@@ -1278,19 +1503,21 @@ class CoveyRuntime:
                 self._last_heartbeat_mono = max(self._last_heartbeat_mono,
                                                 time.monotonic() - self.heartbeat_interval_ms / 1000.0)
                 return
-            self._claim.uncertain = True
+            claim.uncertain = True
             return
-        message = str(payload.get("message") or "")
-        if str(payload.get("code") or "") in UNCERTAIN_CODES:
-            self._claim.uncertain = True
+        if _is_definite_authority_loss(payload):
+            # Engine rejects already-expired/foreign/stale claims; that is
+            # retirement/reclaim, not renewal success.
+            self._retire_executor(f"lease renewal failed: {str(payload.get('message') or '')}")
             return
-        # Engine rejects already-expired claims; failure past expiry triggers
-        # retirement/reclaim, not renewal success.
-        self._retire_executor(f"lease renewal failed: {message}")
+        claim.uncertain = True
 
     def _reconcile(self) -> bool:
         """Authoritative check of the current live held claim; returns True if
-        ownership is confirmed and uncertainty is cleared."""
+        ownership is confirmed and uncertainty is cleared.  Retires the
+        executor only on an authoritative mismatch, never on a read fault."""
+        if self._closed:
+            return False
         claim = self._claim
         token = self._token.get("executor")
         if claim is None or token is None:
@@ -1299,29 +1526,42 @@ class CoveyRuntime:
         if status is None:
             return False
         live = status.get("claim")
-        if (
-            isinstance(live, dict)
-            and live.get("claim_id") == claim.claim_id
-            and int(live.get("fence_seq", -1)) == claim.fence_seq
-            and live.get("owner_session_token") == token
-            and int(live.get("lease_deadline", 0)) > self._observed_now_ms()
-        ):
+        if live is not None and not isinstance(live, dict):
+            return False
+        if self._live_claim_matches(live, claim, token):
+            claim.lease_deadline_ms = live["lease_deadline"]
             claim.uncertain = False
-            self._claim = claim
             return True
         self._retire_executor("reconciliation found no live claim held by this executor")
         return False
 
+    def _mark_dead(self, token: str | None) -> None:
+        """Record a retired token (and its principal) so it is never re-minted
+        or replayed, even after its pending exit slot is cleared."""
+        if token is None:
+            return
+        self._dead_tokens.add(token)
+        principal = self._token_principal.get(token)
+        if principal is not None:
+            self._dead_principals.add(principal)
+
+    def _retire_role(self, role: str, reason: str) -> None:
+        if role == "executor":
+            self._retire_executor(reason)
+            return
+        # Orchestrator: reaped/exited sessions have nothing left to exit.
+        self._mark_dead(self._token.pop(role, None))
+
     def _retire_executor(self, reason: str) -> None:
         """Definite authority loss: retire the executor TOKEN itself, record
         one pending exit, stop maintenance, and never act on it again."""
-        claim = self._claim
         self._claim = None
         self._lost_reason = reason
         self._stop_event.set()
         token = self._token.pop("executor", None)
         if token is not None:
             self._retired["executor"] = token
+            self._mark_dead(token)
 
     def _clear_claim_and_retire_executor(self) -> dict | None:
         """Definite outcome cleared: clear claim, stop renewals, retire token
@@ -1331,13 +1571,18 @@ class CoveyRuntime:
         token = self._token.pop("executor", None)
         diagnostics = None
         if token is not None:
+            self._mark_dead(token)
             diagnostics = self._attempt_exit("executor", token, NORMAL_TIMEOUT)
         return diagnostics
 
-    def _attempt_exit(self, role: str, token: str, timeout: float) -> dict | None:
+    def _attempt_exit(self, role: str, token: str, timeout: float, *,
+                      teardown: bool = False) -> dict | None:
         if not token:
             return None
-        payload = self._call(["session", "exit", "--session-token", token], timeout=timeout)
+        if self._closed and not teardown:
+            return _envelope_failure("closed", "runtime closed; session exit was not attempted")
+        payload = self._call(["session", "exit", _opt("--session-token", token)],
+                             timeout=timeout, teardown=True)
         if payload.get("ok") is True:
             return None
         # Cleanup failures are sanitized diagnostics, never successful exits.
@@ -1346,33 +1591,44 @@ class CoveyRuntime:
     # -- teardown --------------------------------------------------------------
 
     def close(self) -> None:
-        """Bounded, idempotent teardown. Revokes local authority first, then
-        exits each role once within a single total monotonic deadline."""
-        if self._closed:
-            return
-        deadline = time.monotonic() + max(0.1, self.teardown_timeout)
-        with self._lock:
-            self._closed = True
+        """Bounded, idempotent teardown.  Revokes local authority FIRST without
+        waiting on any lock, then exits each role once within a single total
+        monotonic deadline that also covers thread join and lock acquisition."""
+        with self._close_guard:
+            if self._close_started:
+                return
+            self._close_started = True
+            self._closed = True  # gates every action, tick and backend call
             self._epoch += 1
             self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                self._thread.join(timeout=remaining)
-        acquired = self._lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
-        if acquired:
-            try:
-                # exit_session releases held claims and clears active_subtask_id;
-                # no redundant claim-release call.
-                for role in ("executor", "orchestrator"):
+        deadline = time.monotonic() + max(0.1, self.teardown_timeout)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            # An in-flight command consumed the budget: stay revoked; lease
+            # expiry is the backstop.  The in-flight thread sees `_closed` and
+            # publishes nothing.
+            logger.warning("covey-tasks teardown budget exhausted before exit; relying on lease expiry")
+            return
+        try:
+            self._claim = None
+            # exit_session releases held claims and clears active_subtask_id;
+            # no redundant claim-release call.
+            for role in ("executor", "orchestrator"):
+                tokens = [self._retired.pop(role, None), self._token.pop(role, None)]
+                for token in tokens:
+                    if not token:
+                        continue
+                    self._mark_dead(token)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Budget exhausted: leave revoked state; lease expiry
-                        # is the backstop.
-                        break
-                    pending = self._retired.pop(role, None) or self._token.pop(role, None)
-                    if pending:
-                        self._attempt_exit(role, pending, remaining)
-            finally:
-                self._lock.release()
+                        # Budget exhausted: leave revoked state.
+                        continue
+                    diag = self._attempt_exit(role, token, remaining, teardown=True)
+                    if diag is not None:
+                        logger.warning("covey-tasks teardown exit for %s failed: %s", role,
+                                       _redact(str(diag.get("message") or "")))
+        finally:
+            self._lock.release()
 
