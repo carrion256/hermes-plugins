@@ -176,16 +176,25 @@ python evaluation/evaluate_paired.py --run --efforts medium,xhigh --repeats 2 --
 
 Each pair starts from identical source, uses the same numeric seed, and has isolated workspace/HOME/HERMES_HOME. Seeds vary across repeats; arm order alternates within each case. The corpus carries six frozen cases (suffix removal, page count, JSONL record parsing, CSV catalog aggregation, cross-file memo state, ledger batches) plus four additive cases (YAML service config, SQLite migration, path-security asset fetch, slug control). The v4 run used a six-case plan; the current design plans all ten (40 arms per two-effort, two-repeat run). Public and hidden oracles have reference-positive and broken/mutant-negative controls. The runner retains failures, timeouts, sources, transmitted controls, cumulative execution/repair usage and deterministic assessment cost; it does **not** claim an independent model code review or known monetary total.
 
-The 2026-10-10 v4 run attempted 24 arms. One timeout pair and one mixed-effort-transmission pair were excluded, leaving 10 eligible comparisons. A broken path-security oracle and incomplete schema-rollback oracle were found during review; original artifacts remain unchanged. `evaluation/reassess_paired_v4.py` replays corrected oracles against hash-verified frozen candidates, in a separate output directory, without new model calls. These results are explicitly **retrospective**, not a preregistered rerun:
+The 2026-10-10 v4 run attempted 24 arms. One timeout pair and one mixed-effort-transmission pair were excluded, leaving 10 eligible comparisons. A broken path-security oracle and incomplete schema-rollback oracle were found during review; original artifacts remain unchanged. `evaluation/reassess_paired_v4.py` replays corrected oracles against hash-verified frozen candidates, in a separate output directory, without new model calls. These results are explicitly **retrospective**, not a preregistered rerun.
+
+The current comparative run is `paired-live-v5`: all 10 cases (the 6 frozen plus 4 additive), 20 pairs / 40 arms, `medium` versus `xhigh`, two counterbalanced repeats with shared per-pair seeds and isolated homes. It completed 18 eligible pairs; one `memo-flight` repeat timed out in both arms at the 180-second child cap and remains in correctness/latency as a censored observation, while two xhigh arms were excluded by the wire-support gate because one request omitted the effort field. Raw unfiltered outcomes were medium 19/20 correct and xhigh 20/20; eligible-pair aggregates were:
 
 | Eligible-arm observation | medium | xhigh |
 |---|---:|---:|
-| Correct under corrected deterministic oracles | 10/10 | 10/10 |
-| Cumulative native execution seconds | 305.16 | 405.19 |
-| Native input + output tokens | 445,385 | 596,349 |
-| Native API calls | 65 | 79 |
+| Correct under corrected deterministic oracles | 17/18 | 18/18 |
+| Raw unfiltered correctness | 19/20 | 20/20 |
+| Cumulative native execution seconds | 353.27 | 385.99 |
+| Mean native child latency, seconds | 19.63 | 21.44 |
+| Native input + output tokens | 721,800 | 736,040 |
+| Native API calls | 112 | 107 |
+| Verification ledger rows observed | 19 | 17 |
+| Verified corrective revisions | 0 | 0 |
+| Native cost estimate | unknown | unknown |
 
-Lilith transmitted `chat_template_kwargs.reasoning_effort`, budget fields 8192/65536 and scaffold flags false/true. The client profile sets `enable_thinking: true`; an executed sandboxed render of the deployed tokenizer's hash-matched template confirms that medium and xhigh produce distinct prompt prefixes. The same render proves that budget/scaffold fields do not change this template; their intended SGLang behavior is **not qualified on the deployed vLLM fork**. Runtime reasoning-budget enforcement remains unknown. Earlier v3 missing-effort observations were an instrumentation omission, not evidence of unsupported transmission. Durable receipts are under `/home/common/projects/hermes-plugins-qualification/2026-10-10/evidence`: `effort-template-support.json`, `paired-v4-closure/` and the unchanged `paired-live*` attempts. The closure receipt verifies all 24 arm provenance chains and 136 unchanged historical files. These small-sample descriptive totals establish neither general quality equivalence nor monetary savings. **Automatic routing remains NOT_QUALIFIED.**
+The paired descriptive deltas were 838 fewer tokens and 1.82 seconds faster for `medium` on average, but the spread is large and this is not a savings claim. Two xhigh requests in separate pairs omitted the effort field and were excluded by the wire-support gate; the timeout pair remains included as censored latency with unobserved tokens/cost.
+
+Lilith transmitted `chat_template_kwargs.reasoning_effort`, budget fields 8192/65536 and scaffold flags false/true. The client profile sets `enable_thinking: true`; an executed sandboxed render of the deployed tokenizer's hash-matched template confirms that medium and xhigh produce distinct prompt prefixes. The same render proves that budget/scaffold fields do not change this template; their intended SGLang behavior is **not qualified on the deployed vLLM fork**. Runtime reasoning-budget enforcement remains unknown. The provider also sends `auto_disable_thinking_with_tools` on tool turns, so backend thinking may flatten even when the wire effort differs. Earlier v3 missing-effort observations were an instrumentation omission, not evidence of unsupported transmission. Durable receipts are under `/home/common/projects/hermes-plugins-qualification/2026-10-10/evidence`: `paired-live-v5/`, `effort-template-support.json`, `paired-v4-closure/` and the unchanged `paired-live*` attempts. The closure receipt verifies all 24 arm provenance chains and 136 unchanged historical files. These small-sample descriptive totals establish neither general quality equivalence nor monetary savings. **Automatic routing remains NOT_QUALIFIED.**
 
 The earlier fixed-xhigh six-case observation remains frozen in [evaluation/results/2026-10-09](evaluation/results/2026-10-09). It is historical evidence, not a paired effort comparison.
 
