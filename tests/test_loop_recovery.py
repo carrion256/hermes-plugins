@@ -343,3 +343,28 @@ def test_recovering_later_error_does_not_clear_established_blocker(recovery):
     observe(h, agent, "patch", a, {"success": True})
     assert status(h)["blocker"] is None
     assert status(h)["observed_recoveries"] == 1
+
+
+def test_snapshot_failure_is_logged_and_visible_not_swallowed(recovery, project, monkeypatch, caplog):
+    import logging as _logging
+
+    h, agent = recovery
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr("agent.verification_evidence.verification_evidence_by_id", boom)
+    payload = {"exit_code": 1,
+               "verification_evidence": {"id": 7, "status": "failed",
+                                         "command": "python3 -m pytest -q"}}
+    with caplog.at_level(_logging.WARNING):
+        for _ in range(3):
+            observe(h, agent, "terminal", {"command": "python3 -m pytest -q"}, payload)
+    logged = [r for r in caplog.records if "evidence snapshot failed" in r.getMessage()]
+    assert logged, "the snapshot failure must be logged, not passed silently"
+    assert any(r.exc_info for r in logged), "the diagnostic must retain the exception"
+    report = status(h)
+    assert report["blocker"] is not None, "the failed check must still record a blocker"
+    assert report["blocker"]["approaches"][-1]["check_status"] == "snapshot_error"
+    # A snapshot error must never masquerade as recovery evidence.
+    assert report["observed_recoveries"] == 0

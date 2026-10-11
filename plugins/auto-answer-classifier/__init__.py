@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ _UNSAFE = re.compile(r"\b(approv\w*|authoriz\w*|permission|consent|secret\w*|cre
 _CONVENTIONAL = re.compile(r"\b(indentation|indent|formatting|naming convention|line endings)\b", re.I)
 _LIMIT = 64
 _FILE_LIMIT = 16384
+logger = logging.getLogger(__name__)
 
 
 def _digest(value):
@@ -464,8 +466,11 @@ def register(ctx):
                 return json.dumps({"responses": [{"qid": f"q{i}", "question": r["question"], "choices_offered": r["choices"],
                                                  "response_status": "automatic_default"} for i, r in enumerate(questions)],
                                    "automatic_answers": upfront, "automatic_answer_note": "Previously human-approved conventions, not new human answers."})
-        except Exception:
-            pass  # Native clarify remains available when plugin state fails.
+        except Exception as exc:
+            # Native clarify remains available when plugin state fails; the
+            # failure must still be diagnosable.
+            logger.warning("auto-answer convention replay failed: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
         result = next_call(args) if next_call else None
         if not current(owner, workspace, task_id):
             return result
@@ -502,8 +507,10 @@ def register(ctx):
             if decisions and current(owner, workspace, task_id):
                 return json.dumps({**payload, "automatic_answers": decisions,
                                    "automatic_answer_note": "Derived defaults only; original human answers/skips remain authoritative."})
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never apply derived defaults from broken state; say why not.
+            logger.warning("auto-answer timeout default skipped: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
         return result
 
     ctx.register_hook("post_tool_call", observe)

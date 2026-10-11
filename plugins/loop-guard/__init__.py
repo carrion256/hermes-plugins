@@ -4,12 +4,14 @@ from __future__ import annotations
 from collections import deque
 import hashlib
 import json
+import logging
 import threading
 import uuid
 import weakref
 
 _POLL_ACTIONS = {"list", "poll", "log", "wait"}
 _HISTORY_LIMIT = 24
+logger = logging.getLogger(__name__)
 
 
 def _signature(name, args) -> str:
@@ -160,7 +162,8 @@ def register(ctx) -> None:
         return None, []
 
     def blocker(reason, events):
-        approaches = [{"tool": e["tool"], "argument_digest": e["call"][:16]} for e in events[-4:]]
+        approaches = [{"tool": e["tool"], "argument_digest": e["call"][:16],
+                        "check_status": e.get("check_status")} for e in events[-4:]]
         return {"invariant": redact_for_egress(reason), "approaches": approaches,
                 "next_step": "loop_recovery hypothesis: name the assumption and one exact check."}
 
@@ -242,11 +245,16 @@ def register(ctx) -> None:
                 if check_status == "failed":
                     failure = "verification:" + check
                     invariant = "verification still fails: " + str(args.get("command"))[:160]
-        except Exception:
-            pass
+        except Exception as exc:
+            # Snapshot extraction is best-effort (the event must still record),
+            # but a missing evidence check must never hide WHY it is missing.
+            check_status = "snapshot_error"
+            logger.warning("loop-guard evidence snapshot failed: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
         event = {"tool": tool_name, "call": _signature(tool_name, args),
                  "result": _signature("result", result), "failure": failure,
-                 "invariant": invariant, "target": target, "check": check}
+                 "invariant": invariant, "target": target, "check": check,
+                 "check_status": check_status}
         with lock:
             s = state(agent)
             s["answer"], s["answers"] = "", 0

@@ -283,7 +283,7 @@ class FakeClock:
         return self.now
 
 
-def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_path):
+def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_path, caplog):
     h = gate_setup(load_plugin, monkeypatch, verdict=None)
     clock = FakeClock()
     monkeypatch.setattr(h.module, "time", clock)
@@ -294,6 +294,8 @@ def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_
     target.write_text("before")
     assert screen(h, agent, "task-expire", "write_file",
                   {"path": str(target), "content": "after"}) is not None
+    # An unusable verdict must be diagnosable, never a silent pass.
+    assert any("unusable verdict" in r.getMessage() for r in caplog.records)
     clock.now += h.module._COOLDOWN_SECONDS + 1
     recovered = []
     monkeypatch.setattr(h.module.urllib.request, "urlopen",

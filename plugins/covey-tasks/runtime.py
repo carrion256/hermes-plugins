@@ -879,8 +879,11 @@ class CoveyRuntime:
                 if key not in self._cwd_backup:
                     self._cwd_backup[key] = get_session_cwd(key)
                 record_session_cwd(key, workspace)
-        except Exception:
-            pass  # host seam unavailable: file/terminal cwd routing degrades to unbound
+        except Exception as exc:
+            # Host seam unavailable: cwd routing degrades to unbound — loud,
+            # because the workspace guard's confinement depends on this binding.
+            logger.warning("covey cwd bind failed (routing degrades to unbound): %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
 
     def _restore_session_cwd(self) -> None:
         try:
@@ -890,8 +893,9 @@ class CoveyRuntime:
                     clear_session_cwd(key)
                 else:
                     record_session_cwd(key, prior)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("covey cwd restore failed: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
         self._cwd_backup.clear()
 
     def workspace_guard(self, tool_name: str, args: Any) -> dict | None:

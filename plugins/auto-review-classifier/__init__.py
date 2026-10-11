@@ -260,8 +260,10 @@ def register(ctx):
             verdict = data.get("risk") if isinstance(data, dict) else None
             if verdict in ("safe", "risky"):
                 return verdict
-        except Exception:
-            pass
+            logger.warning("auto-review classifier returned unusable verdict: %r", verdict)
+        except Exception as exc:
+            logger.warning("auto-review classifier unavailable: %s: %s",
+                           type(exc).__name__, exc, exc_info=True)
         down[endpoint] = time.monotonic() + _COOLDOWN_SECONDS
         return None
 
