@@ -1,6 +1,6 @@
 name: subagent-effort
 version: 0.5.3
-description: "Classifier-driven reasoning-effort evaluation for delegated subagents. PURE SHADOW by design: records verdicts, observed child origin, native-normalized recommendations and outcomes in durable ctx.state; never applies effort — every explicit operator/model/tool choice stays untouched."
+description: "Classifier-driven reasoning-effort evaluation for delegated subagents. PURE SHADOW by design: records verdicts, observed child origin, native-normalized recommendations and outcomes in durable ctx.state; never applies effort — every explicit operator/model/tool choice stays untouched. Not a replacement for OMP's native effort controls: these plugins cannot set reasoning effort."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1

@@ -1,6 +1,6 @@
 name: keyword-steering
 version: 0.3.0
-description: "Explicit steering modes: config-defined modes referencing skill/rule paths or identifiers, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded); declared conflicts surface and withhold both sides; inspectable via steering_status. Guidance-only."
+description: "Explicit steering modes: config-defined modes referencing skill/rule paths or identifiers, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded); declared conflicts surface and withhold both sides; inspectable via steering_status. Guidance-only. Not OMP-style magic keywords: unconfigured phrases do nothing and wording never implies an effort or mode change."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1

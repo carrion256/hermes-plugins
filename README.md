@@ -26,6 +26,17 @@ Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/car
 
 These plugins optimize for completed work per unit of agent time. Clean paths add no prompts or ceremony; classifiers and telemetry stay off launch-critical paths; rule guidance rides successful tool results instead of forcing retries; asynchronous review releases the turn while preserving the binding; optional planning fields do not block a valid handoff; external adapters cache or reuse repeated identity/observation work. Hard stops remain only for concrete evidence, authorization, credential, or mutation-safety risks.
 
+### Deliberate differences from OMP
+
+These plugins intentionally narrow OMP's behavior wherever implicit magic would undermine evidence, custody or explicit choice. If you are coming from OMP, expect these differences:
+
+| Area | OMP behavior | Here | What to expect |
+|---|---|---|---|
+| Prewalk handoff | The planning model can hand off implicitly (for example on the first write). | Only `prewalk_ready` switches models, and only with a native todo plan plus explicit located files, symbols/callers, constraints, chosen approach and acceptance IDs. | No implicit model switches. A plan that cannot point at real context stays on the planning model; scratch writes never count as readiness. |
+| Completion | A turn completes when the model stops. | `continuation` holds coding turns in `pre_verify` until the native todo ledger is clear, verification evidence is fresh, and an independent review closed on the exact reviewed change; declared acceptance criteria must bind real native evidence. | Deliberately more demanding, slower completion: "Completion unverified" until the evidence exists. A blocked or cancelled disposition is never completion. |
+| Magic keywords | Typed trigger phrases silently change behavior (modes, effort). | `keyword-steering` activates only configured prose triggers; identifiers, quotes, code and paths never trigger; declared conflicts surface and withhold both sides; `steering_status` shows exactly what is configured. | An unconfigured phrase does nothing — there is no hidden keyword list, and wording never implies an effort change. |
+| Subagent effort | Native effort controls can change reasoning effort per call. | `subagent-effort` is shadow-only: verdicts and recommendations are recorded, never applied. Automatic routing stays NOT_QUALIFIED until paired evidence qualifies it. | Effort is set through the model/provider configuration, never through these plugins. |
+
 ## Native prerequisites
 
 The matching host source supplies these shared contracts; there is no substitute scheduler or evidence database in this repository:
