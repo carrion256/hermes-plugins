@@ -203,3 +203,158 @@ def test_session_cleanup_preserves_other_live_turns(steering):
     assert _status(steering, "owner")["state"] == "inactive"
     assert _status(steering, "peer")["active"] == ["review"]
     assert _turn(steering, "please review", session_id="peer") == []
+
+
+# --- built-in magic keywords (OMP-compatible) -------------------------------
+
+MAGIC_MESSAGES = {
+    "ultrathink": "please ultrathink this design",
+    "orchestrate": "orchestrate the migration please",
+    "workflow": "run this as a workflow please",
+}
+MAGIC_MARKERS = {
+    "ultrathink": "maximum reasoning effort requested",
+    "orchestrate": "delegation and parallel subagents",
+    "workflow": "explicit plan first, then verification, then a closing review",
+}
+
+
+def test_magic_keywords_active_by_default_from_prose(load_plugin):
+    harness = load_plugin("keyword-steering", settings={})
+    for keyword, message in MAGIC_MESSAGES.items():
+        results = _turn(harness, message, turn_id=f"turn-{keyword}")
+        assert len(results) == 1
+        guidance = results[0]["context"]
+        assert f"Magic keyword '{keyword}' is active" in guidance
+        assert MAGIC_MARKERS[keyword] in guidance
+        status = _status(harness)
+        assert status["active"] == [keyword]
+        assert status["references"][keyword] == [
+            "built-in magic keyword (OMP-compatible)"
+        ]
+
+
+def test_magic_keywords_ignored_outside_prose(steering):
+    for i, message in enumerate((
+        "```\nultrathink it\n```",
+        "run `orchestrate --all` now",
+        'the doc said "workflow mode" twice',
+        "check src/ultrathink/hooks.py and workflow_timeout",
+    )):
+        assert _turn(steering, message, turn_id=f"t{i}") == []
+
+
+def test_ultrathink_calls_set_turn_reasoning_and_reports_applied(load_plugin, monkeypatch):
+    from hermes_cli.plugins import PluginContext
+    calls = []
+
+    def fake_set_turn_reasoning(self, effort, reason=""):
+        calls.append((effort, reason))
+        return {"applied": True, "effort": effort, "source": "plugin"}
+
+    monkeypatch.setattr(PluginContext, "set_turn_reasoning",
+                        fake_set_turn_reasoning, raising=False)
+    harness = load_plugin("keyword-steering", settings={})
+    guidance = _turn(harness, "please ultrathink this design")[0]["context"]
+    assert calls == [("ultra", "magic keyword: ultrathink")]
+    assert "raised to 'ultra'" in guidance
+    assert "applied=true" in guidance
+    effect = _status(harness)["magic_effects"]["ultrathink"]
+    assert effect["applied"] is True and effect["degraded"] is False
+    assert effect["receipt"] == {"applied": True, "effort": "ultra", "source": "plugin"}
+    # Turn dedup: the seam is requested once per turn, never again.
+    assert _turn(harness, "please ultrathink this design") == []
+    assert calls == [("ultra", "magic keyword: ultrathink")]
+
+
+def test_ultrathink_degrades_without_host_seam(load_plugin, monkeypatch):
+    from hermes_cli.plugins import PluginContext
+    # Deterministic regardless of whether the host has grown the seam.
+    monkeypatch.delattr(PluginContext, "set_turn_reasoning", raising=False)
+    harness = load_plugin("keyword-steering", settings={})
+    guidance = _turn(harness, "please ultrathink this design")[0]["context"]
+    assert "degraded to guidance-only" in guidance
+    assert "does not provide PluginContext.set_turn_reasoning" in guidance
+    effect = _status(harness)["magic_effects"]["ultrathink"]
+    assert effect["applied"] is False and effect["degraded"] is True
+    assert effect["reason"] == "magic keyword: ultrathink"
+    assert "unavailable" in effect["detail"]
+
+
+def test_ultrathink_reports_host_declined_receipt(load_plugin, monkeypatch):
+    from hermes_cli.plugins import PluginContext
+    monkeypatch.setattr(PluginContext, "set_turn_reasoning",
+                        lambda self, effort, reason="": {"applied": False}, raising=False)
+    harness = load_plugin("keyword-steering", settings={})
+    guidance = _turn(harness, "please ultrathink this design")[0]["context"]
+    assert "degraded to guidance-only" in guidance
+    assert "applied=false" in guidance
+    effect = _status(harness)["magic_effects"]["ultrathink"]
+    assert effect["applied"] is False and effect["degraded"] is True
+
+
+def test_magic_keyword_disabled_via_config(load_plugin):
+    harness = load_plugin("keyword-steering", settings={
+        "magic_keywords": {"ultrathink": False},
+    })
+    assert _turn(harness, "please ultrathink this design") == []
+    assert _turn(harness, "orchestrate the migration please", turn_id="turn-2") != []
+    summary = _status(harness)["magic_keywords"]
+    assert summary["ultrathink"]["enabled"] is False
+    assert summary["orchestrate"]["enabled"] is True
+    assert summary["workflow"]["source"] == "built-in (OMP-compatible)"
+
+
+def test_all_magic_keywords_disabled_via_enabled_flag(load_plugin):
+    harness = load_plugin("keyword-steering", settings={
+        "magic_keywords": {"enabled": False},
+    })
+    for i, keyword in enumerate(("ultrathink", "orchestrate", "workflow")):
+        assert _turn(harness, f"please {keyword} this", turn_id=f"t{i}") == []
+    assert _status(harness)["state"] == "inactive"
+
+
+def test_user_mode_cannot_shadow_magic_keyword(load_plugin):
+    with pytest.raises(AssertionError, match="reserved"):
+        load_plugin("keyword-steering", settings={"modes": {
+            "ultrathink": {"refs": [REF_A]},
+        }})
+
+
+def test_user_mode_conflict_with_magic_keyword_withholds_both(load_plugin):
+    harness = load_plugin("keyword-steering", settings={"modes": {
+        "quick": {"refs": [REF_A], "conflicts_with": ["ultrathink"]},
+    }})
+    guidance = _turn(harness, "do a quick ultrathink pass please")[0]["context"]
+    assert "conflict" in guidance
+    assert REF_A not in guidance
+    assert "maximum reasoning effort requested" not in guidance
+    status = _status(harness)
+    assert status["withheld"] == ["quick", "ultrathink"]
+    assert status["conflicts"] == [["quick", "ultrathink"]]
+    # The effort seam is never requested for a withheld keyword.
+    assert status["magic_effects"] == {}
+
+
+def test_status_lists_magic_keyword_provenance(load_plugin):
+    harness = load_plugin("keyword-steering", settings={})
+    _turn(harness, "orchestrate the migration please")
+    status = _status(harness)
+    assert set(status["magic_keywords"]) == {"ultrathink", "orchestrate", "workflow"}
+    assert all(entry["enabled"] is True
+               and entry["source"] == "built-in (OMP-compatible)"
+               for entry in status["magic_keywords"].values())
+    assert status["references"]["orchestrate"] == [
+        "built-in magic keyword (OMP-compatible)"
+    ]
+
+
+@pytest.mark.parametrize("bad_magic,reason", [
+    (["ultrathink"], "mapping"),
+    ({"enabled": "sure"}, "boolean"),
+    ({"ultrathink": "yes"}, "boolean"),
+    ({"hyperthink": True}, "unknown magic"),
+])
+def test_invalid_magic_config_refused(load_plugin, bad_magic, reason):
+    with pytest.raises(AssertionError, match=reason):
+        load_plugin("keyword-steering", settings={"magic_keywords": bad_magic})
