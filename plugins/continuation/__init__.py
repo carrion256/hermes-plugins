@@ -518,10 +518,13 @@ def register(ctx) -> None:
         return [(str(i.get("id")), str(i.get("status"))) for i in _todo_items(agent)]
 
     def _acceptance_state(record, agent):
-        """(criteria, required_ids, cancellable_ids, blocked_lines)."""
+        """(criteria, required_ids, cancellable_ids, blocked_lines).
+        Required ids derive from EXPLICIT declarations only — a native todo
+        alone is never a declared acceptance criterion; its content is still
+        passed to the reviewer via the mapping."""
         criteria = record.get("acceptance") or {}
         rows = _todo_rows(agent)
-        required = set(criteria) | {tid for tid, _ in rows}
+        required = set(criteria)
         cancellable = {cid for cid, c in criteria.items()
                        if str((c.get("disposition") or {}).get("status")) == "cancelled"}
         cancellable |= {tid for tid, st in rows if st == "cancelled"}
@@ -1452,13 +1455,18 @@ def register(ctx) -> None:
                     return {"action": "continue",
                             "message": "Review record lookup failed; completion cannot be certified. Retry."}
                 if delegation is not None and str(delegation.get("state") or "") in _RUNNING_DELEGATION:
-                    record["blockers"] = list(record.get("findings") or []) + [
-                        "independent review still running (pending)"]
+                    # Reviewer still running: release the turn instead of holding
+                    # every internal round. The binding stays (released) so the
+                    # next genuine turn picks the delegation up; release is silent.
+                    record["review"] = dict(review, released=True)
+                    record.pop("blockers", None)
                     _save(session_id, record, owner)
-                    return {"action": "continue",
-                            "message": ("Independent review of this change is still running; its findings "
-                                        "arrive in this conversation. Wait for the structured verdict "
-                                        "before finishing.")}
+                    with _session_lock:
+                        # Release is deliberate and silent: the provisional
+                        # pending marker must not label the released output.
+                        if _owners.get(session_id) == owner:
+                            _memory_blockers.pop(session_id, None)
+                    return None
                 if delegation is None or str(delegation.get("state") or "") != "completed":
                     record["review"] = {}  # lost/failed: not a clean review; cycle continues
                 else:

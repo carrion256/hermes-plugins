@@ -50,8 +50,9 @@ def _mw(harness, tool_name="terminal", args=None, session_id="sess-1", task_id="
 
 
 def _guidance(result):
-    payload = json.loads(result)
-    return payload.get("rule_guidance", ""), payload.get("error", "")
+    # Guidance rides the executed tool result: guidance is checked as text.
+    assert isinstance(result, str) and result.strip()
+    return result, ""
 
 
 def _referenced_files(book):
@@ -138,7 +139,7 @@ def test_always_apply_with_globs_is_never_unconditional(load_plugin, tmp_path, m
     result, calls = _mw(harness, tool_name="read_file", args={"path": "a.rs"})
     guidance, _ = _guidance(result)
     assert "SCOPED-BODY" in guidance
-    assert calls == []  # executor short-circuited for review
+    assert calls == [{"path": "a.rs"}]  # executed with guidance appended
 
 
 # --- rules: tool_execution guidance lane --------------------------------------
@@ -152,8 +153,8 @@ def test_reminder_delivers_once_with_unchanged_args(load_plugin, tmp_path, monke
     guidance, error = _guidance(result)
     assert "GUARD-BODY" in guidance
     assert str(tmp_path / "global" / "guard.md") in guidance  # read-full path
-    assert error  # canonical envelope: result is recognized as blocked
-    assert calls == []  # native executor never ran; args untouched
+    # Delivered once, on the executed call; args are never modified.
+    assert calls == [{"command": "git push --force"}]
     assert args == {"command": "git push --force"}
     # Retry: guidance consumed, executor runs with the SAME args.
     result2, calls2 = _mw(harness, args=args)
@@ -164,10 +165,10 @@ def test_scopes_combine_with_and(load_plugin, tmp_path, monkeypatch):
     _write_rule(tmp_path / "global" / "notes.md",
                 "tools: [terminal]\nglobs: [\"*.txt\"]", body="NOTES-BODY")
     harness = _rules_harness(load_plugin, tmp_path, monkeypatch)
-    # Both scopes satisfied: guidance delivered, executor short-circuited.
+    # Both scopes satisfied: guidance delivered on the executed result.
     _seeded(harness, tmp_path)
     result, calls = _mw(harness, args={"path": "notes.txt"})
-    assert "NOTES-BODY" in _guidance(result)[0] and calls == []
+    assert "NOTES-BODY" in _guidance(result)[0] and calls == [{"path": "notes.txt"}]
     # Tool scope alone is insufficient.
     _seeded(harness, tmp_path, session_id="sess-2")
     result, calls = _mw(harness, tool_name="terminal",
@@ -187,7 +188,7 @@ def test_glob_rule_matches_relative_project_path(load_plugin, tmp_path, monkeypa
     # session-relative candidate matches the project path glob.
     _seeded(harness, tmp_path)
     result, calls = _mw(harness, tool_name="read_file", args={"path": "src/a.py"})
-    assert "SRC-RULE" in _guidance(result)[0] and calls == []
+    assert "SRC-RULE" in _guidance(result)[0] and len(calls) == 1
     # Already delivered once: the retry executes with the same args.
     result, calls = _mw(harness, tool_name="read_file", args={"path": "src/a.py"})
     assert result == "EXECUTED" and calls == [{"path": "src/a.py"}]
@@ -201,7 +202,7 @@ def test_glob_rule_matches_relative_project_path(load_plugin, tmp_path, monkeypa
                         args={"path": str(foreign)}, session_id="sess-2")
     # sess-2's cwd is .../other, so the path is src/b.py inside its own
     # project: per-project scope applies there too (not a foreign suffix match).
-    assert "SRC-RULE" in _guidance(result)[0] and calls == []
+    assert "SRC-RULE" in _guidance(result)[0] and len(calls) == 1
     # True foreign read: session project has no src/ prefix for this path.
     _seeded(harness, tmp_path / "proj_c", session_id="sess-3")
     (tmp_path / "proj_c").mkdir()
@@ -227,7 +228,7 @@ def test_unknown_workspace_does_not_match_foreign_path(load_plugin, tmp_path, mo
         _SESSION_CWD.reset(cwd_token)
 
 
-def test_native_multifile_patch_gets_guidance_before_writing(load_plugin, tmp_path, monkeypatch):
+def test_native_multifile_patch_gets_guidance_with_write(load_plugin, tmp_path, monkeypatch):
     from tools.file_tools import patch_tool
 
     _write_rule(tmp_path / "global" / "src.md",
@@ -249,10 +250,10 @@ def test_native_multifile_patch_gets_guidance_before_writing(load_plugin, tmp_pa
             session_id="sess-1", task_id="t1",
         )
 
-    assert "Review Python changes" in _guidance(apply())[0]
-    assert not (tmp_path / "src" / "widget.py").exists()
-    assert not (tmp_path / "docs" / "note.txt").exists()
-    apply()
+    result = apply()
+    assert "Review Python changes" in _guidance(result)[0]  # delivered once
+    assert (tmp_path / "src" / "widget.py").exists()
+    assert (tmp_path / "docs" / "note.txt").exists()
     import runpy
     assert runpy.run_path(str(tmp_path / "src" / "widget.py"))["ANSWER"] == 42
     assert (tmp_path / "docs" / "note.txt").read_text().splitlines() == ["hello"]
@@ -267,7 +268,7 @@ def test_glob_extension_basename_match(load_plugin, tmp_path, monkeypatch):
     guidance, _ = _guidance(result)
     assert "RUST-RULE" in guidance
     assert str(tmp_path / "global" / "rust.md") in guidance  # full text + file
-    assert calls == []
+    assert len(calls) == 1  # guidance rides the executed result
     # Extension mismatch: executor runs.
     _seeded(harness, tmp_path, session_id="sess-2")
     result, calls = _mw(harness, tool_name="read_file",
@@ -283,7 +284,7 @@ def test_two_matching_rules_deliver_deterministically(load_plugin, tmp_path, mon
     result, calls = _mw(harness, args={"command": "ls"})
     guidance, _ = _guidance(result)
     assert guidance.index("ALPHA") < guidance.index("BRAVO")  # sorted-by-name
-    assert calls == []
+    assert len(calls) == 1  # delivered with the executed result
     result, calls = _mw(harness, args={"command": "ls"})
     assert result == "EXECUTED" and len(calls) == 1
 
@@ -310,7 +311,7 @@ def test_activation_cleanup_on_session_reset(load_plugin, tmp_path, monkeypatch)
                  reason="new_session", platform="cli")
     _seeded(harness, tmp_path)  # fresh activation
     result, calls = _mw(harness, args={"command": "ls"})
-    assert "GUARD-BODY" in _guidance(result)[0] and calls == []
+    assert "GUARD-BODY" in _guidance(result)[0] and len(calls) == 1
 
 
 def test_lazy_seed_delivers_without_render(load_plugin, tmp_path, monkeypatch):
@@ -321,7 +322,7 @@ def test_lazy_seed_delivers_without_render(load_plugin, tmp_path, monkeypatch):
     monkeypatch.setattr(harness.module, "_runtime_cwd", lambda: str(tmp_path))
     monkeypatch.setattr(harness.module, "_profile_name", lambda: "main")
     result, calls = _mw(harness, args={"command": "ls"}, session_id="resumed-1")
-    assert "GUARD-BODY" in _guidance(result)[0] and calls == []
+    assert "GUARD-BODY" in _guidance(result)[0] and len(calls) == 1
 
 
 def test_empty_session_identity_executes_without_guidance(load_plugin, tmp_path, monkeypatch):
@@ -332,7 +333,7 @@ def test_empty_session_identity_executes_without_guidance(load_plugin, tmp_path,
     assert result == "EXECUTED" and len(calls) == 1  # unknown identity: no guidance
 
 
-def test_veto_ordering_cannot_consume_guidance(load_plugin, tmp_path, monkeypatch):
+def test_guidance_delivered_with_executed_call_pretool_untouched(load_plugin, tmp_path, monkeypatch):
     # Verified pipeline order (agent/tool_executor.py: tool_execution
     # middleware wraps the hermes pipeline; _pre_tool_block — the plugin
     # pre-tool veto — runs strictly BELOW it, inside _dispatch_authorized_once).
@@ -348,9 +349,9 @@ def test_veto_ordering_cannot_consume_guidance(load_plugin, tmp_path, monkeypatc
                         turn_id="turn-1", api_request_id="api-1")
     assert veto == []
     result, calls = _mw(harness, args={"command": "ls"})
-    assert "GUARD-BODY" in _guidance(result)[0] and calls == []
-    # Retry: guidance consumed; the executor (and the pre-tool policy above
-    # it in the real pipeline order) runs with the unchanged args.
+    assert "GUARD-BODY" in _guidance(result)[0] and len(calls) == 1
+    # Same call: guidance consumed, the executor (and the pre-tool policy
+    # below it in the real pipeline order) ran with unchanged args.
     result, calls = _mw(harness, args={"command": "ls"})
     assert result == "EXECUTED" and len(calls) == 1
 

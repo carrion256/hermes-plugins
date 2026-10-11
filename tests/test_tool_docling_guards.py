@@ -163,6 +163,33 @@ def test_cache_hit_and_invalidation(docling):
     assert third["source_hash"] != first["source_hash"]
 
 
+
+def test_converter_launcher_hash_cached_and_invalidated(docling, monkeypatch):
+    import builtins
+    ctx, log, tmp = docling
+    fake = tmp / "docling"
+    real_path = os.path.realpath(str(fake))
+    real_open = builtins.open
+    launcher_reads = []
+
+    def spy(file, *a, **k):
+        if str(file) == real_path:
+            launcher_reads.append(str(file))
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", spy)
+    (tmp / "cache.md").write_text("cache content")
+    _convert(ctx, {"path": "cache.md"})
+    after_first = len(launcher_reads)
+    assert after_first == 2  # pre-run hash + fresh post-run CWE-367 recheck
+    second = _convert(ctx, {"path": "cache.md"})
+    assert second["from_cache"] is True
+    assert len(launcher_reads) == after_first  # stat identity unchanged: cached
+    fake.write_text(FAKE + "\n# upgraded launcher\n")  # stat identity changes
+    third = _convert(ctx, {"path": "cache.md"})
+    assert third["from_cache"] is False
+    assert len(launcher_reads) > after_first  # invalidated, launcher re-hashed
+
 def test_failed_conversion_publishes_no_stale_cache(docling):
     ctx, log, tmp = docling
     src = tmp / "bad.md"

@@ -14,9 +14,12 @@ import re
 import shlex
 import stat
 import os
+import time
 import urllib.request
 import uuid
 
+_CLASSIFY_TIMEOUT = 2.5
+_COOLDOWN_SECONDS = 45
 logger = logging.getLogger(__name__)
 _SKIP = {"read_file", "search_files", "web_search", "web_extract", "skill_view",
          "skills_list", "ha_get_state", "ha_list_entities", "ha_list_services"}
@@ -239,21 +242,28 @@ def _outbound(summary):
 
 
 def register(ctx):
+    # Cooldown is a fixed blackout: recovery is re-attempted after it expires.
+    down = {}  # endpoint -> monotonic deadline; a dead endpoint must not tax every tool call
     def classify(text):
         key = os.environ.get(ctx.get_config("api_key_env", "CLASSIFIER_API_KEY"), "")
         endpoint = str(ctx.get_config("endpoint", "http://192.168.50.149:8787") or "").rstrip("/")
+        if down.get(endpoint, 0.0) > time.monotonic():
+            return None
         if not key or not endpoint:
             return None
         request = urllib.request.Request(endpoint + "/classify",
                                          data=json.dumps({"text": text, "schema": {"risk": ["safe", "risky"]}}).encode(),
                                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(request, timeout=10) as reply:
+            with urllib.request.urlopen(request, timeout=_CLASSIFY_TIMEOUT) as reply:
                 data = json.loads(reply.read(16385))
             verdict = data.get("risk") if isinstance(data, dict) else None
-            return verdict if verdict in ("safe", "risky") else None
+            if verdict in ("safe", "risky"):
+                return verdict
         except Exception:
-            return None
+            pass
+        down[endpoint] = time.monotonic() + _COOLDOWN_SECONDS
+        return None
 
     def gate(tool_name="", args=None, task_id="", tool_call_id="", session_id="", turn_id="", **_kw):
         if tool_name in _SKIP or (tool_name == "process_manage" and isinstance(args, dict) and args.get("action") in _POLLING):

@@ -2889,3 +2889,37 @@ def test_relative_gitdir_lock_resolves_from_worktree(covey, covey_bin, tmp_path,
         assert busy is not None and busy["code"] == "workspace_busy"
     finally:
         peer_rt.close()
+
+
+def test_static_guidance_shown_once_per_runtime(covey, tmp_path, agent_for):
+    db = tmp_path / "guid.db"
+    h = covey(db_path=str(db))
+    agent = agent_for("s1")
+    first = ok(call(h, agent, action="create", prompt="guidance one"))
+    assert first["guidance"]  # static guidance on the FIRST qualifying result
+    second = ok(call(h, agent, action="create", prompt="guidance two"))
+    assert "guidance" not in second  # once per runtime, not per result
+
+
+def test_start_guidance_shown_once_per_runtime(covey, covey_bin, tmp_path, agent_for):
+    db = tmp_path / "guid-start.db"
+    h = covey(db_path=str(db))
+    mod = runtime_module(h)
+    meta_id, tid, orch = seed_worklist(covey_bin, db)
+    tid2 = seed_task(covey_bin, db, orch, meta_id, "second claim")
+    first_rt = mod.CoveyRuntime(agent_for("s1"), binary=covey_bin,
+                                db_path=str(db), profile_home=str(tmp_path))
+    second_rt = mod.CoveyRuntime(agent_for("s2"), binary=covey_bin,
+                                 db_path=str(db), profile_home=str(tmp_path))
+    try:
+        started = ok(first_rt.execute({"action": "start", "subtask_id": tid}))
+        assert started["guidance"]
+        fresh = ok(second_rt.execute({"action": "start", "subtask_id": tid2}))
+        # A fresh runtime shows the guidance again; the previous runtime
+        # does not repeat it.
+        assert fresh["guidance"]
+        assert first_rt._started_data(first_rt._claim)["state"] == "in_progress"
+        assert "guidance" not in first_rt._started_data(first_rt._claim)
+    finally:
+        first_rt.close()
+        second_rt.close()

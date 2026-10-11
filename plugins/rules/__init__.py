@@ -398,6 +398,8 @@ def register(ctx) -> None:
         if omitted:
             logger.warning("rules: %d always-apply rule(s) exceed the prompt budget "
                            "and are omitted for session %s", omitted, info.get("session_id"))
+            return text + (f"\n\n[RULES] {omitted} always-apply rule(s) exceed the "
+                           "prompt budget and are omitted; read the rule files directly.")
         return text
 
     def _render_rulebook(info: Any) -> str:
@@ -418,7 +420,9 @@ def register(ctx) -> None:
             text = candidate
             lines.append(line)
         if omitted:
-            text += (f"\n- {', '.join(omitted)} — over the rulebook budget; "
+            shown = ", ".join(omitted[:8])
+            more = f" (+{len(omitted) - 8} more)" if len(omitted) > 8 else ""
+            text += (f"\n- {shown}{more} — over the rulebook budget; "
                      "read these rule files directly")
         return text
 
@@ -457,11 +461,11 @@ def register(ctx) -> None:
 
     def tool_execution(tool_name: str = "", args: Any = None, next_call=None,
                        session_id: str = "", task_id: str = "", **_kw):
-        # One-time rule guidance delivered as the tool result itself. This
-        # middleware wraps pre-tool policy (agent/tool_executor.py), so the
-        # short-circuit delivers guidance first without consuming any pre-tool
-        # decision; the retry meets pre-tool policy, and until it is reached
-        # the executor never runs and args are never modified.
+        # One-time rule guidance delivered WITH the executed result — no
+        # synthetic error, no retry round-trip. This middleware wraps
+        # pre-tool policy (agent/tool_executor.py), so the executor and
+        # args are never modified; guidance rides the real tool result and
+        # each rule is delivered at most once per session.
         if next_call is None or not ttsr_enabled or not isinstance(args, dict):
             return next_call(args) if next_call else None
         session_id = str(session_id or "")
@@ -487,17 +491,27 @@ def register(ctx) -> None:
             return next_call(args)
         for rule in hits:  # mark fired only for actually delivered rules
             act.fired.add(rule.name)
-        # Canonical tool-error envelope so the result reads as blocked; the
-        # model retries the same call. Full bodies + file path, never truncated.
         text = "\n\n".join(f"{r.body}\n[rule file: {r.path}]" for r in hits)
-        return json.dumps({
-            "error": "Blocked once by rules plugin for review: "
-                     + ", ".join(r.name for r in hits),
-            "rule_guidance": text,
-            # Opaque planner-facing metadata (id/source/checks); the ids and
-            # refs are data only — never resolved or executed here.
-            "rule_refs": _rule_refs(hits),
-        }, ensure_ascii=False)
+        refs = _rule_refs(hits)
+        result = next_call(args)
+        if not isinstance(result, str):
+            return result  # structural result: never corrupt tool output
+        note = "\n\n[RULE GUIDANCE — one-time, apply to this change]\n" + text
+        if refs:
+            note += "\n[rule refs] " + json.dumps(refs, ensure_ascii=False)
+        # JSON tool results must remain JSON: native mutation tracking and
+        # downstream consumers parse them. Attach guidance as data there;
+        # only free-form text gets the appended note.
+        try:
+            data = json.loads(result)
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            data["rule_guidance"] = text
+            if refs:
+                data["rule_refs"] = refs
+            return json.dumps(data, ensure_ascii=False)
+        return result + note
 
     def _drop_session(session_id: str = "", **_kw):
         activation.pop(str(session_id or ""), None)

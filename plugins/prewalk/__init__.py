@@ -49,8 +49,8 @@ NUDGE = (
 )
 
 
-_HANDOFF_LISTS = ("files", "constraints", "non_goals", "rejected_approaches",
-                  "falsification_checks", "replan_triggers", "acceptance_ids")
+_HANDOFF_LISTS = ("files", "constraints", "non_goals", "rejected_approaches")
+_OPTIONAL_LISTS = ("falsification_checks", "replan_triggers", "acceptance_ids")
 
 
 def _validate_handoff(args: dict, session_id: str = "",
@@ -66,6 +66,13 @@ def _validate_handoff(args: dict, session_id: str = "",
         if not isinstance(v, list) or not v or any(
                 not isinstance(x, str) or not x.strip() for x in v):
             problems.append(f"{field}: non-empty list of non-empty strings required")
+    for field in _OPTIONAL_LISTS:
+        v = args.get(field)
+        if v is None:
+            v = args[field] = []  # optional: absent defaults to empty
+        if not isinstance(v, list) or any(
+                not isinstance(x, str) or not x.strip() for x in v):
+            problems.append(f"{field}: optional list of non-empty strings")
     symbols = args.get("symbols")
     if not isinstance(symbols, list) or not symbols or any(
             not isinstance(x, str) or not x.strip() for x in symbols):
@@ -76,10 +83,7 @@ def _validate_handoff(args: dict, session_id: str = "",
     if not isinstance(callers, list) or any(
             not isinstance(x, str) or not x.strip() for x in callers):
         problems.append("callers: list of non-empty strings required")
-    elif not callers and not str(args.get("callers_absence_reason") or "").strip():
-        problems.append("callers: none provided — callers_absence_reason is "
-                        "required to state why the located symbol legitimately "
-                        "has no callers (never invent references)")
+    # callers may legitimately be empty with no reason given — advisory only.
     if args.get("rule_refs") is not None and (
             not isinstance(args["rule_refs"], list)
             or any(not isinstance(x, str) for x in args["rule_refs"])):
@@ -396,8 +400,8 @@ def register(ctx) -> None:
                 "parameters": {"type": "object", "properties": {
                     "files": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative paths of located evidence; each must exist."},
                     "symbols": {"type": "array", "items": {"type": "string"}, "description": "Located symbols central to the task; non-empty."},
-                    "callers": {"type": "array", "items": {"type": "string"}, "description": "Callers of the located symbol; empty only with callers_absence_reason."},
-                    "callers_absence_reason": {"type": "string", "description": "Why callers legitimately do not exist; required when callers is empty."},
+                    "callers": {"type": "array", "items": {"type": "string"}, "description": "Callers of the located symbol; may be empty (optionally with callers_absence_reason)."},
+                    "callers_absence_reason": {"type": "string", "description": "Optional: why callers legitimately do not exist."},
                     "constraints": {"type": "array", "items": {"type": "string"}, "description": "Constraints the execution model must respect."},
                     "non_goals": {"type": "array", "items": {"type": "string"}},
                     "chosen_approach": {"type": "string",
@@ -408,9 +412,7 @@ def register(ctx) -> None:
                     "acceptance_ids": {"type": "array", "items": {"type": "string"}, "description": "Acceptance criterion IDs (native acceptance tool ids where enabled)."},
                     "rule_refs": {"type": "array", "items": {"type": "string"}, "description": "Optional rule references."}},
                     "required": ["files", "symbols", "constraints", "non_goals",
-                                 "chosen_approach", "rejected_approaches",
-                                 "falsification_checks", "replan_triggers",
-                                 "acceptance_ids"]}},
+                                 "chosen_approach", "rejected_approaches"]}},
         handler=lambda args, **kw: prewalk_ready(args, **kw),
         description="Hand off to the execution model with a validated evidence-backed plan.",
     )

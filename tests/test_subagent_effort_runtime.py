@@ -286,3 +286,40 @@ def test_explicit_effort_untouched_and_origin_captured_stalled(load_plugin, monk
     assert row["verdict"] == "complex" and row["suggested_effort"] == "high"
     assert row["clamped_effort"] == "unknown"
     assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+def test_pure_bookkeeping_persistence_is_throttled(load_plugin, monkeypatch):
+    """Pending-row bookkeeping is rate-limited; the suppressed row still
+    reaches the durable store on the next snapshot write (coalesced, not
+    lost), and verdict/worker writes below remain durable anyway."""
+    parked, gate = _install_stalled_fake(monkeypatch)
+    h = load_plugin("subagent-effort")
+    monkeypatch.setattr(h.module, "time", _FakeClock())
+    writes = []
+    from hermes_cli.plugins_state import PluginState
+    real_set = PluginState.set
+    monkeypatch.setattr(PluginState, "set",
+                        lambda self, key, value: writes.append(key) or real_set(self, key, value))
+    for child in ("child-a", "child-b"):
+        h.hook("subagent_start", parent_session_id="p", child_session_id=child,
+               child_goal="complex-marker do work")
+    assert writes == ["shadow"]  # child-b's bookkeeping write coalesced away
+    # both rows observable live
+    assert set(_rows(h)) == {"child-a", "child-b"}
+    clock = h.module.time
+    clock.now += h.module._BOOKKEEPING_INTERVAL + 1
+    h.hook("subagent_start", parent_session_id="p", child_session_id="child-c",
+           child_goal="complex-marker do work")
+    assert writes == ["shadow", "shadow"]
+    # the coalesced write carried child-b's row after all: coalesced, not lost
+    assert "child-b" in h.context.state.get("shadow")
+    gate.set()  # cleanup: settle the parked workers
+    _settle(h)

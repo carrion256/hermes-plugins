@@ -55,12 +55,10 @@ MAX_STEPS = 60
 MAX_LOOP = 20
 MAX_EXPANDED = 10_000
 
-# Two exact-location guards echo the base64 URL in native run output. Reserve
-# half the host's 65536-character JSON envelope for snapshots, escaped text,
-# framing and connection metadata; check the actual serialized request too.
-# ponytail: bounded single-file HTML only; larger apps need native resource
-# provenance rather than raising this cap or accepting truncated observations.
-MAX_ARTIFACT_BYTES = 8 * 1024
+MAX_ARTIFACT_BYTES = 64 * 1024
+# The artifact itself is read locally for digesting; the RPC dispatch is bound
+# separately by MAX_RUN_JSON_CHARS on the exact serialized run payload, so the
+# local bound matches the host's 65536-character JSON envelope.
 MAX_RUN_JSON_CHARS = 32768
 TRUNCATION_MARKERS = ("[truncated", "(truncated", "truncated by the MCP")
 
@@ -446,6 +444,85 @@ def register(ctx) -> None:
             _drop_tab(tab_id)
         return False, err
 
+    # ------------------------------------------------------------ lifecycle
+    def _cleanup_session(trigger: str, session_id) -> None:
+        """Session-boundary cleanup: close every tab owned by the ending
+        session through the same native state surface the tools use, then
+        drop ALL of that session's plugin state (tabs, ownership, connection
+        tokens, scenario records). Best effort and honest: each close outcome
+        is recorded in the log receipt (closed / already-closed / error /
+        unknown); uncertain outcomes are NEVER retried or replayed (the _mcp
+        dispatch is timeout-bounded and replay_on_failure=False); local
+        state is cleared regardless so nothing is retained; tabs owned by
+        other sessions are never touched."""
+        sid = str(session_id or "")
+        if not sid:
+            return
+        owned = sorted(
+            tab_id for tab_id, tab in _tabs().items()
+            if isinstance(tab, dict) and tab.get("session_id") == sid)
+        receipt = []
+        for tab_id in owned:
+            try:
+                env = _mcp("state", {"op": "close-tab", "target_id": tab_id})
+            except Exception as exc:
+                # Ambiguous transport outcome: unknown, never retried.
+                receipt.append({"tab_id": tab_id, "outcome": "unknown",
+                                "error": str(exc)})
+                continue
+            if env.get("ok"):
+                receipt.append({"tab_id": tab_id, "outcome": "closed"})
+            elif "tab not found" in str(env.get("error", "")):
+                # Determinate: the host no longer holds the tab.
+                receipt.append({"tab_id": tab_id, "outcome": "already-closed"})
+            else:
+                receipt.append({"tab_id": tab_id, "outcome": "error",
+                                "error": str(env.get("error", ""))})
+        tabs = _tabs()
+        for tab_id in owned:
+            tabs.pop(tab_id, None)
+        state.set("tabs", tabs)
+        index = state.get("scenarios", {})
+        index = index if isinstance(index, dict) else {}
+        owned_scenarios = sorted(k for k, v in index.items() if v == sid)
+        for key in owned_scenarios:
+            # PluginState has no delete; None reads as absent everywhere.
+            state.set(f"scenario:{key}", None)
+            index.pop(key, None)
+        state.set("scenarios", index)
+        for entry in receipt:
+            if entry["outcome"] in ("error", "unknown"):
+                logger.warning(
+                    "browser-bladebro session cleanup (%s, session=%s): "
+                    "close-tab %s outcome=%s error=%r (recorded honestly; "
+                    "not retried)", trigger, sid, entry["tab_id"],
+                    entry["outcome"], entry.get("error"))
+        logger.info(
+            "browser-bladebro session cleanup (%s, session=%s): tabs=%s, "
+            "scenarios_cleared=%d", trigger, sid,
+            {e["tab_id"]: e["outcome"] for e in receipt} or "none owned",
+            len(owned_scenarios))
+
+    def _lifecycle_hook(trigger: str):
+        """on_session_finalize/on_session_reset(session_id, old_session_id,
+        reason) fire at true session boundaries (CLI shutdown, /new, gateway
+        shutdown, session close) as the unbounded last-chance flush.
+        on_session_end is DELIBERATELY NOT registered: it fires at the end of
+        every turn, so acting on it would reap tabs between turns and break
+        multi-turn browsing and scenario continuity. Kwargs may grow; **_
+        tolerates that. Never raises (best effort) so the boundary itself is
+        never disturbed."""
+        def hook(session_id="", old_session_id="", **_):
+            try:
+                _cleanup_session(trigger, old_session_id or session_id)
+            except Exception as exc:
+                logger.warning("browser-bladebro %s cleanup failed: %s",
+                               trigger, exc)
+        return hook
+
+    for _hook_name in ("on_session_finalize", "on_session_reset"):
+        ctx.register_hook(_hook_name, _lifecycle_hook(_hook_name))
+
     def _task_cwd(task_id) -> str | None:
         """Recorded cwd for THIS task only; no ambient fallback."""
         if not task_id:
@@ -716,6 +793,11 @@ def register(ctx) -> None:
             "cwd": cwd,
         }
         state.set(f"scenario:{sid}", record)
+        index = state.get("scenarios", {})
+        if not isinstance(index, dict):
+            index = {}
+        index[sid] = kw.get("session_id")
+        state.set("scenarios", index)
         return _ok(scenario_id=sid, mode=record["mode"], source_hashes=hashes,
                    source_revision=source_revision, status="declared")
 
@@ -927,14 +1009,19 @@ def register(ctx) -> None:
             record["status"] = "stale"
             state.set(f"scenario:{sid}", record)
             return _err("source or artifact drifted during observation; evidence refused")
-        # Backend role/label snapshot while the owned tab is still open:
-        # see(mode=model) lists interactive elements with roles/labels;
-        # see(logs=console) surfaces page errors. Supplementary observations
+        # Backend role/label snapshot: the qualified run's final see already
+        # carries the accessibility snapshot (interactive elements with
+        # roles/labels), so the supplementary call is skipped when the run
+        # output contains those observations. see(logs=console) is never in
+        # the run framing and is always sampled. Supplementary observations
         # only — never evidence-bearing, never flip the verdict.
         supplementary = {}
         if observed_success:
-            for name, obs in (("role_label_snapshot",
-                               {"mode": "model", "budget": 1200}),
+            observations_present = any(
+                k in out_text for k in ("button", "link", "textbox", "checkbox"))
+            samples = () if observations_present else (
+                ("role_label_snapshot", {"mode": "model", "budget": 1200}),)
+            for name, obs in (*samples,
                               ("console_errors", {"logs": "console"})):
                 seen = _mcp("see", obs)
                 supplementary[name] = (str(seen.get("result", ""))
@@ -1141,7 +1228,8 @@ def register(ctx) -> None:
             emoji="🌐",
         )
     logger.info(
-        "browser-bladebro: registered %d native MCP-backed tools (server=%s); "
-        "certified evidence = direct-artifact protocol on the qualified run shape",
+        "browser-bladebro: registered %d native MCP-backed tools + 2 session "
+        "lifecycle cleanup hooks (server=%s); certified evidence = "
+        "direct-artifact protocol on the qualified run shape",
         len(tools), server,
     )

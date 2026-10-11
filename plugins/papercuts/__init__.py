@@ -22,6 +22,17 @@ CATEGORIES = ("tooling", "infra", "docs", "workflow", "model", "other")
 SEVERITIES = ("low", "medium", "high", "blocker")
 _MODES = ("report", "list", "ack", "resolve", "stats")
 AUTO_DAILY_CAP = 20
+PASSTHROUGH_TIMEOUT_SECONDS = 30
+
+
+def _passthrough(argv):
+    try:
+        return subprocess.run(argv, timeout=PASSTHROUGH_TIMEOUT_SECONDS).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError as exc:
+        print(f"papercuts: {exc}", file=sys.stderr)
+        return 127
 
 
 def _parse_time_lost(value) -> float:
@@ -343,7 +354,7 @@ def register(ctx) -> None:
         help="File or triage tool grievances (papercuts).",
         setup_fn=lambda sub: sub.add_argument("rest", nargs="*",
                                               help="native papercuts args, e.g. report --category tooling --severity low --summary x"),
-        handler_fn=lambda args: subprocess.run([binary, *(args.rest or ["list"])]).returncode,
+        handler_fn=lambda args: _passthrough([binary, *(args.rest or ["list"])]),
     )
     logger.info("papercuts: bridge registered -> %s (auto_capture=%s, daily cap %d)",
                 binary, auto_capture, AUTO_DAILY_CAP)

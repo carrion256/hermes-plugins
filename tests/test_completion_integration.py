@@ -385,7 +385,9 @@ def test_message_digest_fallback_identity(project, load_plugin, agent, reviewer)
     assert record.get("review") in ({}, None), "different user message invalidates the review"
 
 
-def test_pending_review_holds_turn(project, load_plugin, agent, reviewer):
+def test_pending_review_releases_turn(project, load_plugin, agent, reviewer):
+    """A running review releases the turn (no hold directive, no pending
+    label); the binding survives and the completion verdict still gates."""
     harness = load_plugin("continuation")
     _verify_ok(project)
     _capture(agent)
@@ -393,17 +395,20 @@ def test_pending_review_holds_turn(project, load_plugin, agent, reviewer):
     _hook(harness, agent, changed_paths=[str(project / "widget.py")])
     delegation_id = _review_id(harness)
     assert _wait_state(delegation_id, ("running",))["state"] == "running"
-    results = _hook(harness, agent, changed_paths=[str(project / "widget.py")])
-    assert results and "running" in results[0]["message"]
+    assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == [], \
+        "a running review must release the turn, not hold it"
     record = harness.context.state.get(f"session:{SESSION}") or {}
     assert record["review"]["identity"] == record["task"]["identity"], \
-        "internal pre_verify rounds re-verify identity; the capture never changes"
+        "the released review stays bound to the exact reviewed identity"
+    labeled = harness.hook("transform_llm_output", response_text="All done.",
+                           session_id=SESSION, model="m")
+    assert labeled == [], "release is silent; the verdict arrives via the review lane"
     reviewer["gate"].set()
 
 
 def test_pending_reviewer_survives_run_boundary(project, load_plugin, agent, reviewer):
     """on_session_end carries no handler: a pending reviewer stays bound and
-    the next turn picks the delegation up (session reset bounds NEW identity)."""
+    the next genuine turn picks the delegation up."""
     harness = load_plugin("continuation")
     _verify_ok(project)
     _capture(agent)
@@ -411,11 +416,24 @@ def test_pending_reviewer_survives_run_boundary(project, load_plugin, agent, rev
     _hook(harness, agent, changed_paths=[str(project / "widget.py")])
     delegation_id = _review_id(harness)
     assert delegation_id
+    assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == []
     harness.hook("on_session_end", session_id=SESSION, completed=True)
     assert _review_id(harness) == delegation_id, "pending binding must survive run boundary"
-    results = _hook(harness, agent, changed_paths=[str(project / "widget.py")])
-    assert results and "running" in results[0]["message"]
+    # Reviewer finishes; the completed verdict is judged against the fresh
+    # current state on the next internal round (evidence-freshness preserved).
+    reviewer["summary"] = _verdict_text("clean")
     reviewer["gate"].set()
+    _wait_state(delegation_id, ("completed",))
+    assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == []
+    labeled = harness.hook("transform_llm_output", response_text="All done.",
+                           session_id=SESSION, model="m")
+    assert labeled == [], "completed clean review releases with no unverified label"
+    # The next genuine user turn is a new identity: nothing carries over.
+    _capture(agent, task_id="task-2", turn_id="turn-2")
+    record = harness.context.state.get(f"session:{SESSION}") or {}
+    assert record.get("review") in ({}, None), \
+        "a genuine new turn starts its own review lifecycle"
+
 
 
 def test_findings_carried_verbatim_and_rebound(project, load_plugin, agent, reviewer):
@@ -997,35 +1015,59 @@ def test_reviewer_clean_without_coverage_assessment_is_unverified(
     assert labeled and _NOTE in labeled[0]
 
 
-def test_completed_todo_requires_coverage_of_its_outcome(
-        project, load_plugin, reviewer):
-    """Native todo outcomes are reviewable REQUIRED outcomes: a completed
-    todo without evidence cannot be laundered clean by a reviewer assertion —
-    the evidence gate fires BEFORE the reviewer dispatches."""
+def test_required_ids_derive_from_declarations_only(project, load_plugin, reviewer):
+    """An undeclared completed todo is not a required id: no declare/bind
+    ceremony is imposed; its native content still reaches the reviewer.
+    Declared criteria DO gate on evidence before any dispatch."""
     harness = load_plugin("continuation")
     agent = FakeAgent(todos=[{"id": "9", "content": "done thing",
                               "status": "completed"}])
     _verify_ok(project)
     _capture(agent)
-    assert _declare(harness, cid="1")["success"] is True
-    evidence = _run_observed_check(harness, agent, project)
-    assert _tool(harness, action="bind", id="1",
-                 evidence_id=evidence["id"])["success"] is True
+    assert reviewer["built"] == {}
+    # Undeclared todo: review dispatches with no ceremony, and the bare
+    # clean verdict releases (todo 9 is NOT a required id).
+    reviewer["gate"].clear()  # hold the runner so the async rail is deterministic
+    first = _hook(harness, agent, changed_paths=[str(project / "widget.py")])
+    assert first and "review dispatched" in first[0]["message"]
+    delegation_id = _review_id(harness)
+    assert delegation_id
+    # While it runs, the gate releases the turn — never a hold directive.
+    assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == []
+    reviewer["gate"].set()
+    _wait_state(delegation_id, ("completed",))
+    assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == []
+    labeled = harness.hook("transform_llm_output", response_text="All done.",
+                           session_id=SESSION, model="m")
+    assert labeled == [], "undeclared todo content adds no unverified label"
+
+    # Declared criterion 9 without evidence: hard evidence gate, before dispatch.
+    assert _declare(harness, cid="9", identity="pytest tests/test_widget.py",
+                    paths=("widget.py",))["success"] is True
+    reviewer["built"].clear()
     results = _hook(harness, agent, changed_paths=[str(project / "widget.py")])
     assert results and "9" in results[0]["message"] \
-        and "criterion" in results[0]["message"].lower(), \
-        "todo 9 needs a declared criterion + evidence; reviewer cannot cover it"
+        and "no valid evidence binding" in results[0]["message"], \
+        "a declared criterion without evidence blocks completion"
     assert reviewer["built"] == {}, "evidence gate precedes review dispatch"
-    assert _declare(harness, cid="9")["success"] is True
-    evidence9 = _run_observed_check(harness, agent, project, call_id="tc-9")
-    assert _tool(harness, action="bind", id="9",
-                 evidence_id=evidence9["id"])["success"] is True
-    reviewer["summary"] = _coverage_verdict("clean", {"1": "covered"})  # todo 9 unassessed
+    evidence9 = _run_observed_check(harness, agent, project,
+                                    call_id="tc-9", identity="pytest tests/test_widget.py")
+    bound9 = _tool(harness, action="bind", id="9", evidence_id=evidence9["id"])
+    assert bound9["success"] is True, bound9
+    # Coverage contract stays strict for declared ids.
+    reviewer["summary"] = _verdict_text("clean")  # coverage field missing
     _hook(harness, agent, changed_paths=[str(project / "widget.py")])
     _wait_state(_review_id(harness), ("completed",))
     results = _hook(harness, agent, changed_paths=[str(project / "widget.py")])
-    assert results and "unverified" in results[0]["message"].lower()
-    reviewer["summary"] = _coverage_verdict("clean", {"1": "covered", "9": "covered"})
+    assert results and "unverified" in results[0]["message"].lower(), \
+        "clean without a coverage assessment for declared id 9 is unverified"
+    reviewer["summary"] = _coverage_verdict("clean", {"9": "covered"})
+    # Fresh genuine turn: review budget is per turn (test_genuine_turn_resets_round_budget);
+    # the undeclared probe legitimately consumed round 1, so the coverage flip runs round 1
+    # of the new turn rather than exceeding this turn's cap.
+    agent = FakeAgent(todos=[{"id": "9", "content": "done thing",
+                              "status": "completed"}])
+    _capture(agent, turn_id="turn-2")
     _hook(harness, agent, changed_paths=[str(project / "widget.py")])
     _wait_state(_review_id(harness), ("completed",))
     assert _hook(harness, agent, changed_paths=[str(project / "widget.py")]) == []
@@ -1985,10 +2027,13 @@ def _setup_wedge_scenario(project, load_plugin, agent, monkeypatch, settle=True)
                                        exit_code=0, output="1 passed")
         ev_b = record_terminal_result(command="pytest", cwd=project, session_id=s,
                                        exit_code=0, output="1 passed")
-    # 10ms per-callback cap, suppression window expired: the next dispatch
-    # of the same callback hits the STILL-RUNNING worker branch directly.
+    # 10ms per-callback cap: A's observer times out, its worker is abandoned
+    # mid-hash (still running). The callback-level suppression window (a fact
+    # about the hung CALLBACK, coarse by design) then suppresses B's dispatch:
+    # _HOOK_SKIPPED, no replay. Call-identity gates (#98382) separate concurrent
+    # CALLS, not hung callbacks; the back-off window is main's suppression seam.
     monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
-    monkeypatch.setattr(harness.manager, "_hook_timeout_suppression_seconds", 0.0)
+    monkeypatch.setattr(harness.manager, "_hook_timeout_suppression_seconds", 60.0)
 
     def post(tool_call_id):
         with bind_subagent_parent(agent):

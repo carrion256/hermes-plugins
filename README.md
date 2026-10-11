@@ -8,11 +8,11 @@ Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/car
 
 | Plugin | Implemented contract |
 |---|---|
-| `continuation` | Explicit requirement declarations and owned check observations bind native evidence IDs to source hashes, execution workspace and task. Independent review must assess coverage, not just notice a passing test. |
-| `prewalk` | Only `prewalk_ready` performs the model handoff, after a native todo plan and evidence-grounded execution brief. Scratch writes do not signal readiness. Optional replanning is bounded and off by default. |
+| `continuation` | Explicit requirement declarations and owned check observations bind native evidence IDs to source hashes, execution workspace and task. Independent review runs asynchronously and releases the turn while pending; its binding and verdict still gate the next completion. Reviewer coverage applies to declared criteria, not undeclared todo bookkeeping. |
+| `prewalk` | Only `prewalk_ready` performs the model handoff, after a native todo plan and evidence-grounded execution brief. Core located context is required; falsification/replan/acceptance lists are optional. Scratch writes do not signal readiness. Optional replanning is bounded and off by default. |
 | `covey-tasks` | Native durable worklists, fenced claims, compact checkpoint/resume handoffs and native discovery diagnostics. Optional linked-worktree ownership guards prevent cooperative workers sharing one workspace. |
 | `rules` | Scoped rule delivery plus `rules_explain`: applicability, provenance, precedence, explicit conflicts, omitted entries and check references. Guidance is never executable authorization. |
-| `browser-bladebro` | Native MCP browsing and bounded, approval-aware runs. Local self-contained HTML scenarios can bind immutable artifact bytes and observed interactions to native verification evidence. Ordinary HTTP browsing is not build attestation. |
+| `browser-bladebro` | Native MCP browsing and bounded, approval-aware runs. Local self-contained HTML scenarios can bind immutable artifact bytes and observed interactions to native verification evidence. Ordinary HTTP browsing is not build attestation. Tabs and scenario state are session-owned: `on_session_finalize`/`on_session_reset` close the session's tabs and clear its state. Per-turn `on_session_end` is deliberately not used, so tabs survive across turns within a session. |
 | `loop-guard` | Bounded structured-error, failed-verification and short-cycle recovery. Delivered interventions, exact next-call hypotheses and matching recovery are distinguished from suppression or exhausted budgets. |
 | `auto-review-classifier` | Advisory screening of operation effects, resolved targets and missing context, with redacted egress and operation-specific native approvals. Selected risky approvals revalidate scope after consent. |
 | `tool-fff` | **Retired.** Use native `search_files`; no override consent, extra search registration or claimed acceleration. |
@@ -22,12 +22,17 @@ Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/car
 | `keyword-steering` | Explicit configured modes reference existing skills/rules, expire with the turn, expose status and withhold conflicting guidance. No semantic classifier or implied effort switch. |
 | `papercuts` | Typed, redacted reports and native recurrence/triage. Opt-in authoritative tool-failure capture has a cross-process quota; the native binary continues owning the store. |
 
+### Throughput posture
+
+These plugins optimize for completed work per unit of agent time. Clean paths add no prompts or ceremony; classifiers and telemetry stay off launch-critical paths; rule guidance rides successful tool results instead of forcing retries; asynchronous review releases the turn while preserving the binding; optional planning fields do not block a valid handoff; external adapters cache or reuse repeated identity/observation work. Hard stops remain only for concrete evidence, authorization, credential, or mutation-safety risks.
+
 ## Native prerequisites
 
 The matching host source supplies these shared contracts; there is no substitute scheduler or evidence database in this repository:
 
 - `agent.verification_evidence`: explicit row lookup, external evidence, source/artifact metadata, terminal evidence IDs, disabled-ledger refusal and a durable edit watermark. A later check cannot revive pre-edit evidence.
 - `hermes_cli.plugins` / `plugins_dispatch`: all callbacks run; block wins over approval; delivery/suppression receipts use unique directive identities. `post_tool_call_settled` fires exactly once after every `post_tool_call` dispatch, including when bounded observers are suppressed or time out, so call-observation reservations settle without being wedged forever. Modified operations are presented at approval. A selected internal `revalidate(final_args)` must return exactly `True` after consent or the operation is vetoed.
+- `PluginContext.cancel_model_call(reason, *, hard=False, agent=None)`: a plugin-facing mid-stream cancellation seam. It requests interruption of the in-flight model/tool loop; the host stream monitor observes the request within its ~0.3s cadence and aborts in-flight provider streams (marks the request cancelled, closes request-local sockets, joins the streaming worker; the aborted call is not silently retried). Returns an honest receipt (`{"cancelled": bool, "reason": ...}`), never raises, and reports `cancelled: False` on surfaces with no resolvable agent (e.g. gateway). It is a cancellation request, not a sandbox: completed work is not stopped and completion is not immediate.
 - Native final-output transforms compose rather than overwrite each other's warnings; the original streamed text remains available for reconciliation.
 - `tools.clarify_tool`: each question reports `answered`, `skipped` or `timed_out` with its `qid`.
 - `PluginContext.call_mcp(..., replay_on_failure=False)`: trusted out-of-band no-replay policy and a host-minted token identifying the exact MCP connection. Remote result fields are not connection authority.
@@ -229,7 +234,7 @@ Validate every remaining plugin manifest in a disposable Hermes home with the pa
 
 - `dsh-jump` GUI navigation and separate settings panels are not ported; use native configuration surfaces where available.
 - Child prewalk is part of `prewalk`, not a second plugin.
-- True mid-stream model cancellation still requires a supported host cancellation seam.
+- Mid-stream model cancellation is implemented (`PluginContext.cancel_model_call`); surfaces without a resolvable agent (gateway) return an honest refusal, and browser tab cleanup still cannot run after an unclean process kill.
 - DSH browser/search/Docling backends are not interchangeable with OMP's native implementations.
 
 ## Attribution

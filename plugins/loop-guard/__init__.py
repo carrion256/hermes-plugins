@@ -162,9 +162,7 @@ def register(ctx) -> None:
     def blocker(reason, events):
         approaches = [{"tool": e["tool"], "argument_digest": e["call"][:16]} for e in events[-4:]]
         return {"invariant": redact_for_egress(reason), "approaches": approaches,
-                "next_step": "Choose a check that distinguishes the remaining explanations; "
-                             "use loop_recovery hypothesis to name the assumption, exact next check, "
-                             "and expected observation. A new hypothesis is not evidence of recovery."}
+                "next_step": "loop_recovery hypothesis: name the assumption and one exact check."}
 
     def before(tool_name="", args=None, session_id="", tool_call_id="", **_kw):
         agent = owner(session_id)
@@ -301,8 +299,8 @@ def register(ctx) -> None:
             s = state(agent)
             if s["answers"] >= answer_limit and not s["answer_reminded"]:
                 s["answer_reminded"] = True
-                return {"context": "LOOP GUARD: prior answers repeated without new tool evidence. "
-                        "Address the current request with a discriminating check or an explicit blocker."}
+                return {"context": "LOOP GUARD: answers repeated without new evidence. "
+                        "Run a discriminating check or state the blocker."}
         return None
 
     def pre_verify(session_id="", **_kw):

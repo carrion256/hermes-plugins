@@ -85,7 +85,7 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(request, timeout=10) as reply:
+            with urllib.request.urlopen(request, timeout=2.5) as reply:
                 verdict = json.loads(reply.read(16385))
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 503) and attempt == 0:

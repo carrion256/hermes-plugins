@@ -215,7 +215,7 @@ def test_capture_oversized_artifact_refused_before_dispatch(browser):
     ctx, calls, router, browser_mp = browser
     root = pathlib.Path(ctx.home).parent
     root.joinpath("fixture.html").write_text(
-        "<!doctype html><p>" + "x" * 9000 + "</p>")
+        "<!doctype html><p>" + "x" * 70_000 + "</p>")
     declared = _declare(ctx)
     assert declared["success"]
     calls.clear()
@@ -223,6 +223,25 @@ def test_capture_oversized_artifact_refused_before_dispatch(browser):
                               session_id=SESSION, task_id=TASK))
     assert out["success"] is False and "byte bound" in out["error"]
     assert calls == []  # bounded refusal precedes any native dispatch
+
+
+def test_capture_artifact_above_old_cap_accepted(browser, monkeypatch):
+    # The 64 KiB local bound replaced the old 8 KiB cap: a 6 KiB payload
+    # (over the old 8 KiB byte-to-base64 crossover, inside both the local
+    # bound and the serialized-run guard) is certified normally.
+    ctx, calls, router, browser_mp = browser
+    root = pathlib.Path(ctx.home).parent
+    root.joinpath("fixture.html").write_text(
+        "<!doctype html><p>" + "x" * 6144 + "</p>")
+    _approve(browser[3])
+    assert _declare(ctx)["success"]
+    router["run"] = lambda a: {"ok": True,
+                               "result": qualified_run_output(
+                                   "data:text/html;base64,TESTURL")}
+    router["state"] = lambda a: {"ok": True, "result": ""}
+    out = _capture(ctx)
+    assert out["success"] and out["passed"] is True
+
 
 # ------------------------------------------------------------- capture tests
 
@@ -256,6 +275,22 @@ def test_capture_passes_with_native_ledger_round_trip(browser):
     assert row["source_revision"] == declared["source_revision"]
     assert row["artifact_digest"] == out["artifact_digest"]
 
+
+
+def test_supplementary_role_snapshot_skipped_when_run_carries_it(browser):
+    # The qualified run framing already contains the see(model) accessibility
+    # snapshot; the plugin must not re-issue the role/label see call.
+    ctx, calls, router, browser_mp = browser
+    _approve(browser[3])
+    _declare(ctx)
+    router["run"] = lambda a: {"ok": True,
+                               "result": qualified_run_output("data:u")}
+    router["state"] = lambda a: {"ok": True, "result": ""}
+    out = _capture(ctx)
+    assert out["success"] and out["passed"] is True
+    sees = [c for c in calls if c[0] == "see"]
+    assert len(sees) == 1  # console_errors only
+    assert sees[0][1] == {"logs": "console"}
 
 def test_capture_transported_digest_matches_csp_bytes(browser):
     ctx, calls, router, browser_mp = browser
@@ -537,9 +572,9 @@ def test_capture_run_carries_final_target_guard(browser, monkeypatch):
 
 
 def test_capture_oversized_run_payload_refused_before_dispatch(browser, monkeypatch):
-    # The 32 KiB serialized-run guard is defense-in-depth above the 8 KiB
-    # artifact cap, so its own bound is exercised by lowering the constant:
-    # refusal must precede approval and any native dispatch.
+    # The 32 KiB serialized-run guard is defense-in-depth: it binds the exact
+    # RPC dispatch even when the local artifact bound allows the file itself,
+    # so its own bound is exercised by lowering the constant:
     ctx, calls, router, browser_mp = browser
     _approve(monkeypatch)
     _declare(ctx)
@@ -702,3 +737,190 @@ def test_tab_id_unparseable_refuses_ownership(browser):
                               session_id=SESSION, task_id=TASK))
     assert out["success"] is False and "tab id" in out["error"]
     assert calls[0][2]["replay_on_failure"] is False
+
+
+# ------------------------------------------------------- lifecycle cleanup
+
+def _open_state_router(tab=TAB, token="tok-1"):
+    def state_handler(a):
+        if a.get("op") == "open-tab":
+            return {"ok": True, "connection_token": token,
+                    "result": f"✓ opened + switched to tab {tab}\n"}
+        return {"ok": True, "connection_token": token, "result": ""}
+    return state_handler
+
+
+def _open(ctx, session=SESSION, tab=TAB):
+    return json.loads(ctx.tool("browser_open", {"url": "http://x"},
+                               session_id=session, task_id=TASK))
+
+
+CLOSED_TAB = ("state", {"op": "close-tab", "target_id": TAB},
+              {"replay_on_failure": False})
+
+
+def test_lifecycle_hooks_registered(browser):
+    ctx, _, _, _ = browser
+    from hermes_cli.plugins import VALID_HOOKS
+    for name in ("on_session_finalize", "on_session_reset"):
+        assert name in VALID_HOOKS
+        ours = [cb for cb in ctx.manager.iter_hook_callbacks(name)
+                if cb.__module__ == ctx.module.__name__]
+        assert ours, f"{name} not registered by browser-bladebro"
+    # on_session_end fires per TURN: registering cleanup there would reap
+    # tabs between turns; the plugin must stay silent on it.
+    ours = [cb for cb in ctx.manager.iter_hook_callbacks("on_session_end")
+            if cb.__module__ == ctx.module.__name__]
+    assert ours == []
+
+
+def test_session_end_survives_turn_boundary(browser):
+    # on_session_end fires at the end of EVERY turn (turn_finalizer/cli);
+    # the plugin must not reap tabs or state there — multi-turn browsing
+    # and scenario continuity depend on the tab surviving per-turn fires.
+    ctx, calls, router, _ = browser
+    router["state"] = _open_state_router()
+    assert _open(ctx)["success"]
+    calls.clear()
+    ctx.hook("on_session_end", session_id=SESSION, task_id=TASK, turn_id=1,
+             completed=True, failed=False, interrupted=False,
+             turn_exit_reason="model_stop")
+    assert calls == []  # zero native dispatch on a per-turn boundary
+    # tab binding intact and fully operable after the turn
+    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
+                              session_id=SESSION, task_id=TASK))
+    assert out["success"] and out["closed"] is True
+
+
+def test_finalize_reaps_tab_after_turn_survival(browser):
+    # The same tab that survives per-turn on_session_end fires is closed at
+    # the true session boundary.
+    ctx, calls, router, _ = browser
+    router["state"] = _open_state_router()
+    assert _open(ctx)["success"]
+    ctx.hook("on_session_end", session_id=SESSION, task_id=TASK, turn_id=1,
+             completed=True, failed=False, interrupted=False,
+             turn_exit_reason="model_stop")
+    calls.clear()
+    ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
+    assert CLOSED_TAB in calls
+    calls.clear()
+    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
+                              session_id=SESSION, task_id=TASK))
+    assert out["success"] is False and "not owned" in out["error"]
+    assert calls == []
+
+
+def test_finalize_and_reset_close_owned_tabs(browser):
+    ctx, calls, router, _ = browser
+    router["state"] = _open_state_router()
+    assert _open(ctx)["success"]
+    calls.clear()
+    ctx.hook("on_session_finalize", session_id=SESSION, reason="end")
+    assert CLOSED_TAB in calls
+    # session state empty; a fresh open then a reset boundary closes again
+    assert _open(ctx)["success"]
+    calls.clear()
+    ctx.hook("on_session_reset", session_id=SESSION, reason="reset")
+    assert CLOSED_TAB in calls
+
+
+def test_finalize_clears_scenario_records_for_session(browser):
+    ctx, _, _, _ = browser
+    assert _declare(ctx)["success"]
+    again = _declare(ctx)
+    assert again["success"] is False and "already declared" in again["error"]
+    ctx.hook("on_session_finalize", session_id=SESSION, reason="end")
+    assert _declare(ctx)["success"]  # record tombstoned; id declarable again
+
+
+def test_cleanup_never_touches_foreign_session_tabs(browser):
+    ctx, calls, router, _ = browser
+    seq = {"n": 0}
+
+    def state_handler(a):
+        if a.get("op") == "open-tab":
+            seq["n"] += 1
+            tab = TAB if seq["n"] == 1 else OTHER_TAB
+            return {"ok": True, "connection_token": "tok-1",
+                    "result": f"✓ opened + switched to tab {tab}\n"}
+        return {"ok": True, "connection_token": "tok-1", "result": ""}
+    router["state"] = state_handler
+    assert _open(ctx, session=SESSION)["tab_id"] == TAB
+    assert _open(ctx, session="sess-2")["tab_id"] == OTHER_TAB
+    calls.clear()
+    ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
+    closed = [c[1]["target_id"] for c in calls
+              if c[1].get("op") == "close-tab"]
+    assert closed == [TAB]  # exactly the one owned tab
+    # foreign binding intact and operable by its owner
+    out = json.loads(ctx.tool("browser_close", {"tab_id": OTHER_TAB},
+                              session_id="sess-2", task_id=TASK))
+    assert out["success"] and out["closed"] is True
+
+
+def test_cleanup_records_error_without_retry_and_still_clears(browser, caplog):
+    ctx, calls, router, _ = browser
+
+    def state_handler(a):
+        if a.get("op") == "open-tab":
+            return {"ok": True, "connection_token": "tok-1",
+                    "result": f"✓ opened + switched to tab {TAB}\n"}
+        if a.get("op") == "close-tab":
+            return {"ok": False, "error": "host refused: tab pinned"}
+        return {"ok": True, "connection_token": "tok-1", "result": ""}
+    router["state"] = state_handler
+    assert _open(ctx)["success"]
+    calls.clear()
+    with caplog.at_level("WARNING"):
+        ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
+    close_ops = [c for c in calls if c[1].get("op") == "close-tab"]
+    assert len(close_ops) == 1  # one honest attempt, never retried or replayed
+    assert "outcome=error" in caplog.text and "tab pinned" in caplog.text
+    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
+                              session_id=SESSION, task_id=TASK))
+    assert out["success"] is False and "not owned" in out["error"]  # still cleared
+
+
+def test_cleanup_records_unknown_outcome_without_retry(browser, caplog):
+    ctx, calls, router, _ = browser
+
+    def state_handler(a):
+        if a.get("op") == "open-tab":
+            return {"ok": True, "connection_token": "tok-1",
+                    "result": f"✓ opened + switched to tab {TAB}\n"}
+        if a.get("op") == "close-tab":
+            raise RuntimeError("transport severed mid-call")
+        return {"ok": True, "connection_token": "tok-1", "result": ""}
+    router["state"] = state_handler
+    assert _open(ctx)["success"]
+    calls.clear()
+    with caplog.at_level("WARNING"):
+        ctx.hook("on_session_finalize", session_id=SESSION, reason="end")
+    close_ops = [c for c in calls if c[1].get("op") == "close-tab"]
+    assert len(close_ops) == 1  # unknown outcome recorded, never retried
+    assert "outcome=unknown" in caplog.text and "transport severed" in caplog.text
+    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
+                              session_id=SESSION, task_id=TASK))
+    assert out["success"] is False and "not owned" in out["error"]
+
+
+def test_fresh_session_starts_empty_after_cleanup(browser):
+    ctx, calls, router, _ = browser
+    router["state"] = _open_state_router()
+    assert _open(ctx)["success"]
+    assert _declare(ctx)["success"]
+    ctx.hook("on_session_reset", session_id=SESSION, reason="reset")
+    fresh = json.loads(ctx.tool(
+        "browser_open", {"url": "http://y"},
+        session_id="sess-2", task_id=TASK))
+    assert fresh["success"] and fresh["tab_id"] == TAB
+    fresh_scenario = json.loads(ctx.tool(
+        "browser_scenario",
+        {"action": "declare", "scenario_id": "s1", "sources": ["fixture.html"],
+         "entry_artifact": "fixture.html",
+         "initial_predicate": {"text": "State: pending"},
+         "final_predicate": {"text": "State: committed"},
+         "interaction": {"action": "click", "text": "Commit"}},
+        session_id="sess-2", task_id=TASK))
+    assert fresh_scenario["success"]  # stale id freed, new session owns it

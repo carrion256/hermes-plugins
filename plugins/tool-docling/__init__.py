@@ -144,19 +144,31 @@ def register(ctx) -> None:
     binary = ctx.get_config("binary", "docling")
     state = ctx.state
 
-    def _converter_identity() -> tuple[str | None, str | None]:
+    launcher_hash: dict = {}  # {"key": stat identity, "hash": sha256}; one entry, one binary
+
+    def _converter_identity(fresh: bool = False) -> tuple[str | None, str | None]:
         """Sample launcher sha256 and the full bounded package version report.
         The launcher hash alone does not identify installed dependencies; the reported
-        versions bind the actual package change (not every transitive dependency)."""
+        versions bind the actual package change (not every transitive dependency), so
+        the version probe always runs live. The launcher hash is cached by executable
+        stat identity (dev/ino/size/mtime_ns); ``fresh`` bypasses the cache for the
+        post-run CWE-367 recheck."""
         executable = shutil.which(binary) or (binary if binary and os.path.exists(binary) else None)
         if executable is None:
             return None, None
         try:
-            digest = hashlib.sha256()
-            with open(os.path.realpath(executable), "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    digest.update(chunk)
-            executable_hash = digest.hexdigest()
+            real = os.path.realpath(executable)
+            st = os.stat(real)
+            key = (real, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+            if not fresh and launcher_hash.get("key") == key:
+                executable_hash = launcher_hash["hash"]
+            else:
+                digest = hashlib.sha256()
+                with open(real, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        digest.update(chunk)
+                executable_hash = digest.hexdigest()
+                launcher_hash.update(key=key, hash=executable_hash)
         except OSError:
             return None, None
         version = None
@@ -235,9 +247,8 @@ def register(ctx) -> None:
         def _load_valid() -> tuple[str, dict, str, str] | None:
             """A cache entry is valid only when the marker matches the live-sampled
             identities (source hash, converter version AND converter executable
-            sha256), the pair files load cleanly (the marker itself is never
-            accepted as the converted document), and the source STILL hashes to
-            the marker's bytes (post-load recheck). Returns the ADOPTED marker
+            sha256) and the pair files load cleanly (the marker itself is never
+            accepted as the converted document). Returns the ADOPTED marker
             filenames so callers always reference files that exist."""
             try:
                 with open(marker, encoding="utf-8") as fh:
@@ -257,27 +268,15 @@ def register(ctx) -> None:
                     md_text = fh.read()
                 with open(os.path.join(cache_dir, json_name), encoding="utf-8") as fh:
                     document = json.load(fh)
-                if _source_hash(path) != src_hash:
-                    return None
             except (OSError, ValueError, KeyError):
                 return None
             return md_text, document, md_name, json_name
 
         cached = _load_valid()
         if cached is None:
-            # The conversion boundary: re-sample source and converter identities so
-            # the cache key and the post-run recheck describe exactly the bytes and
-            # binary the subprocess will see.
-            try:
-                src_hash = _source_hash(path)
-            except OSError as exc:
-                return _err(f"cannot read source: {exc}")
-            ident, version = _converter_identity()
-            if ident is None or version is None:
-                return _err("docling version probe failed; backend availability is unverified")
-            cache_key = _cache_key(src_hash, ident, version, options)
-            cache_dir = os.path.join(state.data_dir, "artifacts", cache_key)
-            marker = os.path.join(cache_dir, "artifact.json")
+            # The source hash and identity sampled above are the ones the cache key
+            # binds; the post-run recheck compares fresh samples against them, so no
+            # separate pre-run resample is needed.
             argv_base = [binary, "convert", path, "--to", "md", "--to", "json",
                          "--image-export-mode", "placeholder"]
             if page_range:
@@ -311,7 +310,7 @@ def register(ctx) -> None:
                 # the converter changed while conversion ran, the outputs describe an
                 # identity we cannot attest — refuse publication, touch nothing.
                 post_src_hash = _source_hash(path)
-                post_ident, post_version = _converter_identity()
+                post_ident, post_version = _converter_identity(fresh=True)
                 if post_src_hash != src_hash or post_ident != ident or post_version != version:
                     return _err("source or converter identity changed during conversion; "
                                 "refusing to publish artifacts under the sampled identity (retry)")

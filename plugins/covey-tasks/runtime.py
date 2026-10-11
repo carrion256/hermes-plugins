@@ -754,6 +754,7 @@ class CoveyRuntime:
         self._ws_lock = None  # machine-wide flock handle on the bound worktree
         self._cwd_backup: dict[str, object] = {}
         self._guarded_workspace: str | None = None  # guard stays open until next valid start
+        self._guidance_shown: set[str] = set()  # static guidance shown once per runtime
         self._validate_config(binary)
 
     # -- config / capabilities ---------------------------------------------
@@ -1408,7 +1409,7 @@ class CoveyRuntime:
                     {
                         "meta_task_id": meta_task_id,
                         "state": "planning",
-                        "guidance": CREATE_GUIDANCE,
+                        **self._first_guidance("create", CREATE_GUIDANCE),
                     },
                     action.request_id,
                 )
@@ -1463,15 +1464,21 @@ class CoveyRuntime:
             and live["lease_deadline"] > self._observed_now_ms()
         )
 
-    @staticmethod
-    def _started_data(claim: _Claim) -> dict:
+    def _first_guidance(self, kind: str, text: str) -> dict:
+        """Static guidance appears once per runtime; repeated results stay lean."""
+        if kind in self._guidance_shown:
+            return {}
+        self._guidance_shown.add(kind)
+        return {"guidance": text}
+
+    def _started_data(self, claim: _Claim) -> dict:
         data = {
             "subtask_id": claim.subtask_id,
             "claim_id": claim.claim_id,
             "fence_seq": claim.fence_seq,
             "lease_deadline_ms": claim.lease_deadline_ms,
             "state": "in_progress",
-            "guidance": START_GUIDANCE,
+            **self._first_guidance("start", START_GUIDANCE),
         }
         if claim.workspace:
             data["workspace"] = claim.workspace
@@ -1699,7 +1706,7 @@ class CoveyRuntime:
             claim.uncertain = True
             return self._fail(
                 "outcome_unknown",
-                f"{message} (the claim may exist; reconcile before continuing)",
+                f"{message} (the claim may exist; reconcile with show)",
                 action.request_id,
                 data=data,
             )

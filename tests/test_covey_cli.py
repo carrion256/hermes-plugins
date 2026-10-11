@@ -183,6 +183,9 @@ def test_cli_covey_task_with_native_verification_and_resume(tmp_path, covey_bin)
             "rejected_approaches": ["Weakening the test"], "falsification_checks": ["python3 -m pytest -q"],
             "replan_triggers": ["The focused test fails"], "acceptance_ids": ["work"]}],
          lambda results: any(r.get("handed_off") is True for r in results)),
+        # The native stale-overwrite guard: establish the full-content
+        # baseline for this task before rewriting the existing file.
+        (["read_file", {"path": "cliwidget.py"}], lambda results: True),
         (["write_file", {"path": "cliwidget.py", "content": WIDGET}], done_widget),
         (["terminal", {"command": "python3 -m pytest -q", "timeout": 60}], done_pytest),
         (["acceptance", {"action": "bind", "id": "work",

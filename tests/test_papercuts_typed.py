@@ -4,6 +4,8 @@ these tests assert the plugin feeds it typed argv and redacted text only.
 """
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -316,3 +318,24 @@ def test_invalid_reported_loss_preserves_native_store(papercuts, invalid):
     rejected = json.loads(ctx.tool("papercuts", {**args, "time_lost_seconds": invalid}))
     assert rejected["success"] is False
     assert path.read_bytes() == before
+
+
+def test_cli_passthrough_bounds_the_subprocess(papercuts, monkeypatch):
+    # The passthrough subprocess must carry a timeout and report timeout
+    # observably (exit 124) instead of hanging the CLI.
+    ctx, _ = papercuts
+    seen = {}
+    real_run = __import__("subprocess").run
+
+    def spy(argv, **kw):
+        seen.update(argv=argv, **kw)
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(ctx.module.subprocess, "run", spy)
+    assert ctx.module._passthrough(["true"]) == 0
+    assert seen["timeout"] == ctx.module.PASSTHROUGH_TIMEOUT_SECONDS
+
+    # A subprocess outliving the timeout yields exit code 124, not a hang.
+    monkeypatch.setattr(ctx.module, "PASSTHROUGH_TIMEOUT_SECONDS", 1)
+    assert ctx.module._passthrough(
+        [sys.executable, "-c", "import time; time.sleep(30)"]) == 124

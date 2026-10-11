@@ -153,11 +153,6 @@ def test_ready_requires_full_handoff_and_native_plan(load_plugin, live_agent, wo
         # genuine native plan present, handoff incomplete -> refused
         todo_tool(todos=[{"id": "1", "content": "plan", "status": "pending"}],
                   store=agent._todo_store)
-        incomplete = {k: v for k, v in _handoff().items() if k != "falsification_checks"}
-        refused = json.loads(h.tool("prewalk_ready", incomplete, session_id="s"))
-        assert refused["success"] is False
-        assert any("falsification_checks" in p for p in refused["problems"])
-        assert agent.model == "strong-planner"
         # evidence path validation happens without executing the prose
         refused = json.loads(h.tool(
             "prewalk_ready", _handoff(files=["widget.py", "does/not/exist.py"]),
@@ -173,13 +168,25 @@ def test_ready_requires_full_handoff_and_native_plan(load_plugin, live_agent, wo
         refused = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
         assert refused["success"] is False and "todo plan" in refused["error"]
         assert agent.model == "strong-planner"
+        # falsification_checks/replan_triggers/acceptance_ids are optional:
+        # omitting them defaults to empty and the handoff validates.
+        todo_tool(todos=[{"id": "1", "content": "plan", "status": "pending"}],
+                  store=agent._todo_store)
+        minimal = {k: v for k, v in _handoff().items()
+                   if k not in ("falsification_checks", "replan_triggers",
+                                "acceptance_ids")}
+        handed = json.loads(h.tool("prewalk_ready", minimal, session_id="s"))
+        assert handed["success"] is True
+        assert handed["handoff"]["falsification_checks"] == []
+        assert handed["handoff"]["acceptance_ids"] == []
+        assert agent.model == TARGET
 
 
 def test_ready_rejects_unconfined_and_evidence_less_handoff(load_plugin, live_agent,
                                                             workspace, tmp_path):
     """Located evidence must be real: directories and symlink-escaping
-    entries are rejected; symbols are mandatory; empty callers need an
-    explicit absence reason — never an invented reference."""
+    entries are rejected; symbols are mandatory; empty callers need no
+    reason (advisory only) — never an invented reference."""
     agent = live_agent
     from tools.todo_tool import TodoStore, todo_tool
     agent._todo_store = TodoStore()
@@ -207,15 +214,10 @@ def test_ready_rejects_unconfined_and_evidence_less_handoff(load_plugin, live_ag
         assert any("symbols" in p for p in refused["problems"])
         bad = _handoff()
         bad["callers"] = []
-        refused = json.loads(h.tool("prewalk_ready", bad, session_id="s"))
-        assert refused["success"] is False
-        assert any("callers_absence_reason" in p for p in refused["problems"])
-        # legitimate absence stated honestly -> validated handoff switches
-        bad["callers_absence_reason"] = (
-            "entry point invoked by the CLI dispatcher; no static callers")
         handed = json.loads(h.tool("prewalk_ready", bad, session_id="s"))
-        assert handed["success"] is True
-        assert handed["handoff"]["callers_absence_reason"].startswith("entry point")
+        assert handed["success"] is True, \
+            "empty callers are advisory: no callers_absence_reason required"
+        assert handed["handoff"]["callers"] == []
         assert agent.model == TARGET
 
 

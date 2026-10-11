@@ -53,12 +53,14 @@ import os
 import threading
 import urllib.error
 import urllib.request
+import time
 from contextvars import copy_context
 
 logger = logging.getLogger(__name__)
 
 SCHEMA = {"difficulty": ["simple", "complex"]}
 _MAX_ROWS = 50
+_BOOKKEEPING_INTERVAL = 30
 # Classifier workers are daemon threads capped by a bounded semaphore: no
 # unbounded thread/queue growth per child, and the child-launch hook path
 # NEVER blocks on classifier I/O. Overflow fails open (reason overloaded).
@@ -101,19 +103,36 @@ def register(ctx) -> None:
     # call happens on its own daemon worker thread, never under this lock.
     _lock = threading.Lock()
 
+    def _enforce_rows_locked() -> None:
+        if len(verdicts) > _MAX_ROWS:
+            for stale in sorted(verdicts)[: len(verdicts) - _MAX_ROWS]:
+                verdicts.pop(stale, None)
+
     def _persist() -> None:
         # Serialize + durable write INSIDE the lock: callers hold no lock,
         # so an older snapshot can never overwrite newer rows and nested rec
         # dicts cannot mutate while the state store serializes them.
         with _lock:
-            if len(verdicts) > _MAX_ROWS:
-                for stale in sorted(verdicts)[: len(verdicts) - _MAX_ROWS]:
-                    verdicts.pop(stale, None)
+            _enforce_rows_locked()
             try:
                 ctx.state.set("shadow", verdicts)
             except Exception:
                 logger.warning("subagent-effort: durable state write failed (quota?)",
                                exc_info=True)
+
+
+    _last_bookkeeping = [-_BOOKKEEPING_INTERVAL]  # first write always passes
+
+    def _persist_bookkeeping() -> None:
+        # Rate-limited write for pure bookkeeping (pending row, captured
+        # origin). Verdicts are written as a full-dict snapshot, so any
+        # later durable write carries these fields; a dropped throttle
+        # window loses nothing durable and never rewrites after unload.
+        now = time.monotonic()
+        if now - _last_bookkeeping[0] < _BOOKKEEPING_INTERVAL:
+            return
+        _last_bookkeeping[0] = now
+        _persist()
 
     # child_session_id -> observed usage, aggregated from post_api_request.
     usage_totals: dict[str, dict] = {}
@@ -284,11 +303,12 @@ def register(ctx) -> None:
                 return
             child_sessions.add(child_session_id)
             verdicts[child_session_id] = rec
+            _enforce_rows_locked()
             if config_error:
                 # config-invalid: plugin stays IDLE (no classifier call, no
                 # row mutation beyond the honest unavailable state)
                 _apply_verdict(rec, None, "not_configured")
-        _persist()
+        _persist_bookkeeping()
         if config_error:
             return
         _spawn_classifier(child_session_id, rec, goal)
@@ -337,7 +357,7 @@ def register(ctx) -> None:
             # suggestion stays as classified, clamped_effort stays unknown.
             rec["supported_efforts"] = supported or "unknown"
             rec["clamped_effort"] = clamped if clamped is not None else "unknown"
-        _persist()
+        _persist_bookkeeping()
         logger.info("subagent-effort: child %s origin recorded (reasoning=%s, clamped=%s)",
                     session_id, reasoning, clamped if clamped is not None else "unknown")
 

@@ -262,3 +262,55 @@ def test_nested_credential_syntax_abstains_before_http(load_plugin, monkeypatch,
     assert h.captured == []
     assert result[0]["risk_review"]["status"] == "unknown"
     assert result[0]["risk_review"]["screened"] is False
+
+
+def test_dead_classifier_cooldown_serves_fail_open_without_second_call(load_plugin, monkeypatch):
+    h = gate_setup(load_plugin, monkeypatch, verdict=None)
+    agent = local_agent()
+    fail = screen(h, agent, "task-cooldown", "terminal", {"command": "echo hi"})
+    assert fail[0]["risk_review"]["reason"] == "classifier_unavailable_or_invalid"
+    assert len(h.raws) == 1
+    again = screen(h, agent, "task-cooldown-2", "terminal", {"command": "echo again"})
+    assert again[0]["risk_review"]["reason"] == "classifier_unavailable_or_invalid"
+    assert len(h.raws) == 1  # second call served from cooldown, no second urlopen
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, verdict=None)
+    clock = FakeClock()
+    monkeypatch.setattr(h.module, "time", clock)
+    agent = local_agent()
+    workspace_for("task-expire", tmp_path)
+    workspace_for("task-expired", tmp_path)
+    target = tmp_path / "target.txt"
+    target.write_text("before")
+    assert screen(h, agent, "task-expire", "write_file",
+                  {"path": str(target), "content": "after"}) is not None
+    clock.now += h.module._COOLDOWN_SECONDS + 1
+    recovered = []
+    monkeypatch.setattr(h.module.urllib.request, "urlopen",
+                        lambda request, *_a, **_kw: recovered.append(1) or Reply({"risk": "safe"}))
+    assert screen(h, agent, "task-expired", "write_file",
+                  {"path": str(target), "content": "after"}) == []
+    assert recovered == [1]  # classifier retried exactly once after expiry
+
+
+def test_classify_timeout_is_bounded(load_plugin, monkeypatch):
+    h = gate_setup(load_plugin, monkeypatch)
+    seen = []
+
+    def spy(request, *args, timeout=None, **_kw):
+        seen.append(timeout)
+        return Reply({"risk": "safe"})
+
+    monkeypatch.setattr(h.module.urllib.request, "urlopen", spy)
+    screen(h, local_agent(), "task-timeout-bound", "terminal", {"command": "echo hi"})
+    assert seen and all(t is not None and t <= 3 for t in seen)

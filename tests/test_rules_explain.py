@@ -146,6 +146,10 @@ def test_budget_omissions_visible(load_plugin, tmp_path, monkeypatch):
     _write_rule(tmp_path / "global" / "zbb.md", "alwaysApply: true", body="B" * 3500)
     h = _harness(load_plugin, tmp_path, monkeypatch)
     _seed(h, tmp_path)
+    sections = h.manager.render_system_prompt_sections(_meta(tmp_path))
+    always = {item.id: item.content for item in sections}["rules.always-apply"]
+    assert "B" * 100 not in always  # over-budget body omitted from the prompt
+    assert "exceed the prompt budget" in always  # visible bounded omission note
     result = _explain(h, {"paths": ["a.py"], "tool_name": "read_file"})
     assert result["budget_omissions"]["always_apply"] == ["zbb"]
     # Applicable regardless of budget: omissions are transport, not applicability.
@@ -181,7 +185,7 @@ def test_invalid_paths_rejected(load_plugin, tmp_path, monkeypatch):
     assert _explain(h, {"paths": [""]})["success"] is False
 
 
-def test_rule_refs_in_pre_edit_guidance_envelope(load_plugin, tmp_path, monkeypatch):
+def test_rule_refs_in_executed_guidance(load_plugin, tmp_path, monkeypatch):
     _write_rule(tmp_path / "global" / "guard.md", "tools: [terminal]", body="GUARD")
     h = _harness(load_plugin, tmp_path, monkeypatch)
     _seed(h, tmp_path)
@@ -193,12 +197,33 @@ def test_rule_refs_in_pre_edit_guidance_envelope(load_plugin, tmp_path, monkeypa
                           args={"command": "ls"}, next_call=next_call,
                           session_id="sess-1", task_id="t1", tool_call_id="c1",
                           turn_id="turn-1", api_request_id="api-1")
-    payload = json.loads(result)
-    assert "GUARD" in payload["rule_guidance"]
-    refs = payload["rule_refs"]
+    assert result.startswith("EXECUTED")  # the real tool result is unharmed
+    assert "GUARD" in result
+    decoder = json.JSONDecoder()
+    payload, _ = decoder.raw_decode(result[result.index("[rule refs]") + len("[rule refs]"):].lstrip())
+    refs = payload
+    # (payload above carries no error envelope: guidance is delivered once
+    #  with the executed result, never as a fake tool error.)
     assert [r["source"] for r in refs] == [str(tmp_path / "global" / "guard.md")]
     assert [set(r) for r in refs] == [{"id", "source", "description"}]
     assert refs[0]["id"].startswith("rule:")
+
+
+def test_json_tool_result_remains_parseable_with_guidance(load_plugin, tmp_path, monkeypatch):
+    _write_rule(tmp_path / "global" / "guard.md", "tools: [write_file]", body="GUARD")
+    h = _harness(load_plugin, tmp_path, monkeypatch)
+    _seed(h, tmp_path)
+
+    def next_call(next_args=None):
+        return json.dumps({"success": True, "bytes_written": 3, "resolved_path": "a.py"})
+
+    result = h.middleware("tool_execution", tool_name="write_file",
+                          args={"path": "a.py"}, next_call=next_call,
+                          session_id="sess-json", task_id="t1", tool_call_id="c1",
+                          turn_id="turn-1", api_request_id="api-1")
+    payload = json.loads(result)
+    assert payload["success"] is True and payload["bytes_written"] == 3
+    assert "GUARD" in payload["rule_guidance"]
 
 
 def test_tool_scoped_rulebook_rule_matches_only_in_scope(load_plugin, tmp_path, monkeypatch):

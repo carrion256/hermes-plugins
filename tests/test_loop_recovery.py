@@ -79,6 +79,23 @@ def test_same_structured_failure_survives_argument_variation(recovery):
     assert report["delivered_interventions"] == 0
 
 
+def test_blocker_label_is_concise_and_actionable(recovery):
+    from hermes_cli.plugins import get_pre_tool_call_directive
+
+    h, agent = recovery
+    for attempt in range(3):
+        observe(h, agent, "terminal", {"command": f"fetch --attempt={attempt}"},
+                {"ok": False, "code": "backend_unavailable", "error": "connection refused"})
+    action, message = get_pre_tool_call_directive(
+        "terminal", {"command": "fetch --attempt=4"}, session_id=agent.session_id)
+    assert action == "block"
+    blocker = json.loads(message.split("LOOP GUARD: ", 1)[1])
+    assert blocker["invariant"] == "repeated tool error (backend_unavailable)"
+    assert blocker["next_step"] == \
+        "loop_recovery hypothesis: name the assumption and one exact check."
+    assert len(blocker["next_step"]) < 120  # concise, actionable text
+
+
 def test_short_cycles_detected_but_polling_and_progress_are_not(recovery):
     from hermes_cli.plugins import get_pre_tool_call_directive
 

@@ -11,7 +11,9 @@ provides_tools:
   - browser_scenario
   - browser_capture
   - browser_screenshot
-provides_hooks: []
+provides_hooks:
+  - on_session_finalize
+  - on_session_reset
 external_dependencies:
   - "operator-granted plugins.entries.browser-bladebro.mcp_allowlist containing the bladebro MCP server"
 config_schema:

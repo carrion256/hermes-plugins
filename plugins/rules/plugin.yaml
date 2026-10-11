@@ -23,7 +23,7 @@ config_schema:
   ttsr_enabled:
     type: bool
     default: true
-    description: "Rules scoped by tools/condition/globs deliver once per session as one-time tool_execution guidance (canonical tool-error result with full rule text + file path; executor and args untouched). Disable to silence this lane. Scopes combine with AND; unknown session identity delivers nothing; fired marks cover only actually delivered guidance."
+    description: "Rules scoped by tools/condition/globs deliver once per session as one-time tool_execution guidance appended to the real executed tool result (full rule text + file path; no synthetic error, executor and args untouched). Disable to silence this lane. Scopes combine with AND; unknown session identity delivers nothing; fired marks cover only actually delivered guidance."
   rules_explain_enabled:
     type: bool
     default: true
