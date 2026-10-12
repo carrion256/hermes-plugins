@@ -1,6 +1,6 @@
 name: prewalk
-version: 0.6.0
-description: "One-way model handoff driven ONLY by prewalk_ready: strong model plans, validated evidence-backed handoff switches to the cheap execution model via the native live switch or the host cross-provider switch seam (no implicit first-write switch; optional bounded operator-enabled replan back to the original model AND provider)."
+version: 0.7.0
+description: "One-way model handoff: strong model plans, validated evidence-backed handoff switches to the cheap execution model via the native live switch or the host cross-provider switch seam. Top-level sessions switch ONLY via prewalk_ready; delegated children on the task lane hand off automatically on their first completed tool call, mid-turn (never retried). No implicit first-write switch; optional bounded operator-enabled replan back to the original model AND provider."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -12,6 +12,7 @@ provides_tools:
   - prewalk_replan
 provides_hooks:
   - pre_llm_call
+  - post_tool_call
   - subagent_start
   - on_session_reset
   - on_session_finalize
@@ -31,7 +32,11 @@ config_schema:
   child_prewalk:
     type: bool
     default: true
-    description: "Armed planning lane is inherited by delegated child sessions (OMP bundled-task parity)."
+    description: "Armed planning lane is inherited by delegated child sessions (OMP bundled-task parity). Master switch; see child_prewalk_roles for which routing roles inherit it. Child-lane handoff is AUTOMATIC: no prewalk_ready and no todo gate; on the child's first completed post_tool_call the child switches to the target model once, mid-turn, before its next model call (a failed switch is logged at warning level and never retried — the child continues on its current model). Top-level sessions still require prewalk_ready validation to switch."
+  child_prewalk_roles:
+    type: list
+    default: ["task"]
+    description: "Routing roles whose delegated children inherit the planning lane (host reports the child's effective routing role in the subagent_start child_model_role field). A child that requested NO role (plain delegation) always arms, as in OMP; any other role (e.g. scout, reviewer, architect) arms nothing. Set to a list of role names to extend the lane."
   todo_gate:
     type: bool
     default: true

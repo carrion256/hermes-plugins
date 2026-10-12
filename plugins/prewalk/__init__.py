@@ -1,18 +1,25 @@
 """Task prewalk — port of dsh-prewalk: strong model plans, cheap model executes.
 
-One-way per logical session, driven ONLY by the explicit prewalk_ready tool:
-when prewalk arms, the planner sees the plan nudge in the SAME TURN — the
-prewalk_arm tool result carries it — and delegated children get it on their
-first pre_llm_call. The session switches to the target model when (and only
-when) prewalk_ready validates the complete handoff: located files with
-workspace paths that actually exist, symbols/callers, constraints,
-non-goals, chosen approach, rejected alternatives, falsification checks,
-replan triggers and acceptance IDs, on top of a genuine native todo plan
-(real agent._todo_store checked, not tool args). The first successful
-edit/write NEVER switches. The switch runs on the currently-bound agent,
-invoked from prewalk_ready itself. Same-endpoint targets (no
-target_provider, or one equal to the agent's provider) keep Hermes'
-NATIVE agent_runtime_helpers.switch_model path (provider/base_url/
+One-way per logical session, driven by prewalk_ready for the top-level
+lane and automatically for the child lane: when prewalk arms, the planner
+sees the plan nudge in the SAME TURN — the prewalk_arm tool result carries
+it — and delegated children get it on their first pre_llm_call. The session
+switches to the target model when (and only when) prewalk_ready validates
+the complete handoff: located files with workspace paths that actually
+exist, symbols/callers, constraints, non-goals, chosen approach, rejected
+alternatives, falsification checks, replan triggers and acceptance IDs,
+on top of a genuine native todo plan (real agent._todo_store checked, not
+tool args). The first successful edit/write NEVER switches. The child lane
+(delegated children armed via subagent_start) hands off AUTOMATICALLY on
+the child's first completed post_tool_call — mid-turn, after the child's
+first model response requested work and before the next model call —
+bypassing prewalk_ready and the todo gate; the lane is consumed exactly
+once per child, a failed switch is logged with the receipt reason at
+warning level and never retried, and the child simply continues on its
+current model. The switch runs on the
+currently-bound agent, invoked from prewalk_ready itself. Same-endpoint
+targets (no target_provider, or one equal to the agent's provider) keep
+Hermes' NATIVE agent_runtime_helpers.switch_model path (provider/base_url/
 api_mode/api_key kept as-is; switch_model rebuilds clients/caching/
 compressor/reasoning_config with rollback on failure). Cross-provider
 targets — target_provider naming a different provider, or a routed
@@ -187,6 +194,14 @@ def register(ctx) -> None:
     do_nudge = bool(ctx.get_config("plan_nudge", True))
     # OMP parity: delegated (bundled "task") agents prewalk by default.
     child_prewalk = bool(ctx.get_config("child_prewalk", True))
+    # OMP parity: the child lane only arms for children that requested one of these
+    # routing roles — or requested none at all (a plain delegation, which OMP prewalks
+    # too). Any other role (scout, architect, reviewer, ...) arms nothing.
+    raw_roles = ctx.get_config("child_prewalk_roles", ["task"])
+    child_prewalk_roles = (
+        {str(r).strip() for r in raw_roles if str(r).strip()}
+        if isinstance(raw_roles, (list, tuple)) else {"task"}
+    )
     todo_gate = bool(ctx.get_config("todo_gate", True))
     # Operator opt-in only: bounded one-shot replan back to the ORIGINAL
     # model AND provider. Default stays OFF; the handoff itself never oscillates.
@@ -201,6 +216,7 @@ def register(ctx) -> None:
     original_providers: dict[str, str] = {}  # session_id -> planner provider at handoff
     session_targets: dict[str, dict] = {}    # session_id -> target used at handoff (status)
     replan_used: set[str] = set()          # bounded: one replan per session, ever
+    child_lane: set[str] = set()      # sessions armed via the child (subagent_start) lane
 
     # Live agent object -> session id last seen for it. Compaction rotation
     # (agent/conversation_compression.py) reassigns agent.session_id on the
@@ -271,7 +287,7 @@ def register(ctx) -> None:
             return
         if origin in armed:
             armed[session_id] = armed.pop(origin)
-        for s in (handed_off, nudged, replan_used):
+        for s in (handed_off, nudged, replan_used, child_lane):
             if origin in s:
                 s.discard(origin)
                 s.add(session_id)
@@ -290,6 +306,7 @@ def register(ctx) -> None:
         original_providers.pop(session_id, None)
         session_targets.pop(session_id, None)
         replan_used.discard(session_id)
+        child_lane.discard(session_id)
 
     def prewalk_arm(session_id: str = "", **_kw) -> str:
         _migrate(session_id)
@@ -388,8 +405,14 @@ def register(ctx) -> None:
     # Child lane: every delegated child inherits the armed planning lane
     # (config child_prewalk). The child's goal rides its first user message;
     # the plan nudge fires once on that same first turn.
-    def on_subagent_start(child_session_id: str = "", **_kw):
+    def on_subagent_start(child_session_id: str = "", child_model_role=None, **_kw):
+        # OMP parity: only children that requested the "task" lane prewalk. The host
+        # records the child's effective routing role in child_model_role; None means no
+        # role was requested at all — a plain delegation, which OMP prewalks too. Any
+        # other role (scout, reviewer, ...) keeps its own lane and arms nothing.
+        role = str(child_model_role or "").strip() or None
         if (child_prewalk and child_session_id
+                and (role is None or role in child_prewalk_roles)
                 and child_session_id not in handed_off
                 and child_session_id not in armed):
             agent = _bound_agent()
@@ -405,8 +428,54 @@ def register(ctx) -> None:
                                child_session_id, problem)
                 return
             armed.setdefault(child_session_id, target)
+            child_lane.add(child_session_id)
 
     ctx.register_hook("subagent_start", on_subagent_start)
+
+    def child_handoff(session_id: str = "", **_kw):
+        """OMP parity: the child lane hands off AUTOMATICALLY on the child's first
+        completed post_tool_call — no prewalk_ready, no todo gate (the planning nudge
+        may still fire on that same first call). post_tool_call fires once per tool
+        result, so the switch lands mid-turn after the child's first model response
+        requested work — before the next model call. A child whose first response
+        ends the run never fires this hook; for it the handoff is moot.
+        One-shot: the lane is consumed before the switch is attempted, so a failed
+        switch is logged with the receipt reason and never retried; the child simply
+        continues on its current model. Top-level sessions are untouched — they arm
+        via prewalk_arm and switch only via a validated prewalk_ready."""
+        if (not session_id or session_id not in child_lane
+                or session_id not in armed or session_id in handed_off):
+            return None
+        _migrate(session_id)
+        target = armed.get(session_id)
+        # Consume the lane BEFORE attempting the switch: exactly once per child, ever.
+        armed.pop(session_id, None)
+        child_lane.discard(session_id)
+        if target is None:
+            return None
+        agent = _bound_agent()
+        dest = str(target["model"])
+        dest_provider = str(target.get("provider") or "")
+        current = str(getattr(agent, "model", "") or "") if agent is not None else ""
+        provider_ok = (not dest_provider
+                       or dest_provider == _agent_provider(agent))
+        if agent is not None and current == dest and provider_ok:
+            handed_off.add(session_id)
+            session_targets[session_id] = dict(target)
+            logger.info("prewalk: child %s already runs on target %s; no switch needed",
+                        session_id, dest)
+            return None
+        switched, detail = _switch(session_id, "prewalk child auto handoff",
+                                   model=dest, provider=dest_provider)
+        if switched:
+            session_targets[session_id] = dict(target)
+        else:
+            logger.warning("prewalk: child auto handoff failed for session %s: %s "
+                           "(child continues on its current model; never retried)",
+                           session_id, detail)
+        return None
+
+    ctx.register_hook("post_tool_call", child_handoff)
 
     if do_nudge:
         def nudge(session_id: str = "", **_kw):

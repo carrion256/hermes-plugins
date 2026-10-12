@@ -724,6 +724,147 @@ def test_child_lane_armed_when_cross_provider_resolvable(load_plugin, live_agent
         assert agent.model == "strong-planner"  # arming never switches
 
 
+# --- prewalk child lane: routing-role gating + automatic handoff -------------
+
+
+def _child_agent(session_id="c1", model="strong-planner", provider="openai"):
+    child = MagicMock()
+    child.session_id = session_id
+    child.model = model
+    child.provider = provider
+    child._persist_disabled = False
+    return child
+
+
+def test_scout_child_not_armed(load_plugin, live_agent, monkeypatch):
+    """OMP parity: only task-lane children prewalk. A child running under any
+    other routing role (scout, reviewer, ...) arms nothing, is never nudged,
+    and its post_tool_call switches nothing."""
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    _fake_switch_seam(monkeypatch)
+    child = _child_agent()
+    with bind_subagent_parent(child):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="sweep the repo", child_model_role="scout")
+        assert json.loads(h.tool("prewalk_status", {}, session_id="c1"))["state"] == "inactive"
+        assert h.hook("pre_llm_call", session_id="c1", user_message="sweep",
+                      is_first_turn=True) == []
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+        assert child.model == "strong-planner"
+
+
+def test_task_and_plain_children_armed(load_plugin, live_agent):
+    """role == "task" arms, no role at all (plain delegation) arms, and the
+    configured child_prewalk_roles list extends the lane."""
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    h.hook("subagent_start", parent_session_id="s", child_session_id="c-task",
+           child_goal="g", child_model_role="task")
+    h.hook("subagent_start", parent_session_id="s", child_session_id="c-plain",
+           child_goal="g")
+    assert json.loads(h.tool("prewalk_status", {}, session_id="c-task"))["state"] == "armed"
+    assert json.loads(h.tool("prewalk_status", {}, session_id="c-plain"))["state"] == "armed"
+
+    h2 = load_plugin("prewalk", settings={"target_model": TARGET,
+                                          "child_prewalk_roles": ["researcher"]})
+    h2.hook("subagent_start", parent_session_id="s", child_session_id="c2",
+            child_goal="g", child_model_role="researcher")
+    assert json.loads(h2.tool("prewalk_status", {}, session_id="c2"))["state"] == "armed"
+    h2.hook("subagent_start", parent_session_id="s", child_session_id="c3",
+            child_goal="g", child_model_role="task")
+    assert json.loads(h2.tool("prewalk_status", {}, session_id="c3"))["state"] == "inactive"
+
+
+def test_child_auto_handoff_once_with_executor_route(load_plugin, live_agent, monkeypatch):
+    """The child lane hands off automatically on the child's FIRST post_tool_call
+    — no prewalk_ready, no todo gate — using the routed (executor model,
+    provider), exactly once; a second post_tool_call is a no-op."""
+    agent = live_agent
+    route = _fake_executor_route(monkeypatch, model="exec-m", provider="zai")
+    calls = _fake_switch_seam(monkeypatch)
+    h = load_plugin("prewalk", settings={})  # target comes from the executor route
+    child = _child_agent()
+    with bind_subagent_parent(agent):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="carry the plan", child_model_role="task")
+        st = json.loads(h.tool("prewalk_status", {}, session_id="c1"))
+        assert st["state"] == "armed"
+        assert st["target"] == "exec-m" and st["target_provider"] == "zai"
+        assert st["target_source"] == "route"
+    with bind_subagent_parent(child):
+        # the planning nudge still fires on the child's first call
+        assert h.hook("pre_llm_call", session_id="c1", user_message="plan",
+                      is_first_turn=True)
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+        assert (child.model, child.provider) == ("exec-m", "zai")
+        # second tool result in the same turn: never again
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "other.py"}, result="ok", status="ok")
+    real = [c for c in calls if not c["dry_run"]]
+    assert len(real) == 1
+    assert (real[0]["model"], real[0]["provider"]) == (route["model"], route["provider"])
+    st = json.loads(h.tool("prewalk_status", {}, session_id="c1"))
+    assert st["state"] == "handed_off" and st["handoff"] is False
+
+
+def test_child_handoff_no_switch_when_already_on_target(load_plugin, live_agent, monkeypatch):
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    calls = _fake_switch_seam(monkeypatch)
+    child = _child_agent(model=TARGET)
+    with bind_subagent_parent(child):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="g", child_model_role="task")
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+    assert [c for c in calls if not c["dry_run"]] == []  # no switch attempted
+    assert child.model == TARGET
+    assert json.loads(h.tool("prewalk_status", {}, session_id="c1"))["state"] == "handed_off"
+
+
+def test_child_handoff_failure_warned_and_never_retried(load_plugin, live_agent,
+                                                        monkeypatch, caplog):
+    import logging
+    reason = "host declined: destination runtime unresolvable"
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    calls = _fake_switch_seam(monkeypatch, fail_reason=reason)
+    caplog.set_level(logging.WARNING)
+    child = _child_agent()
+    with bind_subagent_parent(child):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="g", child_model_role="task")
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+        assert child.model == "strong-planner"  # child continues on its current model
+        assert "child auto handoff failed for session c1" in caplog.text
+        assert reason in caplog.text  # the receipt reason, at warning level
+        # never retried: a second post_tool_call attempts nothing
+        h.hook("post_tool_call", session_id="c1", tool_name="read_file",
+               args={"path": "other.py"}, result="ok", status="ok")
+    assert [c for c in calls if not c["dry_run"]] and len(calls) == 1
+
+
+def test_top_level_lane_still_requires_prewalk_ready(load_plugin, live_agent, workspace,
+                                                     monkeypatch):
+    """post_tool_call belongs to the CHILD lane only: a top-level session armed
+    via prewalk_arm is untouched by the child's first-tool-call handoff — and
+    the validated prewalk_ready path still works unchanged."""
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        h.tool("prewalk_arm", {}, session_id="s")
+        h.hook("post_tool_call", session_id="s", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+        assert agent.model == "strong-planner"  # no auto switch for the parent
+        assert json.loads(h.tool("prewalk_status", {}, session_id="s"))["state"] == "armed"
+        assert [c for c in calls if not c["dry_run"]] == []
+        result = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert result["success"] is True and result["handed_off"] is True
+        assert agent.model == TARGET
+
+
 # --- subagent-effort (pure shadow) ---------------------------------------------
 
 
