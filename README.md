@@ -20,6 +20,7 @@ Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/car
 | `subagent-effort` | Shadow telemetry and separate paired experiments. Explicit effort choices remain unchanged; automatic routing is **NOT_QUALIFIED**. |
 | `auto-answer-classifier` | Evidence-supported ranking of all eligible conventional choices, scoped human-approved preferences, and per-question timeout provenance. Human answers and explicit skips remain authoritative. |
 | `keyword-steering` | Built-in OMP-compatible magic keywords (`ultrathink` raises the turn's reasoning effort to `ultra`, `orchestrate` and `workflow` steer delegation and staged workflows) plus explicit configured modes referencing existing skills/rules. All are deterministic, expire with the turn, expose status and withhold conflicting guidance. No semantic classifier or implied switch: only these explicit keywords move effort. |
+| `model-routing` | Named roles (`model` + optional `provider`, `fallback: inherit\|refuse`) route delegate `model_role`, the prewalk executor and review owners to configured models — explicit pins always win, implicit lookups never refuse. `route_status`/`route_apply` expose and materialize pins; cross-provider targets are supported. Nothing picks a model from classifier output, cost or quota. |
 | `papercuts` | Typed, redacted reports and native recurrence/triage. Opt-in authoritative tool-failure capture has a cross-process quota; the native binary continues owning the store. |
 
 ### Throughput posture
@@ -32,10 +33,11 @@ These plugins intentionally narrow OMP's behavior wherever implicit magic would 
 
 | Area | OMP behavior | Here | What to expect |
 |---|---|---|---|
-| Prewalk handoff | The planning model can hand off implicitly (for example on the first write). | Only `prewalk_ready` switches models, and only with a native todo plan plus explicit located files, symbols/callers, constraints, chosen approach and acceptance IDs. | No implicit model switches. A plan that cannot point at real context stays on the planning model; scratch writes never count as readiness. |
+| Prewalk handoff | The planning model can hand off implicitly (for example on the first write). | Only `prewalk_ready` switches models, and only with a native todo plan plus explicit located files, symbols/callers, constraints, chosen approach and acceptance IDs. The execution target may be an explicit `target_model`/`target_provider` or the routed `executor` role, on the same or another provider. | No implicit model switches. A plan that cannot point at real context stays on the planning model; scratch writes never count as readiness. A cross-provider target is validated at arm time and refuses to arm if unresolvable. |
 | Completion | A turn completes when the model stops. | `continuation` holds coding turns in `pre_verify` until the native todo ledger is clear, verification evidence is fresh, and an independent review closed on the exact reviewed change; declared acceptance criteria must bind real native evidence. | Deliberately more demanding, slower completion: "Completion unverified" until the evidence exists. A blocked or cancelled disposition is never completion. |
 | Magic keywords | Typed trigger phrases silently change behavior (modes, effort). | Restored OMP-compatible built-ins: `ultrathink` raises the current turn's reasoning effort to `ultra` through the host seam (guidance-only fallback on hosts without it), `orchestrate` and `workflow` steer delegation and staged-workflow discipline. Same deterministic rules as user modes: prose-only whole-word triggers, identifiers/quotes/code/paths never trigger, conflicts withhold both sides, `steering_status` shows what activated and what the effort request did. Built-in names are reserved; user modes configure their own triggers. | Typing `ultrathink` works out of the box and is visible, never silent: the reminder states the raise and `steering_status` records the provenance receipt. |
 | Subagent effort | Native effort controls can change reasoning effort per call. | `subagent-effort` is shadow-only: verdicts and recommendations are recorded, never applied. Automatic routing stays NOT_QUALIFIED until paired evidence qualifies it. | Effort changes only through explicit user intent (the `ultrathink` keyword or the model/provider configuration) via `PluginContext.set_turn_reasoning` — never from a classifier's recommendation. |
+| Model routing | OMP routes model selection by role, including metered/quota-aware routing. | `model-routing` supports role routing: configured `roles` (model + optional provider) resolve with precedence explicit > route > inherit, `fallback: inherit\|refuse` for explicit delegate `model_role` requests, and cross-provider targets validated at arm time. Metered/quota-based routing is **not ported**. | Role routing works via `model-routing`; nothing chooses a model from classifier output, cost or quota. |
 
 ## Native prerequisites
 
@@ -85,15 +87,54 @@ Terminal `check_identity` is the **exact raw executed command**, including its l
 
 ## Explicit planning handoff
 
-Set `plugins.entries.prewalk.settings.target_model` to an execution model served by the planner's **same provider/endpoint**. Empty means inactive. Call `prewalk_arm`, populate native todos, then call `prewalk_ready` with:
+Set `plugins.entries.prewalk.settings.target_model` to an execution model, optionally with `target_provider` when it is served by a provider other than the planner's. An explicit target beats the routed `executor` role (see *Model routing*); with neither set, prewalk stays inactive. Call `prewalk_arm`, populate native todos, then call `prewalk_ready` with:
 
 - Located workspace-relative files and relevant symbols/callers. Files must be confined regular files; no callers requires a concrete `callers_absence_reason`.
 - Constraints, non-goals, chosen approach and rejected alternatives.
 - Falsification checks, replanning triggers and acceptance IDs; optional rule references.
 
-The tool validates the brief and invokes native `switch_model`; it does not claim to prove that every model-authored explanation is correct. `prewalk_status` and `prewalk_reset` expose state. `replan_enabled` defaults to false; when enabled, `prewalk_replan` allows one return to the original model with a concrete failed assumption/check.
+The tool validates the brief and performs the handoff through the host model-switch seam `switch_agent_model`, falling back to native same-endpoint `switch_model` on hosts without the seam (on such hosts a cross-provider target refuses to arm). It does not claim to prove that every model-authored explanation is correct. `prewalk_status` and `prewalk_reset` expose state; `prewalk_status` also shows the target model/provider and its source (`explicit` or `route`). `replan_enabled` defaults to false; when enabled, `prewalk_replan` allows one return to the planner's original model and provider with a concrete failed assumption/check.
 
 These tools may be deferred behind Hermes's native catalog. Discover the actual schema via `tool_search`/`tool_describe`; the bridge uses `{"calls":[{"name":"prewalk_arm","arguments":{}}]}`, not a bare `tool_name`.
+
+## Model routing
+
+`model-routing` resolves named roles to concrete models. Configure named roles under `plugins.entries.model-routing.settings.roles` (role names match `[a-z][a-z0-9_-]*`); each role has a required non-empty `model` and an optional `provider` validated against the configured providers without network access. An omitted provider means the calling surface's own parent provider (a parentless surface uses the configured main provider). `settings.fallback` selects what an unknown role does: `inherit` (default) or `refuse`. Unknown keys or providers fail plugin registration with the offending name:
+
+```yaml
+plugins:
+  entries:
+    model-routing:
+      settings:
+        roles:
+          executor:
+            model: glm-5.3-flash
+            provider: openai
+          reviewer:
+            model: glm-5.3
+        fallback: inherit
+```
+
+Resolution precedence is **explicit > route > inherit**. An explicit model — a per-call/surface model or an `auxiliary.*`/`delegation.*` pin — always wins and the role is ignored. A configured role routes to its `{model, provider}`. Anything else inherits today's behavior. With `fallback: refuse`, only an explicit delegate `model_role` request is rejected; implicit lookups (review owners, the prewalk executor) never refuse and inherit instead.
+
+Surfaces:
+
+- Delegate `model_role`: a per-task `model_role` beats the top-level one, and an explicit per-task model/provider pin beats both. A refused request rejects the task with the reason and spawns nothing. `/review` children take an explicit `auxiliary.review` pin first, then `model_role`/`roles.reviewer`, then inherit.
+- Prewalk executor: an explicit `target_model` (with optional `target_provider`) beats `roles.executor`; with neither set, prewalk keeps today's behavior.
+- Review owners: an explicit `auxiliary.<owner>` pin beats `roles.reviewer`, which beats inherit. A routed reviewer counts as routed for the existing parent-capability skip, like an explicit pin.
+- `route_status` reports the configuration, effective resolutions, a bounded append-only audit of the plugin's own resolutions and the host seam. `route_apply` materializes pins — prewalk `target_model`/`target_provider`, `delegation.model`/`provider` and `auxiliary.{curator,background_review,review}` — through the native config writer with a provenance marker, never touches unrelated keys and reports drift.
+
+Role routing needs a Hermes host with the `register_role_resolver`/`switch_agent_model` seams. Without them the plugin still loads and its tools work, `route_status` reports `host_seam: unavailable`, and nothing routes.
+
+### Cross-provider routing
+
+Roles and explicit targets may name a model on a different provider:
+
+- Prewalk can hand off to another provider's model. Destination credentials and runtime are resolved exactly the way CLI/gateway startup resolves them (`resolve_runtime_provider`); at arm time a dry run validates the target, and an unresolvable provider refuses arming with the provider and reason named.
+- A delegate child built on another provider gets that destination runtime's own configured trust map (`capabilities`), never the parent's — the same map gateway startup gives an agent on that provider. Direct `delegation.base_url` endpoints without a provider-configured trust map stay `{}`.
+- Same-provider switches keep the agent's exact current endpoint (`api_key`/`base_url`/`api_mode`); nothing is re-resolved by provider name.
+
+No path chooses a model from classifier output, cost or quota.
 
 ## Recoverable Covey work
 
