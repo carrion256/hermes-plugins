@@ -1,8 +1,14 @@
-"""bladebro browser acceptance over the native Hermes MCP client.
+"""bladebro browser backend over the native Hermes MCP client.
 
-CLI transport retired: browser calls go through the host's native MCP path
-(``ctx.call_mcp``), gated by the operator-granted
-``plugins.entries.browser-bladebro.mcp_allowlist`` (default deny).
+Drop-in: the built-in ``browser_*`` tools (navigate, snapshot, click, type,
+scroll, back, press, get_images, vision, console) are replaced with the SAME
+names, schemas and result shapes, executed on the bladebro backend (needs
+``plugins.entries.browser-bladebro.allow_tool_override: true``; unloading the
+plugin restores the built-ins). Each Hermes task owns one backend tab.
+
+Calls go through the host's native MCP path (``ctx.call_mcp``), gated by the
+operator-granted ``plugins.entries.browser-bladebro.mcp_allowlist`` (default
+deny).
 
 Certified evidence uses the direct-artifact protocol (qualified wire shape):
 scenario declare pins immutable source hashes + a workspace-confined HTML
@@ -37,6 +43,8 @@ import re
 import stat
 import threading
 import time
+from collections import Counter
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +135,45 @@ def _parse_tab_id(text: str) -> str | None:
                 return token.upper()
             return None
     return None
+
+
+STEP_RE = re.compile(r"(?m)^step (\d+): ")
+STEP_ERROR_RE = re.compile(r"^✗ error: (?:step \d+ failed: )+")
+ACTIONABLE_RE = re.compile(r"\| (\d+) actionable")
+TITLE_RE = re.compile(r"(?m)^title: (.*)$")
+CONSOLE_LINE_RE = re.compile(r"^(\w+): (.*)$")
+MEDIA_RE = re.compile(r"MEDIA:(\S+)")
+NO_BROWSER_SESSION = "No browser session for this task. Call browser_navigate first."
+HREF_STEP = {"action": "eval", "js": "location.href"}
+SCROLL_PIXELS = 500  # built-in parity: about half a viewport per call
+FULL_SNAPSHOT_BUDGET = 50_000  # stays under the host's 64 KiB MCP envelope cap
+GET_IMAGES_JS = (
+    "[...document.images].map(img => ({src: img.src, alt: img.alt || '', "
+    "width: img.naturalWidth, height: img.naturalHeight}))"
+    ".filter(img => img.src && !img.src.startsWith('data:'))")
+
+
+def _split_steps(text: str) -> dict[int, str]:
+    """Native run framing -> {top-level step number: body}. Nested ``step 2.0:``
+    lines stay inside their parent's body."""
+    parts = STEP_RE.split(text)
+    return {int(parts[i]): parts[i + 1].rstrip() for i in range(1, len(parts) - 1, 2)}
+
+
+def _eval_value(body: str):
+    """``js → result: <json>`` step body -> parsed value (raw text when not JSON)."""
+    raw = body.split("result: ", 1)[1] if "result: " in body else body
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def _native_ref(ref) -> str:
+    """Built-in ``@e5`` / annotate ``[5]`` -> native ``e5`` (bladebro treats
+    ``@e5`` as a stale ref)."""
+    ref = str(ref or "").strip().lstrip("@").strip("[]")
+    return f"e{ref}" if ref.isdigit() else ref
 
 
 def _walk_steps(steps, depth=0, path="", total=None):
@@ -388,7 +435,8 @@ def register(ctx) -> None:
     server = str(ctx.get_config("server", "bladebro") or "bladebro")
     timeout = float(ctx.get_config("timeout", 60) or 60)
     state = ctx.state
-    _browser_lock = threading.Lock()
+    # Reentrant: browser_vision holds switch-tab + capture as one critical section.
+    _browser_lock = threading.RLock()
 
     def _mcp(tool: str, args: dict) -> dict:
         with _browser_lock:
@@ -418,31 +466,51 @@ def register(ctx) -> None:
             del tabs[tab_id]
             state.set("tabs", tabs)
 
-    def _switch(tab_id: str):
-        """Switch to an owned tab; returns (True, env) or (False, error_text).
-        On tab-not-found the owned binding is dropped and callers MUST stop.
-        The host connection_token is host-minted and cannot be forged by
-        server output: a token mismatch OR an ABSENT token voids the binding
-        (fail closed — a stale connection that recycles tab ids must not be
-        able to reuse ownership; McpReplayPolicyImpl)."""
-        env = _mcp("state", {"op": "switch-tab", "target_id": tab_id})
+    # ------------------------------------------------------------ task tabs
+    # The backend has ONE current tab shared by every caller. Each Hermes task
+    # (keyed like the built-in browser: session + task_id) owns one tab, and
+    # every call switches to it inside the same native run RPC as the action.
+    def _task_key(kw) -> tuple[str, str]:
+        return str(kw.get("session_id") or ""), str(kw.get("task_id") or "default")
+
+    def _task_tab(kw) -> str | None:
+        sid, tid = _task_key(kw)
+        for tab_id, tab in _tabs().items():
+            if isinstance(tab, dict) and (tab.get("session_id"), tab.get("task_id")) == (sid, tid):
+                return tab_id
+        return None
+
+    def _open_task_tab(kw) -> tuple[str | None, str]:
+        env = _mcp("state", {"op": "open-tab", "url": "about:blank"})
+        if not env.get("ok"):
+            return None, f"open-tab failed: {env.get('error')}"
+        tab_id = _parse_tab_id(_result_text(env))
+        if not tab_id:
+            return None, f"native open-tab result did not carry a tab id (expected: {TAB_ID_RE_HINT})"
+        sid, tid = _task_key(kw)
+        tabs = _tabs()
+        tabs[tab_id] = {"opened": time.time(), "session_id": sid, "task_id": tid}
+        state.set("tabs", tabs)
+        return tab_id, ""
+
+    def _in_tab(tab_id: str, *steps) -> tuple[dict | None, str]:
+        """ONE native run RPC: switch-tab, then ``steps`` (step 2 onward), so no
+        other caller can move the backend's current tab in between. Returns
+        ({step: body}, "") or (None, error); a vanished tab drops the binding
+        and reports NO_BROWSER_SESSION (nothing ran)."""
+        env = _mcp("run", {"steps": [
+            {"action": "state", "op": "switch-tab", "target_id": tab_id}, *steps]})
         if env.get("ok"):
-            token = env.get("connection_token")
-            tab = _tabs().get(tab_id)
-            bound = (tab or {}).get("connection_token")
-            if not isinstance(token, str) or not token:
-                _drop_tab(tab_id)
-                return False, ("host connection token unavailable; ownership "
-                               "cannot be verified, binding voided")
-            if not isinstance(bound, str) or not bound or bound != token:
-                _drop_tab(tab_id)
-                return False, (f"host connection changed since tab opened; "
-                               f"tab id preserved but session is not the same")
-            return True, env
+            return _split_steps(_result_text(env)), ""
         err = str(env.get("error", ""))
-        if "tab not found" in err:
+        if err.startswith("✗ error: step 1 failed") and "tab not found" in err:
             _drop_tab(tab_id)
-        return False, err
+            return None, NO_BROWSER_SESSION
+        return None, STEP_ERROR_RE.sub("", err)
+
+    def _task_steps(kw, *steps) -> tuple[dict | None, str]:
+        tab_id = _task_tab(kw)
+        return _in_tab(tab_id, *steps) if tab_id else (None, NO_BROWSER_SESSION)
 
     # ------------------------------------------------------------ lifecycle
     def _cleanup_session(trigger: str, session_id) -> None:
@@ -523,6 +591,16 @@ def register(ctx) -> None:
     for _hook_name in ("on_session_finalize", "on_session_reset"):
         ctx.register_hook(_hook_name, _lifecycle_hook(_hook_name))
 
+    def _subagent_stop(child_session_id=None, **_):
+        """Close the tabs a delegated child opened when it stops, instead of
+        leaving them open until the parent session ends."""
+        try:
+            _cleanup_session("subagent_stop", child_session_id)
+        except Exception as exc:
+            logger.warning("browser-bladebro subagent_stop cleanup failed: %s", exc)
+
+    ctx.register_hook("subagent_stop", _subagent_stop)
+
     def _task_cwd(task_id) -> str | None:
         """Recorded cwd for THIS task only; no ambient fallback."""
         if not task_id:
@@ -533,62 +611,246 @@ def register(ctx) -> None:
         except Exception:
             return None
 
-    # ---------------------------------------------------------------- open
-    def browser_open(args: dict, **kw) -> str:
-        url = str(args.get("url", "")).strip()
-        if not url:
-            return _err("url is required")
-        sid, tid = kw.get("session_id"), kw.get("task_id")
-        if not sid or not tid:
-            return _err("session/task identity unavailable; cannot own a tab")
-        env = _mcp("state", {"op": "open-tab", "url": url})
-        if not env.get("ok"):
-            return _err(f"open-tab failed: {env.get('error')}")
-        tab_id = _parse_tab_id(_result_text(env))
-        if not tab_id:
-            return _err(f"native open-tab result did not carry a tab id (expected: {TAB_ID_RE_HINT})")
-        token = env.get("connection_token")
-        if not isinstance(token, str) or not token:
-            # Fail closed: an unverified connection cannot own a certifiable
-            # tab. The host mints the token; its absence means ownership is
-            # unverifiable, not unenforced.
-            return _err("host connection token unavailable; refusing to own a tab")
-        tabs = _tabs()
-        tabs[tab_id] = {"url": url, "opened": time.time(),
-                        "session_id": sid, "task_id": tid,
-                        # Host-minted connection identity (cannot be forged
-                        # by server output; verified on every switch).
-                        "connection_token": token}
-        state.set("tabs", tabs)
-        return _ok(tab_id=tab_id, url=url, result=_result_text(env))
+    # ------------------------------------------------- drop-in built-in tools
+    # Same names, schemas and result shapes as tools/browser_tool.py, backed by
+    # the bladebro backend. Importing the built-in module first guarantees its
+    # entries exist, so the override below replaces them (unload restores them).
+    from tools import browser_tool as _bt
+    from tools import browser_tool_snapshot as _snap
+    from tools import browser_tool_vision as _vision
 
-    # ---------------------------------------------------------------- close
-    def browser_close(args: dict, **kw) -> str:
-        tab_id = str(args.get("tab_id", ""))
+    def _json(payload) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _page_text(body: str) -> str:
+        """Built-in snapshot handling: oversized text is truncated at line
+        boundaries with the full text stored for read_file paging, then redacted."""
+        threshold = _bt.get_browser_snapshot_threshold()
+        if len(body) > threshold:
+            body = _snap._truncate_snapshot(body, max_chars=threshold)
+        return _snap._redact_browser_output(body)
+
+    def _snapshot_fields(body: str) -> dict:
+        count = ACTIONABLE_RE.search(body)
+        return {"snapshot": _page_text(body), "element_count": int(count.group(1)) if count else 0}
+
+    def _landing_blocked(tab_id: str, landed) -> str | None:
+        """Built-in post-redirect check on where the page actually landed
+        (metadata floor, private ranges, website policy); a blocked page is
+        moved to about:blank so later reads cannot expose it."""
+        if not isinstance(landed, str) or not landed.startswith(("http://", "https://")):
+            return None
+        blocked = _bt._url_policy_error(landed)
+        if blocked is None:
+            return None
+        _in_tab(tab_id, {"action": "navigate", "url": "about:blank"})
+        return _err(f"Blocked: page landed on {landed}: {blocked['error']}")
+
+    def _act(kw, step: dict, fields: dict, failure: str) -> dict:
+        """One page action; the backend's verdict + page delta rides along as
+        ``result`` so the model rarely needs a separate browser_snapshot."""
+        out, err = _task_steps(kw, step)
+        if out is None:
+            return {"success": False, "error": err or failure}
+        return {"success": True, **fields, "result": _page_text(out.get(2, ""))}
+
+    def browser_navigate(args: dict, **kw) -> str:
+        url, blocked = _bt._secret_url_error_normalized(str(args.get("url", "")))
+        blocked = blocked or _bt._url_policy_error(url)
+        if blocked:
+            return _json(blocked)
+        steps = ({"action": "navigate", "url": url}, HREF_STEP)
+        tab_id = _task_tab(kw)
+        out, err = _in_tab(tab_id, *steps) if tab_id else (None, NO_BROWSER_SESSION)
+        if out is None and err == NO_BROWSER_SESSION:
+            # First navigation, or the backend lost the tab: nothing ran yet.
+            tab_id, err = _open_task_tab(kw)
+            if tab_id:
+                out, err = _in_tab(tab_id, *steps)
+        if out is None:
+            return _err(err)
+        landed = _eval_value(out.get(3, ""))
+        refused = _landing_blocked(tab_id, landed)
+        if refused:
+            return refused
         tab = _tabs().get(tab_id)
-        denied = _owner_ok(tab, kw) if tab is not None else "tab is not owned by this plugin session"
-        if denied:
-            return _err(denied)
-        env = _mcp("state", {"op": "close-tab", "target_id": tab_id})
-        if not env.get("ok"):
-            return _err(f"close-tab failed: {env.get('error')}")
-        _drop_tab(tab_id)
-        return _ok(tab_id=tab_id, closed=True)
+        if tab is not None and tab.pop("console_seen", None) is not None:
+            state.set("tabs", {**_tabs(), tab_id: tab})
+        body = out.get(2, "")
+        title = TITLE_RE.search(body)
+        return _json({"success": True, "url": landed if isinstance(landed, str) else url,
+                      "title": title.group(1) if title else "", **_snapshot_fields(body)})
+
+    def browser_snapshot(args: dict, **kw) -> str:
+        full = bool(args.get("full"))
+        out, err = _task_steps(kw, {
+            "action": "see", "mode": "model", "content": full,
+            "budget": FULL_SNAPSHOT_BUDGET if full else _bt.get_browser_snapshot_threshold()})
+        if out is None:
+            return _err(err)
+        body = out.get(2, "")
+        if body.startswith("see ("):  # drop the "see (N chars):" framing line
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+        return _json({"success": True, **_snapshot_fields(body)})
+
+    def browser_click(args: dict, **kw) -> str:
+        ref = _native_ref(args.get("ref"))
+        if not ref:
+            return _err("ref is required")
+        return _json(_act(kw, {"action": "click", "ref": ref}, {"clicked": f"@{ref}"},
+                          f"Failed to click @{ref}"))
+
+    def browser_type(args: dict, **kw) -> str:
+        from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
+        ref, text = _native_ref(args.get("ref")), str(args.get("text", ""))
+        if not ref:
+            return _err("ref is required")
+        # The typed value already went to the page; keep secrets out of history.
+        shown = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
+        response = _act(kw, {"action": "type", "ref": ref, "text": text},
+                        {"typed": shown, "element": f"@{ref}"}, f"Failed to type into @{ref}")
+        return _json(redact_browser_typed_text_for_display(response, text))
+
+    def browser_scroll(args: dict, **kw) -> str:
+        direction = args.get("direction")
+        if direction not in ("up", "down"):
+            return _err(f"Invalid direction '{direction}'. Use 'up' or 'down'.")
+        dy = SCROLL_PIXELS if direction == "down" else -SCROLL_PIXELS
+        return _json(_act(kw, {"action": "scroll", "dy": dy}, {"scrolled": direction},
+                          f"Failed to scroll {direction}"))
+
+    def browser_back(args: dict, **kw) -> str:
+        tab_id = _task_tab(kw)
+        if not tab_id:
+            return _err(NO_BROWSER_SESSION)
+        out, err = _in_tab(tab_id, {"action": "back"}, HREF_STEP)
+        if out is None:
+            return _err(err or "Failed to go back")
+        landed = _eval_value(out.get(3, ""))
+        return _landing_blocked(tab_id, landed) or _json({
+            "success": True, "url": landed if isinstance(landed, str) else "",
+            "result": _page_text(out.get(2, ""))})
+
+    def browser_press(args: dict, **kw) -> str:
+        key = str(args.get("key", ""))
+        if not key:
+            return _err("key is required")
+        return _json(_act(kw, {"action": "press", "key": key}, {"pressed": key},
+                          f"Failed to press {key}"))
+
+    def browser_get_images(args: dict, **kw) -> str:
+        out, err = _task_steps(kw, {"action": "eval", "js": GET_IMAGES_JS})
+        if out is None:
+            return _err(err or "Failed to get images")
+        images = _eval_value(out.get(2, ""))
+        if not isinstance(images, list):
+            return _json({"success": True, "images": [], "count": 0,
+                          "warning": "Could not parse image data"})
+        return _json({"success": True, "images": _snap._redact_browser_output(images),
+                      "count": len(images)})
+
+    def browser_console(args: dict, **kw) -> str:
+        expression = args.get("expression")
+        if expression is not None:
+            policy_error = _bt._eval_policy._enforce_browser_eval_policy(expression)
+            if policy_error:
+                return _err(policy_error)
+            out, err = _task_steps(kw, {"action": "eval", "js": str(expression)})
+            if out is None:
+                return _err(err)
+            value = _snap._redact_browser_output(_eval_value(out.get(2, "")))
+            return _json({"success": True, "result": value, "result_type": type(value).__name__})
+        tab_id = _task_tab(kw)
+        if not tab_id:
+            return _err(NO_BROWSER_SESSION)
+        out, err = _in_tab(tab_id, {"action": "see", "logs": "console"})
+        if out is None:
+            return _err(err)
+        entries: list[list[str]] = []
+        for line in out.get(2, "").splitlines()[1:]:
+            if line.startswith("console"):  # "console (N entries):" / "console: (empty)"
+                continue
+            match = CONSOLE_LINE_RE.match(line)
+            if match:
+                entries.append([match.group(1), match.group(2)])
+            elif entries:  # continuation of a multi-line message / stack
+                entries[-1][1] += "\n" + line
+        # The backend has no buffer clear, so `clear` records a baseline that
+        # later reads subtract. ponytail: the baseline resets on browser_navigate
+        # only; a reload by click/press can hide an identical repeat message.
+        tab = _tabs().get(tab_id) or {}
+        baseline = Counter(tab.get("console_seen") or [])
+        fresh = []
+        for level, text in entries:
+            key = f"{level}: {text}"
+            if baseline[key]:
+                baseline[key] -= 1
+            else:
+                fresh.append((level, _snap._redact_browser_output(text)))
+        if args.get("clear"):
+            tab["console_seen"] = [f"{level}: {text}" for level, text in entries]
+            state.set("tabs", {**_tabs(), tab_id: tab})
+        messages = [{"type": level, "text": text, "source": "console"}
+                    for level, text in fresh if level != "exception"]
+        errors = [{"message": text, "source": "exception"}
+                  for level, text in fresh if level == "exception"]
+        return _json({"success": True, "console_messages": messages, "js_errors": errors,
+                      "total_messages": len(messages), "total_errors": len(errors)})
+
+    def browser_vision(args: dict, **kw):
+        question, annotate = str(args.get("question", "")), bool(args.get("annotate"))
+        tab_id = _task_tab(kw)
+        if not tab_id:
+            return _err(NO_BROWSER_SESSION)
+        # Vision is not a run step, so switch + capture are two RPCs held under
+        # the plugin lock. ponytail: serializes this process only; another
+        # process driving the same backend can switch tabs in between. Upgrade
+        # path: a backend vision step inside `run` (or a target_id on vision).
+        with _browser_lock:
+            switched = _mcp("state", {"op": "switch-tab", "target_id": tab_id})
+            if not switched.get("ok"):
+                if "tab not found" in str(switched.get("error", "")):
+                    _drop_tab(tab_id)
+                    return _err(NO_BROWSER_SESSION)
+                return _err(f"Failed to take screenshot: {switched.get('error')}")
+            shot = _mcp("vision", {"marks": annotate})
+        if not shot.get("ok"):
+            return _err(f"Failed to take screenshot: {shot.get('error')}")
+        media = MEDIA_RE.search(_result_text(shot))
+        if not media or not os.path.isfile(media.group(1)):
+            return _err("Failed to take screenshot: the backend returned no image")
+        path = Path(media.group(1))
+        from tools.vision_tools import _should_use_native_vision_fast_path
+        if _should_use_native_vision_fast_path():
+            return _vision._native_vision_result(path, question, annotate, {}, None)
+        try:
+            analysis = _vision._analyze_screenshot_with_aux_llm(path, question)
+        except Exception as exc:
+            logger.warning("browser_vision analysis failed: %s", exc, exc_info=True)
+            return _json({"success": False, "error": f"Error during vision analysis: {exc}",
+                          "screenshot_path": str(path),
+                          "note": "Screenshot was captured but vision analysis failed. "
+                                  "You can still share it via MEDIA:<path>."})
+        return _json({"success": True, "screenshot_path": str(path),
+                      "analysis": analysis or "Vision analysis returned no content."})
 
     # ---------------------------------------------------------------- run
     def browser_run(args: dict, **kw) -> str:
-        tab_id = str(args.get("tab_id", ""))
-        tab = _tabs().get(tab_id)
-        denied = _owner_ok(tab, kw) if tab is not None else "tab is not owned by this plugin session"
-        if denied:
-            return _err(denied)
         steps = args.get("steps")
         if not isinstance(steps, list) or not steps:
             return _err("steps must be a non-empty list of native run/act action objects")
         errors, effects = _validate_run_tree(steps)
         if errors:
             return _err("; ".join(errors))
-        expected_url = str(tab["url"])
+        tab_id = _task_tab(kw)
+        if not tab_id:
+            return _err(NO_BROWSER_SESSION)
+        here, err = _in_tab(tab_id, HREF_STEP)
+        if here is None:
+            return _err(err)
+        expected_url = _eval_value(here.get(2, ""))
+        if not isinstance(expected_url, str) or not expected_url:
+            return _err("could not read the task tab's current URL; batch refused")
         if effects:
             # Approval binds session+task+workspace+server+tab+target+the FULL
             # plugin-generated guarded batch; the model cannot self-authorize.
@@ -600,7 +862,7 @@ def register(ctx) -> None:
                 sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(canonical.encode()).hexdigest()
             reason = (f"browser batch [{digest[:16]}] targeting {expected_url} "
-                      f"(tab {tab_id}) performs side effects at {effects[:5]}"
+                      f"performs side effects at {effects[:5]}"
                       f"{'...' if len(effects) > 5 else ''}")
             try:
                 from tools.approval import request_tool_approval
@@ -611,9 +873,9 @@ def register(ctx) -> None:
             if not (isinstance(verdict, dict) and verdict.get("approved")):
                 blocked = verdict.get("message") if isinstance(verdict, dict) else None
                 return _err(f"approval gate denied mutating batch: {blocked or 'not approved'}")
-        # ONE native run RPC (qualified shape): switch-tab + plugin exact-URL
-        # guard wrapping the approved steps; false guard aborts with the
-        # plugin marker and mutates nothing. Unknown outcome is never replayed.
+        # ONE native run RPC: switch-tab + exact-URL guard (the URL read just
+        # above, i.e. the approved target) wrapping the steps; a false guard
+        # aborts with the plugin marker and mutates nothing. Never replayed.
         guarded = [
             {"action": "state", "op": "switch-tab", "target_id": tab_id},
             {"action": "if", "condition": "js", "text": _guard_js(expected_url),
@@ -623,16 +885,15 @@ def register(ctx) -> None:
         text = _result_text(env)
         if not env.get("ok"):
             err = str(env.get("error", ""))
-            _drop_tab(tab_id)  # ambiguous OR false guard: binding is void
             if GUARD_THROW_PREFIX in err:
-                return _err("exact-URL guard false; user steps did not run and "
-                            "nothing was mutated (target mismatch)")
-            return _err(f"native run failed (outcome unknown; tab binding "
-                        f"invalidated, no replay): {err}")
+                return _err("exact-URL guard false: the page moved after approval; "
+                            "user steps did not run and nothing was mutated")
+            return _err(f"native run failed (outcome unknown, not replayed): "
+                        f"{STEP_ERROR_RE.sub('', err)}")
         if any(marker in text for marker in TRUNCATION_MARKERS):
             return _err("run output truncated by the MCP envelope cap; outcome unknown, "
                         "refused (no success from partial framing)")
-        out = {"run_output": text, "tab_id": tab_id, "target": expected_url}
+        out = {"run_output": text, "target": expected_url}
         if "sign in" in text.lower() or "log in" in text.lower():
             out["steering"] = ("Login wall encountered: do not guess credentials — "
                                "stop and ask the user (the operator sets up site accounts).")
@@ -1098,26 +1359,6 @@ def register(ctx) -> None:
             return None
         return {"initial": True, "final": True}
 
-    # ---------------------------------------------------------------- vision
-    def browser_screenshot(args: dict, **kw) -> str:
-        tab_id = str(args.get("tab_id", ""))
-        tab = _tabs().get(tab_id)
-        denied = _owner_ok(tab, kw) if tab is not None else "tab is not owned by this plugin session"
-        if denied:
-            return _err(denied)
-        ok, res = _switch(tab_id)
-        if not ok:
-            return _err(f"switch failed: {res}")
-        env = _mcp("vision", {"marks": bool(args.get("marks"))})
-        if not env.get("ok"):
-            return _err(f"vision failed: {env.get('error')}")
-        return _ok(
-            tab_id=tab_id,
-            supplementary_only=True,
-            note="screenshots are supplementary; certified evidence requires the native run flow",
-            result=_result_text(env),
-        )
-
     def _allowlisted() -> bool:
         try:
             ctx.call_mcp(server, "state", {"op": "tabs"}, timeout=10)
@@ -1128,36 +1369,20 @@ def register(ctx) -> None:
             return False
 
     tools = {
-        "browser_open": (
-            "Open a browser tab owned by this plugin session; returns the native tab id. "
-            "Ordinary browsing only — a tab opened here can NEVER mint certified source+build evidence.",
-            {"url": {"type": "string", "description": "URL to open"}},
-            browser_open, ["url"],
-        ),
-        "browser_close": (
-            "Close a tab this plugin session owns.",
-            {"tab_id": {"type": "string"}},
-            browser_close, ["tab_id"],
-        ),
         "browser_run": (
-            "Run a bounded native batch on an owned tab (session/task owner verified). "
-            "Dispatch is ONE qualified native run RPC: native switch-tab plus a "
-            "plugin-generated exact-URL js guard whose then-branch carries the approved "
-            "steps and whose false branch is a plugin throw (whole-response error, "
-            "nothing mutated). While loops require max <= %d; aggregate tree <= %d "
-            "actions; nesting <= %d; worst-case expanded loop executions <= %d "
-            "(nested maxima multiply); unknown step kinds refused, validated before "
-            "loop cost. Truncated run output is refused as unknown outcome. Side "
-            "effects escalate to the native human-approval gate bound to "
-            "session+task+workspace+server+tab+target+the full plugin-generated batch; "
-            "unknown outcomes are never replayed (tab binding invalidated). Ordinary "
-            "browsing only — this cannot mint certifiable evidence."
+            "Run a bounded bladebro step batch (act/see/wait/if/while steps) on the "
+            "current browser page — the one browser_navigate opened for this task — in "
+            "ONE call, e.g. fill a form, wait, and branch on what appears. The batch is "
+            "wrapped in an exact-URL guard bound to the page's current URL, so it never "
+            "runs against a page that moved. While loops require max <= %d; aggregate "
+            "tree <= %d actions; nesting <= %d; worst-case expanded loop executions <= %d "
+            "(nested maxima multiply); unknown step kinds refused. Side effects escalate "
+            "to the native human-approval gate bound to the full batch and target; "
+            "unknown outcomes are never replayed. Ordinary browsing only — this cannot "
+            "mint certifiable evidence."
             % (MAX_LOOP, MAX_STEPS, MAX_DEPTH, MAX_EXPANDED),
-            {
-                "tab_id": {"type": "string"},
-                "steps": {"type": "array", "description": "native run/act step tree"},
-            },
-            browser_run, ["tab_id", "steps"],
+            {"steps": {"type": "array", "description": "native run/act step tree"}},
+            browser_run, ["steps"],
         ),
         "browser_scenario": (
             "declare: pin an immutable artifact scenario — workspace source snapshot, "
@@ -1203,11 +1428,6 @@ def register(ctx) -> None:
             {"scenario_id": {"type": "string"}},
             browser_capture, ["scenario_id"],
         ),
-        "browser_screenshot": (
-            "Supplementary screenshot of an owned tab (never evidence on its own).",
-            {"tab_id": {"type": "string"}, "marks": {"type": "boolean"}},
-            browser_screenshot, ["tab_id"],
-        ),
     }
     for name, (desc, props, handler, required) in tools.items():
         ctx.register_tool(
@@ -1227,9 +1447,31 @@ def register(ctx) -> None:
             description=desc,
             emoji="🌐",
         )
+    dropin = {
+        "browser_navigate": browser_navigate, "browser_snapshot": browser_snapshot,
+        "browser_click": browser_click, "browser_type": browser_type,
+        "browser_scroll": browser_scroll, "browser_back": browser_back,
+        "browser_press": browser_press, "browser_get_images": browser_get_images,
+        "browser_vision": browser_vision, "browser_console": browser_console,
+    }
+    emojis = {row[0]: row[1] for row in _bt._BROWSER_TOOL_TABLE}
+    replaced = 0
+    for schema in _bt.BROWSER_TOOL_SCHEMAS:
+        handler = dropin[schema["name"]]  # KeyError = built-in grew a tool: fail loudly
+        try:
+            ctx.register_tool(
+                name=schema["name"], toolset="browser", schema=schema,
+                handler=lambda args, _h=handler, **kw: _h(args or {}, **kw),
+                check_fn=_allowlisted, description=schema["description"],
+                emoji=emojis.get(schema["name"], "🌐"), override=True,
+            )
+            replaced += 1
+        except PermissionError as exc:  # PluginToolOverrideError: operator has not opted in
+            logger.warning(
+                "browser-bladebro: built-in browser_* tools NOT replaced (%s). Set "
+                "plugins.entries.browser-bladebro.allow_tool_override: true to use "
+                "bladebro as the drop-in browser backend.", exc)
+            break
     logger.info(
-        "browser-bladebro: registered %d native MCP-backed tools + 2 session "
-        "lifecycle cleanup hooks (server=%s); certified evidence = "
-        "direct-artifact protocol on the qualified run shape",
-        len(tools), server,
-    )
+        "browser-bladebro: replaced %d built-in browser_* tools, registered %d "
+        "bladebro extras + 3 cleanup hooks (server=%s)", replaced, len(tools), server)

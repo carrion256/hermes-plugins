@@ -1,21 +1,30 @@
 name: browser-bladebro
-version: 0.3.1
-description: "Direct-artifact browser acceptance on the qualified native run shape: pinned source snapshots + bounded confined HTML artifacts, initial/interaction/final flow observed by the native backend, backend see/console observations supplementary, real evidence rows with bound/failed/unbound truth."
+version: 0.4.0
+description: "bladebro as the drop-in Hermes browser backend: replaces the built-in browser_* tools (same names, schemas, result shapes) with per-task bladebro tabs, plus browser_run batches and direct-artifact certified browser acceptance (browser_scenario/browser_capture)."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
 provides_tools:
-  - browser_open
-  - browser_close
+  - browser_navigate
+  - browser_snapshot
+  - browser_click
+  - browser_type
+  - browser_scroll
+  - browser_back
+  - browser_press
+  - browser_get_images
+  - browser_vision
+  - browser_console
   - browser_run
   - browser_scenario
   - browser_capture
-  - browser_screenshot
 provides_hooks:
   - on_session_finalize
   - on_session_reset
+  - subagent_stop
 external_dependencies:
   - "operator-granted plugins.entries.browser-bladebro.mcp_allowlist containing the bladebro MCP server"
+  - "operator-granted plugins.entries.browser-bladebro.allow_tool_override: true (replaces the built-in browser_* tools)"
 config_schema:
   server:
     type: str

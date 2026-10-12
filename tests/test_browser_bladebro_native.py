@@ -10,13 +10,19 @@ ledger API (agent.verification_evidence) with actual row ids; the
 disabled-ledger truth (unbound) is asserted separately. No live browser is
 contacted; the parent owns the native backend smoke.
 """
+import base64
 import hashlib
 import json
 import pathlib
+import urllib.parse
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli.plugins import PluginContext
+# Imported at collection so the built-in browser_* entries exist in every
+# test's registry snapshot (the plugin overrides them; unload restores them).
+from tools.browser_tool import BROWSER_TOOL_SCHEMAS
 
 
 TAB = "EA6FDE15266206A4CF5F7416103D5039"
@@ -441,70 +447,291 @@ def test_capture_foreign_session_refused(browser):
     assert calls == []
 
 
+# ------------------------------------------------- drop-in backend double
+
+def fake_backend(router, tabs=(TAB, OTHER_TAB)):
+    """Stateful bladebro double speaking the real wire shapes (probed live):
+    open-tab hands out ids in order; ``run`` executes switch-tab + steps and
+    frames each top-level step as ``step N: <body>``; a vanished tab fails
+    step 1 with ``tab not found``; ``location.href`` is the normalized URL."""
+    backend = SimpleNamespace(pool=list(tabs), live=set(), url={}, current=[None],
+                              state_override={}, bodies={})
+
+    def page(tab):
+        url = backend.url.get(tab, "about:blank")
+        return f"Page: {url} | phase: ready | 3 actionable\ntitle: Fixture\ne1 button \"Commit\""
+
+    def state(a):
+        op = a.get("op")
+        if op in backend.state_override:
+            return backend.state_override[op](a)
+        if op == "open-tab":
+            tab = backend.pool.pop(0)
+            backend.live.add(tab)
+            backend.current[0] = tab
+            return {"ok": True, "result": f"✓ opened + switched to tab {tab}\n{page(tab)}"}
+        if op == "close-tab":
+            backend.live.discard(a["target_id"])
+            return {"ok": True, "result": f"✓ closed tab {a['target_id']}"}
+        if op == "switch-tab":
+            if a["target_id"] not in backend.live:
+                return {"ok": False, "error": f"tab not found: {a['target_id']}"}
+            backend.current[0] = a["target_id"]
+            return {"ok": True, "result": f"✓ switched to tab {a['target_id']}"}
+        return {"ok": True, "result": ""}
+
+    def body(step):
+        tab = backend.current[0]
+        action = step.get("action")
+        if action in backend.bodies:
+            return backend.bodies[action](step)
+        if action == "navigate":
+            parts = urllib.parse.urlsplit(step["url"])
+            backend.url[tab] = urllib.parse.urlunsplit(parts._replace(path=parts.path or "/"))
+            return f"navigated → {parts.netloc}\n{page(tab)}"
+        if action == "eval" and step["js"] == "location.href":
+            return f"js → result: {json.dumps(backend.url.get(tab, 'about:blank'))}"
+        if action == "if" and step.get("condition") == "js":
+            want = json.loads(step["text"].split("=== ", 1)[1])
+            if want != backend.url.get(tab):
+                raise _GuardFalse
+            return 'if(js "...") → then\nstep 2.0: outcome: ok'
+        if action == "see":
+            return f"see (60 chars):\n{page(tab)}"
+        return f"outcome: dom-changed via mouse\n{page(tab)}"
+
+    def run(a):
+        steps = a["steps"]
+        lead = steps[0]
+        if lead.get("op") == "switch-tab" and lead["target_id"] not in backend.live:
+            return {"ok": False, "error": (
+                f"✗ error: step 1 failed: step 1 state failed: tab not found: "
+                f"{lead['target_id']}\n\n--- current page state ---\n")}
+        out = []
+        for i, step in enumerate(steps, 1):
+            if step.get("action") == "state":
+                out.append(f"step {i}: {state(step)['result']}")
+                continue
+            try:
+                out.append(f"step {i}: {body(step)}")
+            except _GuardFalse:
+                return {"ok": False, "error": false_guard_error("TARGET")}
+        return {"ok": True, "result": "\n\n".join(out)}
+
+    router["state"] = state
+    router["run"] = run
+    return backend
+
+
+class _GuardFalse(Exception):
+    pass
+
+
+def _call(ctx, name, args=None, session=SESSION, task=TASK):
+    raw = ctx.tool(name, args or {}, session_id=session, task_id=task)
+    return raw if isinstance(raw, dict) else json.loads(raw)
+
+
+def _runs(calls):
+    return [c[1]["steps"] for c in calls if c[0] == "run"]
+
+
 # --------------------------------------------------------------- run tests
 
-def test_ordinary_run_one_rpc_guard_wraps_steps(browser):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {
-        "ok": True, "connection_token": "tok-1",
-        "result": f"✓ opened + switched to tab {TAB}\nPage: about:blank | phase: ready\n"}
-    opened = json.loads(ctx.tool("browser_open", {"url": "data:text/html;base64,ORIG"},
-                                 session_id=SESSION, task_id=TASK))
+def test_run_guard_binds_to_the_pages_actual_url(browser):
+    # Regression: the guard used the REQUESTED url ("http://x.test"), but the
+    # page reports the normalized "http://x.test/", so every batch failed.
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
     calls.clear()
-    router["run"] = lambda a: {"ok": True, "result": "step 1: ✓ switched\nstep 2: if → then\nstep 2.0: ok\n"}
-    out = json.loads(ctx.tool("browser_run",
-                              {"tab_id": opened["tab_id"],
-                               "steps": [{"action": "see"}]},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"]
-    assert len(calls) == 1 and calls[0][0] == "run"
-    steps = calls[0][1]["steps"]
-    assert steps[0]["op"] == "switch-tab" and steps[0]["target_id"] == TAB
-    assert steps[1]["condition"] == "js"
-    assert "location.href === " in steps[1]["text"]
-    assert steps[1]["then"] == [{"action": "see"}]
-    assert steps[1]["else"][0]["action"] == "eval"
+    out = _call(ctx, "browser_run", {"steps": [{"action": "see"}]})
+    assert out["success"] and out["target"] == "http://x.test/"
+    guarded = _runs(calls)[-1]
+    assert guarded[0] == {"action": "state", "op": "switch-tab", "target_id": TAB}
+    assert guarded[1]["text"] == 'location.href === "http://x.test/"'
+    assert guarded[1]["then"] == [{"action": "see"}]
 
 
-def test_ordinary_run_guard_false_mutates_nothing(browser, monkeypatch):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {
-        "ok": True, "connection_token": "tok-1",
-        "result": f"✓ opened + switched to tab {TAB}\nPage: about:blank | phase: ready\n"}
-    opened = json.loads(ctx.tool("browser_open", {"url": "http://x.test"},
-                                 session_id=SESSION, task_id=TASK))
-    # Approval gate approves; guard then fails honestly.
+def test_run_guard_false_mutates_nothing_and_keeps_the_tab(browser, monkeypatch):
+    ctx, calls, router, _ = browser
+    backend = fake_backend(router)
+    assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
     monkeypatch.setattr("tools.approval.request_tool_approval",
                         lambda *a, **k: {"approved": True, "message": None})
-    router["run"] = lambda a: {"ok": False, "error": false_guard_error("TARGET")}
-    out = json.loads(ctx.tool("browser_run",
-                              {"tab_id": opened["tab_id"],
-                               "steps": [{"action": "click", "text": "Commit"}]},
-                              session_id=SESSION, task_id=TASK))
+    real_run = router["run"]
+
+    def page_moves_after_approval(a):
+        if a["steps"][1].get("action") == "if":
+            backend.url[TAB] = "http://elsewhere.test/"
+        return real_run(a)
+    router["run"] = page_moves_after_approval
+    calls.clear()
+    out = _call(ctx, "browser_run", {"steps": [{"action": "click", "text": "Commit"}]})
     assert out["success"] is False and "guard false" in out["error"]
-    closed = json.loads(ctx.tool("browser_close", {"tab_id": opened["tab_id"]},
-                                 session_id=SESSION, task_id=TASK))
-    assert closed["success"] is False  # binding voided after unknown outcome
-    assert sum(1 for c in calls if c[0] == "run") == 1  # no replay
+    assert len([s for s in _runs(calls) if s[1].get("action") == "if"]) == 1  # no replay
+    assert _call(ctx, "browser_snapshot")["success"]  # binding survives
 
 
-def test_ordinary_run_rejects_oversized_tree(browser):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {
-        "ok": True, "connection_token": "tok-1",
-        "result": f"✓ opened + switched to tab {TAB}\n"}
-    opened = json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                                 session_id=SESSION, task_id=TASK))
+def test_run_rejects_oversized_tree_before_dispatch(browser):
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
     calls.clear()
     half = 31
     branches = [{"action": "if", "condition": "text", "text": "t",
                  "then": [{"action": "wait", "ms": 1}] * half,
                  "else": [{"action": "wait", "ms": 1}] * half}]
-    out = json.loads(ctx.tool("browser_run",
-                              {"tab_id": opened["tab_id"], "steps": branches},
-                              session_id=SESSION, task_id=TASK))
+    out = _call(ctx, "browser_run", {"steps": branches})
     assert out["success"] is False and "aggregate" in out["error"]
     assert calls == []
+
+
+# ------------------------------------------------------------ drop-in tests
+
+def test_dropin_replaces_builtins_and_unload_restores_them(browser):
+    ctx, _, _, _ = browser
+    from tools.registry import registry
+    for schema in BROWSER_TOOL_SCHEMAS:
+        entry = registry.get_entry(schema["name"])
+        assert entry.toolset == "browser" and entry.schema == schema
+        assert entry.handler.__module__ == ctx.module.__name__
+    ctx.manager.unload("browser-bladebro")
+    for schema in BROWSER_TOOL_SCHEMAS:
+        assert registry.get_entry(schema["name"]).handler.__module__ != ctx.module.__name__
+
+
+def test_without_override_grant_builtins_stay_and_extras_load(load_plugin, fake_mcp, monkeypatch):
+    from hermes_cli.plugins import PluginContext
+    from tools.registry import registry
+    monkeypatch.setattr(PluginContext, "_tool_override_allowed", lambda self, name: False)
+    ctx = load_plugin("browser-bladebro")
+    assert registry.get_entry("browser_navigate").handler.__module__ != ctx.module.__name__
+    assert registry.get_entry("browser_run").handler.__module__ == ctx.module.__name__
+
+
+def test_each_task_gets_one_reused_tab(browser):
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    for _ in range(2):
+        assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
+    other = _call(ctx, "browser_navigate", {"url": "http://y.test"}, task="task-2")
+    assert other["success"] and other["url"] == "http://y.test/"
+    opens = [c for c in calls if c[1].get("op") == "open-tab"]
+    assert len(opens) == 2  # one per task, never per call
+    switched = [steps[0]["target_id"] for steps in _runs(calls)]
+    assert switched == [TAB, TAB, OTHER_TAB]
+
+
+def test_navigate_reopens_when_backend_lost_the_tab(browser):
+    ctx, calls, router, _ = browser
+    backend = fake_backend(router)
+    assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
+    backend.live.clear()  # backend restarted
+    calls.clear()
+    out = _call(ctx, "browser_navigate", {"url": "http://x.test/next"})
+    assert out["success"] and out["url"] == "http://x.test/next"
+    navigations = [s for s in _runs(calls) if s[1].get("action") == "navigate"]
+    assert [s[0]["target_id"] for s in navigations] == [TAB, OTHER_TAB]  # first failed at switch
+
+
+def test_navigate_result_matches_builtin_shape(browser):
+    ctx, _, router, _ = browser
+    fake_backend(router)
+    out = _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    assert out == {"success": True, "url": "http://x.test/", "title": "Fixture",
+                   "snapshot": out["snapshot"], "element_count": 3}
+    assert 'e1 button "Commit"' in out["snapshot"]
+
+
+def test_navigate_refuses_secret_bearing_url_before_dispatch(browser):
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    out = _call(ctx, "browser_navigate",
+                {"url": "https://x.test/?k=ghp_" + "a" * 36})
+    assert out["success"] is False and "API key or token" in out["error"]
+    assert calls == []
+
+
+def test_actions_need_a_navigated_tab(browser):
+    ctx, calls, _, _ = browser
+    for name, args in (("browser_snapshot", {}), ("browser_click", {"ref": "@e1"}),
+                       ("browser_console", {}), ("browser_vision", {"question": "q"})):
+        out = _call(ctx, name, args)
+        assert out["success"] is False and "browser_navigate" in out["error"]
+    assert calls == []
+
+
+def test_builtin_refs_reach_the_backend_in_native_form(browser):
+    # bladebro rejects "@e5" as a stale ref; the built-in schema teaches "@e5"
+    # and annotate labels "[5]".
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    for ref in ("@e5", "e5", "5", "[5]"):
+        out = _call(ctx, "browser_click", {"ref": ref})
+        assert out["success"] and out["clicked"] == "@e5"
+        assert _runs(calls)[-1][1] == {"action": "click", "ref": "e5"}
+
+
+def test_backend_step_errors_surface_without_framing(browser):
+    ctx, _, router, _ = browser
+    backend = fake_backend(router)
+    _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    real_run = router["run"]
+
+    def stale(a):
+        if a["steps"][1].get("action") == "click":
+            return {"ok": False, "error": "✗ error: step 2 failed: step 2 failed: stale ref: e9"}
+        return real_run(a)
+    router["run"] = stale
+    out = _call(ctx, "browser_click", {"ref": "e9"})
+    assert out == {"success": False, "error": "stale ref: e9"}
+    assert TAB in backend.live
+
+
+def test_console_splits_exceptions_and_clear_hides_seen_messages(browser):
+    ctx, _, router, _ = browser
+    backend = fake_backend(router)
+    _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    log = ["error: boom", "exception: Uncaught Error: bad\n    at f (a.js:1)"]
+    backend.bodies["see"] = lambda step: (
+        f"see (90 chars):\nconsole ({len(log)} entries):\n" + "\n".join(log))
+    first = _call(ctx, "browser_console", {"clear": True})
+    assert first["console_messages"] == [{"type": "error", "text": "boom", "source": "console"}]
+    assert first["js_errors"] == [{"message": "Uncaught Error: bad\n    at f (a.js:1)",
+                                   "source": "exception"}]
+    log.append("error: boom")  # same text again after the clear
+    second = _call(ctx, "browser_console")
+    assert second["total_messages"] == 1 and second["total_errors"] == 0
+    backend.bodies["see"] = lambda step: "see (16 chars):\nconsole: (empty)"
+    assert _call(ctx, "browser_console")["total_messages"] == 0
+
+
+def test_console_expression_returns_parsed_value(browser):
+    ctx, calls, router, _ = browser
+    backend = fake_backend(router)
+    _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    backend.bodies["eval"] = lambda step: 'js → result: {"n": 2}'
+    out = _call(ctx, "browser_console", {"expression": "({n: 2})"})
+    assert out == {"success": True, "result": {"n": 2}, "result_type": "dict"}
+
+
+def test_vision_attaches_the_backend_screenshot_natively(browser, tmp_path, monkeypatch):
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    _call(ctx, "browser_navigate", {"url": "http://x.test"})
+    png = tmp_path / "shot.png"
+    png.write_bytes(base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="))
+    router["vision"] = lambda a: {"ok": True, "result": f"MEDIA:{png}"}
+    monkeypatch.setattr("tools.vision_tools._should_use_native_vision_fast_path", lambda: True)
+    calls.clear()
+    out = _call(ctx, "browser_vision", {"question": "layout?", "annotate": True})
+    assert out["_multimodal"] is True and out["meta"]["screenshot_path"] == str(png)
+    assert [c[0] for c in calls] == ["state", "vision"]
+    assert calls[0][1] == {"op": "switch-tab", "target_id": TAB}
+    assert calls[1][1] == {"marks": True}
 
 
 def test_capture_requires_host_connection_token(browser):
@@ -684,75 +911,18 @@ def test_build_invokes_gateway_with_exact_identity(browser, monkeypatch):
     assert seen["task_id"] == TASK and seen["session_id"] == SESSION
 
 
-# --------------------------------------------------------------- tab tests
-
-def test_open_requires_host_connection_token(browser):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {
-        "ok": True, "connection_token": None,  # host mints none: refuse
-        "result": f"✓ opened + switched to tab {TAB}\n"}
-    out = json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "connection token" in out["error"]
-
-
-def test_open_tracks_native_tab_identity_and_token(browser):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {
-        "ok": True, "connection_token": "tok-1",
-        "result": f"✓ opened + switched to tab {TAB}\n"}
-    opened = json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                                 session_id=SESSION, task_id=TASK))
-    assert opened["success"] and opened["tab_id"] == TAB
-    assert router["state"]  # token present in env
-
-
-def test_connection_token_change_invalidates_binding(browser):
-    ctx, calls, router, browser_mp = browser
-
-    def state_handler(a):
-        if a.get("op") == "open-tab":
-            return {"ok": True, "connection_token": "tok-1",
-                    "result": f"✓ opened + switched to tab {TAB}\n"}
-        return {"ok": True, "connection_token": "tok-2",
-                "result": f"✓ switched to tab {TAB}\n"}
-    router["state"] = state_handler
-    opened = json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                                 session_id=SESSION, task_id=TASK))
-    out = json.loads(ctx.tool("browser_screenshot", {"tab_id": opened["tab_id"]},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "connection changed" in out["error"]
-    # binding gone: subsequent ops refuse without dispatching
-    calls.clear()
-    again = json.loads(ctx.tool("browser_screenshot", {"tab_id": opened["tab_id"]},
-                                session_id=SESSION, task_id=TASK))
-    assert again["success"] is False and "not owned" in again["error"]
-    assert calls == []
-
-
-def test_tab_id_unparseable_refuses_ownership(browser):
-    ctx, calls, router, browser_mp = browser
-    router["state"] = lambda a: {"ok": True, "result": "opened, tab somewhere"}
-    out = json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "tab id" in out["error"]
-    assert calls[0][2]["replay_on_failure"] is False
-
-
 # ------------------------------------------------------- lifecycle cleanup
 
-def _open_state_router(tab=TAB, token="tok-1"):
-    def state_handler(a):
-        if a.get("op") == "open-tab":
-            return {"ok": True, "connection_token": token,
-                    "result": f"✓ opened + switched to tab {tab}\n"}
-        return {"ok": True, "connection_token": token, "result": ""}
-    return state_handler
+def _open(ctx, router, session=SESSION, task=TASK):
+    if "run" not in router:
+        fake_backend(router)
+    return json.loads(ctx.tool("browser_navigate", {"url": "http://x.test"},
+                               session_id=session, task_id=task))
 
 
-def _open(ctx, session=SESSION, tab=TAB):
-    return json.loads(ctx.tool("browser_open", {"url": "http://x"},
-                               session_id=session, task_id=TASK))
+def _snapshot(ctx, session=SESSION, task=TASK):
+    return json.loads(ctx.tool("browser_snapshot", {},
+                               session_id=session, task_id=task))
 
 
 CLOSED_TAB = ("state", {"op": "close-tab", "target_id": TAB},
@@ -762,7 +932,7 @@ CLOSED_TAB = ("state", {"op": "close-tab", "target_id": TAB},
 def test_lifecycle_hooks_registered(browser):
     ctx, _, _, _ = browser
     from hermes_cli.plugins import VALID_HOOKS
-    for name in ("on_session_finalize", "on_session_reset"):
+    for name in ("on_session_finalize", "on_session_reset", "subagent_stop"):
         assert name in VALID_HOOKS
         ours = [cb for cb in ctx.manager.iter_hook_callbacks(name)
                 if cb.__module__ == ctx.module.__name__]
@@ -776,28 +946,21 @@ def test_lifecycle_hooks_registered(browser):
 
 def test_session_end_survives_turn_boundary(browser):
     # on_session_end fires at the end of EVERY turn (turn_finalizer/cli);
-    # the plugin must not reap tabs or state there — multi-turn browsing
-    # and scenario continuity depend on the tab surviving per-turn fires.
+    # the plugin must not reap tabs there — multi-turn browsing depends on it.
     ctx, calls, router, _ = browser
-    router["state"] = _open_state_router()
-    assert _open(ctx)["success"]
+    assert _open(ctx, router)["success"]
     calls.clear()
     ctx.hook("on_session_end", session_id=SESSION, task_id=TASK, turn_id=1,
              completed=True, failed=False, interrupted=False,
              turn_exit_reason="model_stop")
     assert calls == []  # zero native dispatch on a per-turn boundary
-    # tab binding intact and fully operable after the turn
-    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] and out["closed"] is True
+    assert _snapshot(ctx)["success"]  # same tab, next turn
+    assert calls[-1][1]["steps"][0]["target_id"] == TAB
 
 
 def test_finalize_reaps_tab_after_turn_survival(browser):
-    # The same tab that survives per-turn on_session_end fires is closed at
-    # the true session boundary.
     ctx, calls, router, _ = browser
-    router["state"] = _open_state_router()
-    assert _open(ctx)["success"]
+    assert _open(ctx, router)["success"]
     ctx.hook("on_session_end", session_id=SESSION, task_id=TASK, turn_id=1,
              completed=True, failed=False, interrupted=False,
              turn_exit_reason="model_stop")
@@ -805,24 +968,36 @@ def test_finalize_reaps_tab_after_turn_survival(browser):
     ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
     assert CLOSED_TAB in calls
     calls.clear()
-    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "not owned" in out["error"]
+    out = _snapshot(ctx)
+    assert out["success"] is False and "browser_navigate" in out["error"]
     assert calls == []
 
 
 def test_finalize_and_reset_close_owned_tabs(browser):
     ctx, calls, router, _ = browser
-    router["state"] = _open_state_router()
-    assert _open(ctx)["success"]
+    backend = fake_backend(router, tabs=(TAB, TAB))
+    assert _open(ctx, router)["success"]
     calls.clear()
     ctx.hook("on_session_finalize", session_id=SESSION, reason="end")
-    assert CLOSED_TAB in calls
-    # session state empty; a fresh open then a reset boundary closes again
-    assert _open(ctx)["success"]
+    assert CLOSED_TAB in calls and TAB not in backend.live
+    # session state empty; a fresh navigate then a reset boundary closes again
+    assert _open(ctx, router)["success"]
     calls.clear()
     ctx.hook("on_session_reset", session_id=SESSION, reason="reset")
     assert CLOSED_TAB in calls
+
+
+def test_subagent_stop_closes_only_the_childs_tabs(browser):
+    ctx, calls, router, _ = browser
+    fake_backend(router)
+    assert _open(ctx, router, session=SESSION)["success"]
+    assert _open(ctx, router, session="child-1", task="child-task")["success"]
+    calls.clear()
+    ctx.hook("subagent_stop", parent_session_id=SESSION, child_session_id="child-1",
+             child_status="completed")
+    closed = [c[1]["target_id"] for c in calls if c[1].get("op") == "close-tab"]
+    assert closed == [OTHER_TAB]
+    assert _snapshot(ctx)["success"]  # the parent keeps browsing
 
 
 def test_finalize_clears_scenario_records_for_session(browser):
@@ -836,85 +1011,57 @@ def test_finalize_clears_scenario_records_for_session(browser):
 
 def test_cleanup_never_touches_foreign_session_tabs(browser):
     ctx, calls, router, _ = browser
-    seq = {"n": 0}
-
-    def state_handler(a):
-        if a.get("op") == "open-tab":
-            seq["n"] += 1
-            tab = TAB if seq["n"] == 1 else OTHER_TAB
-            return {"ok": True, "connection_token": "tok-1",
-                    "result": f"✓ opened + switched to tab {tab}\n"}
-        return {"ok": True, "connection_token": "tok-1", "result": ""}
-    router["state"] = state_handler
-    assert _open(ctx, session=SESSION)["tab_id"] == TAB
-    assert _open(ctx, session="sess-2")["tab_id"] == OTHER_TAB
+    fake_backend(router)
+    assert _open(ctx, router, session=SESSION)["success"]
+    assert _open(ctx, router, session="sess-2")["success"]
     calls.clear()
     ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
-    closed = [c[1]["target_id"] for c in calls
-              if c[1].get("op") == "close-tab"]
+    closed = [c[1]["target_id"] for c in calls if c[1].get("op") == "close-tab"]
     assert closed == [TAB]  # exactly the one owned tab
-    # foreign binding intact and operable by its owner
-    out = json.loads(ctx.tool("browser_close", {"tab_id": OTHER_TAB},
-                              session_id="sess-2", task_id=TASK))
-    assert out["success"] and out["closed"] is True
+    out = _snapshot(ctx, session="sess-2")
+    assert out["success"]  # foreign tab intact and operable by its owner
+    assert calls[-1][1]["steps"][0]["target_id"] == OTHER_TAB
 
 
 def test_cleanup_records_error_without_retry_and_still_clears(browser, caplog):
     ctx, calls, router, _ = browser
-
-    def state_handler(a):
-        if a.get("op") == "open-tab":
-            return {"ok": True, "connection_token": "tok-1",
-                    "result": f"✓ opened + switched to tab {TAB}\n"}
-        if a.get("op") == "close-tab":
-            return {"ok": False, "error": "host refused: tab pinned"}
-        return {"ok": True, "connection_token": "tok-1", "result": ""}
-    router["state"] = state_handler
-    assert _open(ctx)["success"]
+    backend = fake_backend(router)
+    assert _open(ctx, router)["success"]
+    backend.state_override["close-tab"] = lambda a: {
+        "ok": False, "error": "host refused: tab pinned"}
     calls.clear()
     with caplog.at_level("WARNING"):
         ctx.hook("on_session_finalize", session_id=SESSION, reason="cli_exit")
     close_ops = [c for c in calls if c[1].get("op") == "close-tab"]
     assert len(close_ops) == 1  # one honest attempt, never retried or replayed
     assert "outcome=error" in caplog.text and "tab pinned" in caplog.text
-    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "not owned" in out["error"]  # still cleared
+    assert "browser_navigate" in _snapshot(ctx)["error"]  # still cleared
 
 
 def test_cleanup_records_unknown_outcome_without_retry(browser, caplog):
     ctx, calls, router, _ = browser
+    backend = fake_backend(router)
+    assert _open(ctx, router)["success"]
 
-    def state_handler(a):
-        if a.get("op") == "open-tab":
-            return {"ok": True, "connection_token": "tok-1",
-                    "result": f"✓ opened + switched to tab {TAB}\n"}
-        if a.get("op") == "close-tab":
-            raise RuntimeError("transport severed mid-call")
-        return {"ok": True, "connection_token": "tok-1", "result": ""}
-    router["state"] = state_handler
-    assert _open(ctx)["success"]
+    def severed(a):
+        raise RuntimeError("transport severed mid-call")
+    backend.state_override["close-tab"] = severed
     calls.clear()
     with caplog.at_level("WARNING"):
         ctx.hook("on_session_finalize", session_id=SESSION, reason="end")
     close_ops = [c for c in calls if c[1].get("op") == "close-tab"]
     assert len(close_ops) == 1  # unknown outcome recorded, never retried
     assert "outcome=unknown" in caplog.text and "transport severed" in caplog.text
-    out = json.loads(ctx.tool("browser_close", {"tab_id": TAB},
-                              session_id=SESSION, task_id=TASK))
-    assert out["success"] is False and "not owned" in out["error"]
+    assert "browser_navigate" in _snapshot(ctx)["error"]
 
 
 def test_fresh_session_starts_empty_after_cleanup(browser):
     ctx, calls, router, _ = browser
-    router["state"] = _open_state_router()
-    assert _open(ctx)["success"]
+    fake_backend(router, tabs=(TAB, TAB))
+    assert _open(ctx, router)["success"]
     assert _declare(ctx)["success"]
     ctx.hook("on_session_reset", session_id=SESSION, reason="reset")
-    fresh = json.loads(ctx.tool(
-        "browser_open", {"url": "http://y"},
-        session_id="sess-2", task_id=TASK))
-    assert fresh["success"] and fresh["tab_id"] == TAB
+    assert _open(ctx, router, session="sess-2")["success"]
     fresh_scenario = json.loads(ctx.tool(
         "browser_scenario",
         {"action": "declare", "scenario_id": "s1", "sources": ["fixture.html"],
