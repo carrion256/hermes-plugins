@@ -46,11 +46,20 @@ def _failed_load(isolated_hermes, settings):
     return isolated_hermes.manager._plugins[PLUGIN_ID]
 
 
+class _FakeState:
+    def __init__(self):
+        self.store = {}
+
+    def set(self, key, value):
+        self.store[key] = value
+
+
 class _FakeCtx:
     def __init__(self, with_seam=True):
         self.tools = {}
         self.resolver = None
         self.plugin_id = PLUGIN_ID
+        self.state = _FakeState()
         if with_seam:
             self.register_role_resolver = self._register_role_resolver
 
@@ -99,6 +108,39 @@ def test_invalid_settings_fail_registration_naming_the_key(
     loaded = _failed_load(isolated_hermes, settings)
     assert not loaded.enabled
     assert offending in (loaded.error or "")
+
+
+def test_non_mapping_settings_raises_value_error_naming_the_problem(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "model_routing_unit", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_entry_settings", lambda ctx: "settings-as-a-string")
+    with pytest.raises(ValueError, match="settings"):
+        mod.register(_FakeCtx())
+
+
+def test_string_settings_fails_native_registration_naming_the_problem(isolated_hermes):
+    loaded = _failed_load(isolated_hermes, "settings-as-a-string")
+    assert not loaded.enabled
+    assert "settings" in (loaded.error or "")
+
+
+def test_none_settings_loads_idle_native(isolated_hermes):
+    loaded = _failed_load(isolated_hermes, None)
+    assert loaded.enabled
+
+
+def test_absent_settings_loads_idle_unit(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "model_routing_unit", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_entry_settings", lambda ctx: None)
+    ctx = _FakeCtx()
+    mod.register(ctx)
+    assert callable(ctx.resolver)
+    assert _status(ctx)["config"]["roles"] == {}
 
 
 def test_valid_config_loads_and_reports(isolated_hermes, load_plugin):
@@ -279,10 +321,31 @@ def test_route_apply_writes_only_the_listed_keys(routing):
 
 
 def test_route_apply_is_idempotent_and_drift_free(routing):
-    _json(routing, "route_apply", {"apply": True})
+    applied = _json(routing, "route_apply", {"apply": True})
+    assert applied["applied"] is True
+    assert applied["written"]
+    assert applied["provenance"]
     again = _json(routing, "route_apply")
     assert again["dry_run"] is True
     assert again["diff"] == {}
+
+
+def test_failing_config_writer_persists_no_marker(monkeypatch):
+    """A writer failure must leave applied False, error set, no provenance
+    key, and no marker in the state store — the custody trail never claims a
+    materialization that did not reach disk."""
+    import hermes_cli.config as host_config
+
+    def boom(path, data, **_kw):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(host_config, "atomic_config_write", boom)
+    _mod, ctx = _unit(monkeypatch, APPLY_SETTINGS)
+    receipt = json.loads(ctx.tools["route_apply"]({"apply": True}))
+    assert receipt["applied"] is False
+    assert "RuntimeError: disk on fire" in receipt["error"]
+    assert receipt.get("provenance") is None
+    assert ctx.state.store == {}
 
 
 # --- guard -------------------------------------------------------------------

@@ -389,10 +389,22 @@ def register(ctx) -> None:
     # (config child_prewalk). The child's goal rides its first user message;
     # the plan nudge fires once on that same first turn.
     def on_subagent_start(child_session_id: str = "", **_kw):
-        if child_prewalk and child_session_id and child_session_id not in handed_off:
-            target = _resolve_target(_bound_agent())
-            if target:
-                armed.setdefault(child_session_id, target)
+        if (child_prewalk and child_session_id
+                and child_session_id not in handed_off
+                and child_session_id not in armed):
+            agent = _bound_agent()
+            target = _resolve_target(agent)
+            if not target:
+                return
+            # Same ARM-time gate as prewalk_arm: cross-provider targets are
+            # validated (seam present + dry-run resolvable); a refused
+            # child lane simply stays un-armed, loudly.
+            problem = _cross_provider_problem(target, agent)
+            if problem:
+                logger.warning("prewalk: refusing to arm child %s: %s",
+                               child_session_id, problem)
+                return
+            armed.setdefault(child_session_id, target)
 
     ctx.register_hook("subagent_start", on_subagent_start)
 

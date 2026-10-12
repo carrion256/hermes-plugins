@@ -41,18 +41,21 @@ _RECEIPT_KEYS = ("resolved", "role", "model", "provider", "source", "reason")
 _REVIEW_SURFACES = ("curator", "background_review", "review")
 
 
-def _entry_settings(ctx) -> dict | None:
-    """This plugin's ``plugins.entries.<id>.settings`` mapping via the host
-    config API; ``None`` when the host API is unavailable. The WHOLE mapping
-    is the single settings source so unknown keys are visible to validation."""
+def _entry_settings(ctx):
+    """This plugin's raw ``plugins.entries.<id>.settings`` value via the host
+    config API: a mapping, ``None`` when absent or the host API is unavailable,
+    or whatever malformed value is on disk — ``_read_settings`` decides which
+    is which, so a present-but-broken settings block fails loud instead of
+    silently loading idle."""
     plugin_id = getattr(ctx, "plugin_id", None) or "model-routing"
     try:
         from hermes_cli.config import load_config_readonly
         entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
-        settings = (entries.get(plugin_id) or {}).get("settings")
+        entry = entries.get(plugin_id)
+        settings = entry.get("settings") if isinstance(entry, dict) else None
     except Exception:  # host API unavailable — degrade to an idle plugin
         return None
-    return settings if isinstance(settings, dict) else {}
+    return settings
 
 
 def _known_providers() -> set[str] | None:
@@ -96,8 +99,12 @@ def _read_settings(ctx) -> dict:
     key on any misconfiguration (fail-loud at registration)."""
     raw = _entry_settings(ctx)
     if raw is None:
-        logger.warning("model-routing: settings enumeration unavailable; loading idle")
         raw = {}
+    elif not isinstance(raw, dict):
+        raise ValueError(
+            "model-routing: 'settings' must be a mapping of setting name -> value, "
+            f"got {type(raw).__name__}"
+        )
     unknown = set(raw) - _SETTINGS_FIELDS
     if unknown:
         raise ValueError(
@@ -317,16 +324,21 @@ def register(ctx) -> None:
             receipt["error"] = f"{type(exc).__name__}: {exc}"
         receipt["applied"] = "error" not in receipt
         receipt["written"] = sorted(written)
-        marker = {"plugin": "model-routing",
-                  "roles": {name: dict(spec) for name, spec in sorted(roles.items())},
-                  "keys": sorted(key for _k, key, _v in pins),
-                  "applied_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        receipt["provenance"] = marker
-        state = getattr(ctx, "state", None)
-        try:
-            state.set("route_apply", marker)
-        except Exception:
-            logger.warning("model-routing: provenance marker not persisted", exc_info=True)
+        if receipt["applied"] and written:
+            state = getattr(ctx, "state", None)
+            if state is None:
+                logger.warning("model-routing: provenance marker unavailable")
+            else:
+                marker = {"plugin": "model-routing",
+                          "roles": {name: dict(spec) for name, spec in sorted(roles.items())},
+                          "keys": sorted(key for _k, key, _v in pins),
+                          "applied_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                try:
+                    state.set("route_apply", marker)
+                except Exception:
+                    logger.warning("model-routing: provenance marker not persisted", exc_info=True)
+                else:
+                    receipt["provenance"] = marker
         return json.dumps(receipt, sort_keys=True)
 
     ctx.register_tool(

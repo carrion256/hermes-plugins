@@ -291,9 +291,10 @@ def test_implicit_review_reviewer_refusal_inherits(load_plugin, fake_runtimes, b
     load_plugin("model-routing", settings={"roles": {}, "fallback": "refuse"})
     parent = _delegate_parent()
 
-    out = dt.delegate_task(  # no explicit model_role: /review defaults to 'reviewer'
-        goal="review this diff, implicit reviewer refused",
-        background=True, parent_agent=parent, credentials_cfg={},
+    out = dt.delegate_task(  # production /review shape (agent/review_engine.start_review):
+        goal="review this diff, implicit reviewer refused",   # unpinned auxiliary.review +
+        background=True, parent_agent=parent,                 # review_surface arms the
+        credentials_cfg=None, review_surface=True,            # implicit 'reviewer' lookup
     )
 
     assert json.loads(out)["status"] == "dispatched"  # the /review child spawned
@@ -304,6 +305,39 @@ def test_implicit_review_reviewer_refusal_inherits(load_plugin, fake_runtimes, b
     assert record["capability_posture"] == "inherited"
     assert record["model_role"] == "reviewer"
     assert record["receipt"]["source"] == "refused"  # honest audit of the refusal
+
+
+def test_review_surface_routes_unpinned_review_child_to_reviewer_provider(load_plugin, fake_runtimes,
+                                                                          builds, runs):
+    """Unpinned auxiliary.review on the production /review call shape: the real
+    roles.reviewer route sends the review child to the reviewer provider with
+    the destination runtime's own trust map."""
+    load_plugin("model-routing", settings={"roles": ROLES})
+    parent = _delegate_parent()
+
+    out = dt.delegate_task(
+        goal="review this diff against the contract",
+        background=True, parent_agent=parent,
+        credentials_cfg=None, review_surface=True,  # exactly start_review's call
+    )
+
+    assert json.loads(out)["status"] == "dispatched"
+    kwargs = builds[0]
+    assert kwargs["model"] == REVIEWER_MODEL
+    assert kwargs["override_provider"] == DEST_PROVIDER
+    assert kwargs["override_base_url"] == f"https://{DEST_PROVIDER}.example/v1"
+    assert kwargs["override_api_key"] == "dest-key"
+    assert kwargs["override_api_mode"] == "chat_completions"
+    assert kwargs["override_capabilities"] == DEST_CAPS
+    assert "openai_native_compaction" not in kwargs["override_capabilities"]
+    record = dt.recent_spawn_routes()[-1]
+    assert record["capability_posture"] == "destination"
+    assert record["model_role"] == "reviewer"
+    assert record["child_model"] == REVIEWER_MODEL
+    assert record["child_provider"] == DEST_PROVIDER
+    assert set(record["receipt"]) == SIX_KEYS
+    assert record["receipt"]["source"] == "route"
+    assert record["receipt"]["model"] == REVIEWER_MODEL
 
 
 # --- 3. prewalk + model-routing ------------------------------------------------

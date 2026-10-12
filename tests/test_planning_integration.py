@@ -662,6 +662,68 @@ def test_replan_restores_original_model_and_provider(load_plugin, live_agent,
         assert st["original_provider"] == "openai"
 
 
+def test_child_lane_not_armed_cross_provider_without_seam(load_plugin, live_agent,
+                                                          monkeypatch):
+    agent = live_agent
+    from hermes_cli.plugins import PluginContext
+    # deterministic regardless of whether the host has grown the seams
+    monkeypatch.delattr(PluginContext, "switch_agent_model", raising=False)
+    monkeypatch.delattr(PluginContext, "resolve_role_model", raising=False)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    with bind_subagent_parent(agent):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="carry the plan")
+        # refused at ARM time: the child lane stays un-armed, loudly
+        st = json.loads(h.tool("prewalk_status", {}, session_id="c1"))
+        assert st["state"] == "inactive"
+        assert h.hook("pre_llm_call", session_id="c1", user_message="carry the plan",
+                      is_first_turn=True) == []
+        assert agent.model == "strong-planner"  # no switch attempted
+
+
+def test_child_lane_not_armed_when_dry_run_unresolvable(load_plugin, live_agent,
+                                                        monkeypatch, caplog):
+    import logging
+    agent = live_agent
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    calls = _fake_switch_seam(monkeypatch, dry_run_ok=False)
+    caplog.set_level(logging.WARNING)
+    with bind_subagent_parent(agent):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="carry the plan")
+        # the resolvability probe ran (was not skipped) and refused
+        assert calls and all(c["dry_run"] for c in calls)
+        assert calls[0]["provider"] == "anthropic"
+        st = json.loads(h.tool("prewalk_status", {}, session_id="c1"))
+        assert st["state"] == "inactive"
+        # refusal is logged, never silent
+        assert "refusing to arm child c1" in caplog.text
+        assert "anthropic" in caplog.text
+
+
+def test_child_lane_armed_when_cross_provider_resolvable(load_plugin, live_agent,
+                                                         monkeypatch):
+    agent = live_agent
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="carry the plan")
+        # validated via dry run: the child lane arms
+        assert [c for c in calls if c["dry_run"]]
+        st = json.loads(h.tool("prewalk_status", {}, session_id="c1"))
+        assert st["state"] == "armed"
+        assert st["target_provider"] == "anthropic"
+        assert st["target_source"] == "explicit"
+        # the plan nudge fires once on the child's first turn
+        assert h.hook("pre_llm_call", session_id="c1", user_message="carry the plan",
+                      is_first_turn=True)
+        assert agent.model == "strong-planner"  # arming never switches
+
+
 # --- subagent-effort (pure shadow) ---------------------------------------------
 
 
