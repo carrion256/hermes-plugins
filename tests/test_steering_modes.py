@@ -244,6 +244,17 @@ def test_magic_keywords_ignored_outside_prose(steering):
         assert _turn(steering, message, turn_id=f"t{i}") == []
 
 
+def test_orchestrate_guidance_documents_model_role_routing(load_plugin):
+    harness = load_plugin("keyword-steering", settings={})
+    results = _turn(harness, "orchestrate the migration please")
+    assert len(results) == 1
+    guidance = results[0]["context"]
+    # Deterministic routing guidance: delegate tasks carry model_role,
+    # route_status is the role registry.
+    assert "delegate tasks may pass `model_role`" in guidance
+    assert "`route_status` tool lists the configured roles" in guidance
+
+
 def test_ultrathink_calls_set_turn_reasoning_and_reports_applied(load_plugin, monkeypatch):
     from hermes_cli.plugins import PluginContext
     calls = []

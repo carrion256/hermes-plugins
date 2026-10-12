@@ -9,15 +9,21 @@ workspace paths that actually exist, symbols/callers, constraints,
 non-goals, chosen approach, rejected alternatives, falsification checks,
 replan triggers and acceptance IDs, on top of a genuine native todo plan
 (real agent._todo_store checked, not tool args). The first successful
-edit/write NEVER switches. The switch uses Hermes' NATIVE live switch
-(agent_runtime_helpers.switch_model on the currently-bound agent, invoked
-from prewalk_ready itself); switch_model rebuilds clients/caching/
-compressor/reasoning_config with rollback on failure. Provider kwargs are
-never rewritten and there is NO cross-provider routing: the target model
-must be served by the same endpoint (provider/base_url/api_mode/api_key are
-kept as-is). An operator-enabled, bounded replan (default off) can return
-the session to the ORIGINAL model once, only with a concrete disconfirmed
-assumption/check — never automatic oscillation. Zero extra LLM calls.
+edit/write NEVER switches. The switch runs on the currently-bound agent,
+invoked from prewalk_ready itself. Same-endpoint targets (no
+target_provider, or one equal to the agent's provider) keep Hermes'
+NATIVE agent_runtime_helpers.switch_model path (provider/base_url/
+api_mode/api_key kept as-is; switch_model rebuilds clients/caching/
+compressor/reasoning_config with rollback on failure). Cross-provider
+targets — target_provider naming a different provider, or a routed
+executor role resolved through the host PluginContext.resolve_role_model
+seam — are validated at ARM time via PluginContext.switch_agent_model
+(dry run) and handed off through that seam, which owns credential
+reload, destination capabilities, and rollback; provider kwargs are
+never rewritten on the native path. An operator-enabled, bounded
+replan (default off) can return the session to the ORIGINAL model AND
+provider once, only with a concrete disconfirmed assumption/check —
+never automatic oscillation. Zero extra LLM calls.
 
 Session identity follows the native active-agent binding: the turn facade
 binds ``bind_subagent_parent(self)`` around the whole conversation
@@ -177,20 +183,23 @@ def _bound_agent():
 
 def register(ctx) -> None:
     target_model = (ctx.get_config("target_model", "") or "").strip()
+    target_provider = (ctx.get_config("target_provider", "") or "").strip()
     do_nudge = bool(ctx.get_config("plan_nudge", True))
     # OMP parity: delegated (bundled "task") agents prewalk by default.
     child_prewalk = bool(ctx.get_config("child_prewalk", True))
     todo_gate = bool(ctx.get_config("todo_gate", True))
     # Operator opt-in only: bounded one-shot replan back to the ORIGINAL
-    # model. Default stays OFF; the handoff itself never oscillates.
+    # model AND provider. Default stays OFF; the handoff itself never oscillates.
     replan_enabled = bool(ctx.get_config("replan_enabled", False))
     # ponytail: per-process in-memory state; if handoff state ever must
     # survive restarts, persist per-session rows in the session DB instead.
-    armed: dict[str, str] = {}        # session_id -> target while planning
+    armed: dict[str, dict] = {}      # session_id -> resolved target while planning
     handed_off: set[str] = set()      # completed the one-way handoff
     nudged: set[str] = set()          # plan nudge already injected (one-shot)
     ready_handoffs: dict[str, dict] = {}   # session_id -> validated handoff
     original_models: dict[str, str] = {}   # session_id -> planner model at handoff
+    original_providers: dict[str, str] = {}  # session_id -> planner provider at handoff
+    session_targets: dict[str, dict] = {}    # session_id -> target used at handoff (status)
     replan_used: set[str] = set()          # bounded: one replan per session, ever
 
     # Live agent object -> session id last seen for it. Compaction rotation
@@ -200,6 +209,54 @@ def register(ctx) -> None:
     # rotation origin — migrating on it would steal the parent's armed
     # state into the child. Track each bound agent's own identity instead.
     _agent_session = weakref.WeakKeyDictionary()
+
+    def _resolve_target(agent) -> dict | None:
+        """Handoff target precedence: explicit target_model(+target_provider)
+        > route 'executor' receipt > none. Returns {"model","provider",
+        "source"} or None; never raises."""
+        if target_model:
+            return {"model": target_model, "provider": target_provider,
+                    "source": "explicit"}
+        resolver = getattr(ctx, "resolve_role_model", None)
+        if callable(resolver):
+            try:
+                receipt = resolver("executor", agent=agent)
+            except Exception as exc:  # host contract: never raises; stay defensive
+                logger.warning("prewalk: executor route lookup failed (%s)", exc)
+                receipt = None
+            if isinstance(receipt, dict) and receipt.get("source") == "route":
+                model = str(receipt.get("model") or "").strip()
+                provider = str(receipt.get("provider") or "").strip()
+                if model:
+                    return {"model": model, "provider": provider, "source": "route"}
+        return None
+
+    def _agent_provider(agent) -> str:
+        return str(getattr(agent, "provider", "") or "") if agent is not None else ""
+
+    def _cross_provider_problem(target: dict, agent) -> str | None:
+        """ARM-time validation for cross-provider targets: the destination
+        must be resolvable through the host switch_agent_model seam (dry
+        run). Returns an actionable refusal reason, or None to arm."""
+        provider = target.get("provider", "")
+        if not provider or provider == _agent_provider(agent):
+            return None
+        seam = getattr(ctx, "switch_agent_model", None)
+        if not callable(seam):
+            return (f"cross-provider target {target['model']} on provider "
+                    f"'{provider}' requires the host switch_agent_model seam; "
+                    f"this host does not provide it — set target_provider to "
+                    f"the current provider or upgrade the host")
+        try:
+            receipt = seam(target["model"], provider,
+                           reason="prewalk arm validation", dry_run=True, agent=agent)
+        except Exception as exc:  # defensive: the seam must not raise
+            receipt = {"resolvable": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(receipt, dict) or receipt.get("resolvable") is not True:
+            detail = (str(receipt.get("reason") or "malformed receipt")
+                      if isinstance(receipt, dict) else "malformed receipt")
+            return f"prewalk target provider '{provider}' is not resolvable: {detail}"
+        return None
 
     def _migrate(session_id: str) -> None:
         agent = _bound_agent()
@@ -218,7 +275,7 @@ def register(ctx) -> None:
             if origin in s:
                 s.discard(origin)
                 s.add(session_id)
-        for d in (ready_handoffs, original_models):
+        for d in (ready_handoffs, original_models, original_providers, session_targets):
             if origin in d:
                 d[session_id] = d.pop(origin)
         logger.info("prewalk: session %s -> %s (agent rotation); state carried forward",
@@ -230,11 +287,15 @@ def register(ctx) -> None:
         nudged.discard(session_id)
         ready_handoffs.pop(session_id, None)
         original_models.pop(session_id, None)
+        original_providers.pop(session_id, None)
+        session_targets.pop(session_id, None)
         replan_used.discard(session_id)
 
     def prewalk_arm(session_id: str = "", **_kw) -> str:
         _migrate(session_id)
-        if not target_model:
+        agent = _bound_agent()
+        target = _resolve_target(agent)
+        if target is None:
             return json.dumps({"success": False, "error": "prewalk target_model not configured"})
         if session_id in handed_off or session_id in armed:
             return json.dumps({"success": False, "error": "prewalk already armed/handed off for this session"})
@@ -242,11 +303,19 @@ def register(ctx) -> None:
             # Bounded: the one permitted replan was already spent; no
             # arm->ready->replan->arm oscillation.
             return json.dumps({"success": False, "error": "prewalk replan budget spent for this session"})
-        armed[session_id] = target_model
-        logger.info("prewalk: armed session %s -> %s", session_id, target_model)
+        problem = _cross_provider_problem(target, agent)
+        if problem:
+            logger.warning("prewalk: refusing to arm session %s: %s", session_id, problem)
+            return json.dumps({"success": False, "error": problem})
+        armed[session_id] = target
+        logger.info("prewalk: armed session %s -> %s (%s)",
+                    session_id, target["model"], target["provider"] or "same provider")
         # The tool result carries the nudge so the planner sees it THIS turn,
         # before the next pre_llm_call (which would only fire next turn).
-        return json.dumps({"success": True, "armed": True, "target": target_model,
+        return json.dumps({"success": True, "armed": True,
+                           "target": target["model"],
+                           "target_provider": target["provider"],
+                           "target_source": target["source"],
                            "plan_nudge": NUDGE})
 
     ctx.register_tool(
@@ -266,10 +335,16 @@ def register(ctx) -> None:
             state = "armed"
         else:
             state = "inactive"
+        target = (armed.get(session_id) or session_targets.get(session_id)
+                  or _resolve_target(_bound_agent()))
         return json.dumps({"success": True, "session_id": session_id, "state": state,
-                           "target": target_model,
+                           "target": target["model"] if target else target_model,
+                           "target_model": target["model"] if target else target_model,
+                           "target_provider": target["provider"] if target else "",
+                           "target_source": target["source"] if target else "",
                            "handoff": bool(ready_handoffs.get(session_id)),
                            "original_model": original_models.get(session_id),
+                           "original_provider": original_providers.get(session_id),
                            "replan_available": (bool(replan_enabled)
                                                  and session_id in handed_off
                                                  and session_id not in replan_used),
@@ -314,8 +389,10 @@ def register(ctx) -> None:
     # (config child_prewalk). The child's goal rides its first user message;
     # the plan nudge fires once on that same first turn.
     def on_subagent_start(child_session_id: str = "", **_kw):
-        if child_prewalk and target_model and child_session_id and child_session_id not in handed_off:
-            armed.setdefault(child_session_id, target_model)
+        if child_prewalk and child_session_id and child_session_id not in handed_off:
+            target = _resolve_target(_bound_agent())
+            if target:
+                armed.setdefault(child_session_id, target)
 
     ctx.register_hook("subagent_start", on_subagent_start)
 
@@ -328,42 +405,64 @@ def register(ctx) -> None:
             return None
 
         ctx.register_hook("pre_llm_call", nudge)
-    def _switch(session_id: str, reason: str, model: str = "") -> bool:
+    def _switch(session_id: str, reason: str, model: str = "",
+                provider: str = "") -> tuple[bool, str]:
         target = model or target_model
+        dest_provider = provider if model else target_provider
         agent = _bound_agent()
         if agent is None or getattr(agent, "session_id", None) != session_id:
-            # No live bound agent for THIS session: refuse, stay armed, and
-            # let the next prewalk_ready retry. Never rewrite provider kwargs.
             logger.warning("prewalk: session %s has no live bound agent; staying armed", session_id)
-            return False
+            return False, "no live bound agent for this session"
         if getattr(agent, "_persist_disabled", False):
             logger.warning("prewalk: session %s agent is detached (_persist_disabled); staying armed",
                            session_id)
-            return False
-        # Capture the planner's own model before the native switch so a
-        # bounded replan can return to EXACTLY this model (same endpoint).
+            return False, "agent is detached (_persist_disabled)"
         original_models.setdefault(session_id, str(getattr(agent, "model", "") or ""))
-        try:
-            from agent.agent_runtime_helpers import switch_model
-            switch_model(
-                agent, target, getattr(agent, "provider", "") or "",
-                api_key=getattr(agent, "api_key", "") or "",
-                base_url=getattr(agent, "base_url", "") or "",
-                api_mode=getattr(agent, "api_mode", "") or "",
-            )
-        except Exception:
-            logger.warning("prewalk: live switch to %s failed for session %s; staying armed",
-                           target, session_id, exc_info=True)
-            return False
+        original_providers.setdefault(session_id, str(getattr(agent, "provider", "") or ""))
+        seam = getattr(ctx, "switch_agent_model", None)
+        if callable(seam):
+            try:
+                receipt = seam(target, dest_provider, reason=reason, agent=agent)
+            except Exception as exc:
+                logger.warning("prewalk: switch_agent_model raised for session %s (%s)",
+                               session_id, exc)
+                return False, f"switch_agent_model raised: {type(exc).__name__}: {exc}"
+            if not isinstance(receipt, dict):
+                logger.warning("prewalk: malformed receipt from switch_agent_model "
+                               "for session %s; staying armed", session_id)
+                return False, "malformed receipt from switch_agent_model"
+            if receipt.get("switched") is not True:
+                detail = str(receipt.get("reason") or "switch_agent_model declined the switch")
+                logger.warning("prewalk: switch_agent_model declined for session %s: %s",
+                               session_id, detail)
+                return False, detail
+        else:
+            # No host seam: native same-endpoint path only — provider kwargs
+            # are never rewritten here.
+            if dest_provider and dest_provider != str(getattr(agent, "provider", "") or ""):
+                return False, (f"cross-provider switch to '{dest_provider}' requires the "
+                               f"host switch_agent_model seam")
+            try:
+                from agent.agent_runtime_helpers import switch_model
+                switch_model(
+                    agent, target, getattr(agent, "provider", "") or "",
+                    api_key=getattr(agent, "api_key", "") or "",
+                    base_url=getattr(agent, "base_url", "") or "",
+                    api_mode=getattr(agent, "api_mode", "") or "",
+                )
+            except Exception:
+                logger.warning("prewalk: live switch to %s failed for session %s; staying armed",
+                               target, session_id, exc_info=True)
+                return False, f"native switch_model failed for session {session_id}"
         handed_off.add(session_id)
         armed.pop(session_id, None)
-        logger.info("prewalk: handed off session %s -> %s via %s",
-                    session_id, target, reason)
-        return True
+        logger.info("prewalk: handed off session %s -> %s via %s", session_id, target, reason)
+        return True, ""
 
     def prewalk_ready(args=None, session_id: str = "", **_kw) -> str:
         """The ONLY handoff path: validated full handoff + genuine native
-        plan, switched via the native same-endpoint switch_model."""
+        plan, switched live (host seam when present, native same-endpoint
+        switch_model otherwise)."""
         _migrate(session_id)
         if session_id not in armed or session_id in handed_off:
             return json.dumps({"success": False,
@@ -386,11 +485,20 @@ def register(ctx) -> None:
                                    "error": "genuine native todo plan required before ready "
                                             "(non-empty native todo store not observed for this session)"})
         handoff = _compact_handoff(args)
-        if not _switch(session_id, "prewalk_ready"):
+        target = armed.get(session_id) or {}
+        switched, detail = _switch(session_id, "prewalk_ready",
+                                   model=str(target.get("model") or target_model),
+                                   provider=str(target.get("provider") or ""))
+        if not switched:
             return json.dumps({"success": False,
-                               "error": "native live switch unavailable; session stays armed"})
+                               "error": f"live switch unavailable or refused ({detail}); "
+                                        f"session stays armed"})
+        session_targets[session_id] = dict(target)
         ready_handoffs[session_id] = handoff
-        return json.dumps({"success": True, "handed_off": True, "target": target_model,
+        return json.dumps({"success": True, "handed_off": True,
+                           "target": target.get("model") or target_model,
+                           "target_provider": target.get("provider", ""),
+                           "target_source": target.get("source", ""),
                            "handoff": handoff})
 
     ctx.register_tool(
@@ -418,8 +526,9 @@ def register(ctx) -> None:
     )
 
     def prewalk_replan(args=None, session_id: str = "", **_kw) -> str:
-        """Bounded, operator-gated return to the ORIGINAL model with the
-        concrete disconfirmed assumption/check. Never oscillates."""
+        """Bounded, operator-gated return to the ORIGINAL model AND
+        provider with the concrete disconfirmed assumption/check. Never
+        oscillates."""
         _migrate(session_id)
         args = args if isinstance(args, dict) else {}
         if not replan_enabled:
@@ -435,16 +544,22 @@ def register(ctx) -> None:
         if not original:
             return json.dumps({"success": False,
                                "error": "no original planner model recorded for this session"})
+        original_provider = str(original_providers.get(session_id) or "")
         assumption = str(args.get("failed_assumption") or "").strip()
         failed_check = str(args.get("failed_check") or "").strip()
         if not assumption or not failed_check:
             return json.dumps({"success": False,
                                "error": "replan requires a concrete failed_assumption and failed_check"})
-        if not _switch(session_id, "prewalk_replan", model=original):
+        switched, detail = _switch(session_id, "prewalk_replan",
+                                   model=original, provider=original_provider)
+        if not switched:
             return json.dumps({"success": False,
-                               "error": "native live switch back to the original model failed"})
+                               "error": f"live switch back to the original model failed "
+                                        f"({detail})"})
         replan_used.add(session_id)
-        return json.dumps({"success": True, "replanned": True, "original_model": original,
+        return json.dumps({"success": True, "replanned": True,
+                           "original_model": original,
+                           "original_provider": original_provider,
                            "failed_assumption": assumption, "failed_check": failed_check})
 
     ctx.register_tool(

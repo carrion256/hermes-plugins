@@ -56,7 +56,10 @@ _MAGIC_GUIDANCE = {
         "Magic keyword 'orchestrate' is active this turn (built-in, "
         "OMP-compatible; whole-word match in prose): fan out independent work "
         "through delegation and parallel subagents where possible — the host "
-        "has a delegate tool — and batch independent requests."
+        "has a delegate tool — and batch independent requests. When model "
+        "routing is configured, delegate tasks may pass `model_role` to "
+        "request a configured role, and the `route_status` tool lists the "
+        "configured roles."
     ),
     "workflow": (
         "Magic keyword 'workflow' is active this turn (built-in, "

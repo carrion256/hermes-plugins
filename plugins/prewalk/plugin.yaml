@@ -1,6 +1,6 @@
 name: prewalk
-version: 0.5.0
-description: "One-way model handoff driven ONLY by prewalk_ready: strong model plans, validated evidence-backed handoff switches to the cheap execution model via the native live switch (no implicit first-write switch; optional bounded operator-enabled replan back to the original model)."
+version: 0.6.0
+description: "One-way model handoff driven ONLY by prewalk_ready: strong model plans, validated evidence-backed handoff switches to the cheap execution model via the native live switch or the host cross-provider switch seam (no implicit first-write switch; optional bounded operator-enabled replan back to the original model AND provider)."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -19,7 +19,11 @@ config_schema:
   target_model:
     type: str
     default: ""
-    description: "Cheap/execution model id (must be served by the same provider/endpoint as the planning model)."
+    description: "Cheap/execution model id. When unset, the host route for the 'executor' role (PluginContext.resolve_role_model) supplies the target; with neither configured, prewalk refuses to arm. If the target provider is set (or routed) to a provider other than the planner's own, the destination is validated at arm time and the handoff goes through the host cross-provider switch seam; with the seam absent, cross-provider targets are refused at arm with the provider named. Same-provider targets use the native live switch unchanged."
+  target_provider:
+    type: str
+    default: ""
+    description: "Optional provider for the handoff target (empty = the planner's current provider/endpoint). Cross-provider targets require the host PluginContext.switch_agent_model seam and are dry-run validated at arm; replan then restores the original model AND provider."
   plan_nudge:
     type: bool
     default: true

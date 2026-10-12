@@ -1,0 +1,22 @@
+name: model-routing
+version: 0.1.0
+description: "Explicit config-only model routing: a validated role -> {model, provider} table, deterministic resolution with a single fallback policy (inherit | refuse), and inspectable resolution (stable config/effective plus an append-only audit ring via route_status). route_apply materializes the table into the host's explicit pins (prewalk target, delegation.model/provider, the auxiliary review bindings) through the native config writers, dry-run by default, with a provenance marker and no touch of unrelated keys. The plugin never selects a model by measurement or inference: a role not present in the table has no route. Registers its resolver through the host register_role_resolver seam when available; without the seam the plugin still loads and route_status reports host_seam: unavailable."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - route_status
+  - route_apply
+config_schema:
+  roles:
+    type: dict
+    default: {}
+    description: "Mapping of role name -> {model: required non-empty string, provider: optional non-empty string}. Role names must match [a-z][a-z0-9_-]*; omitted provider means the parent agent's provider (parentless: the config main provider). Providers are validated against the host's known/configured providers at registration (no network); unknown providers, malformed or unknown keys fail registration loudly naming the offending key."
+  fallback:
+    type: str
+    default: inherit
+    description: "Policy for role requests the table does not answer: inherit (default; parent model keeps running, reason names the unknown role) or refuse (the explicit delegate request is rejected with the reason). Unknown fallback values fail registration."
+  delegation_role:
+    type: str
+    default: ""
+    description: "Optional role name used by route_apply to materialize the delegation.model/provider pins (skipped when unset; the role must exist in the table). Materialization only: pin precedence (explicit > route > inherit) is host policy."

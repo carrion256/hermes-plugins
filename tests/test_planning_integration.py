@@ -436,6 +436,232 @@ def test_child_inherits_planning_lane_with_goal(load_plugin, no_live_agent):
     assert h2.hook("pre_llm_call", session_id="child-2", user_message="g") == []
 
 
+# --- prewalk cross-provider routing (target_provider / executor route) ------
+
+
+def _fake_switch_seam(monkeypatch, *, dry_run_ok=True, fail_reason=None):
+    """Fake host PluginContext.switch_agent_model: records calls, dry-runs
+    per the host contract, and applies the switch to the agent on success."""
+    from hermes_cli.plugins import PluginContext
+    calls = []
+
+    def fake(self, model, provider="", *, reason="", dry_run=False, agent=None):
+        calls.append({"model": model, "provider": provider, "reason": reason,
+                      "dry_run": bool(dry_run)})
+        if dry_run:
+            return {"switched": False, "resolvable": bool(dry_run_ok),
+                    "model": model, "provider": provider,
+                    "reason": "ok" if dry_run_ok else
+                              f"no api_key configured for provider '{provider}'"}
+        if fail_reason:
+            return {"switched": False, "reason": fail_reason}
+        agent_provider = str(getattr(agent, "provider", "") or "") if agent is not None else ""
+        if agent is not None:
+            agent.model = model
+            if provider:
+                agent.provider = provider
+        return {"switched": True, "model": model,
+                "provider": provider or agent_provider,
+                "base_url_changed": bool(provider),
+                "capability_posture": "destination", "reason": reason}
+
+    monkeypatch.setattr(PluginContext, "switch_agent_model", fake, raising=False)
+    return calls
+
+
+def _fake_executor_route(monkeypatch, *, model, provider):
+    """Fake host resolve_role_model adapter returning a route receipt."""
+    from hermes_cli.plugins import PluginContext
+    receipt = {"resolved": True, "role": "executor", "model": model,
+               "provider": provider, "source": "route",
+               "reason": "roles.executor configured"}
+
+    def fake(self, role, *, agent=None):
+        return dict(receipt, role=role)
+
+    monkeypatch.setattr(PluginContext, "resolve_role_model", fake, raising=False)
+    return receipt
+
+
+def _planned_todo(agent):
+    from tools.todo_tool import TodoStore, todo_tool
+    agent._todo_store = TodoStore()
+    todo_tool(todos=[{"id": "1", "content": "plan", "status": "pending"}],
+              store=agent._todo_store)
+
+
+def test_explicit_cross_provider_target_hands_off_via_host_seam(load_plugin, live_agent,
+                                                                 workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        armed = json.loads(h.tool("prewalk_arm", {}, session_id="s"))
+        assert armed["success"] is True
+        assert armed["target"] == TARGET
+        assert armed["target_provider"] == "anthropic"
+        assert armed["target_source"] == "explicit"
+        # cross-provider destination validated at ARM time with a dry run
+        dry = [c for c in calls if c["dry_run"]]
+        assert len(dry) == 1
+        assert (dry[0]["model"], dry[0]["provider"]) == (TARGET, "anthropic")
+        handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert handed["success"] is True and handed["handed_off"] is True
+        real = [c for c in calls if not c["dry_run"]]
+        assert len(real) == 1
+        assert (real[0]["model"], real[0]["provider"]) == (TARGET, "anthropic")
+        assert agent.model == TARGET and agent.provider == "anthropic"
+        # the host seam performed the switch; the native same-endpoint
+        # path was never entered
+        agent._create_openai_client.assert_not_called()
+
+
+def test_route_executor_target_used_when_target_model_unset(load_plugin, live_agent,
+                                                            workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={})
+    _fake_executor_route(monkeypatch, model="route-exec", provider="openai")
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        armed = json.loads(h.tool("prewalk_arm", {}, session_id="s"))
+        assert armed["success"] is True
+        assert armed["target"] == "route-exec"
+        assert armed["target_source"] == "route"
+        handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert handed["success"] is True
+        real = [c for c in calls if not c["dry_run"]]
+        assert len(real) == 1
+        assert real[0]["model"] == "route-exec" and real[0]["provider"] == "openai"
+        # same provider as the planner: no dry-run arm validation required
+        assert all(not c["dry_run"] for c in calls)
+        st = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+        assert st["state"] == "handed_off"
+        assert st["target_model"] == "route-exec"
+        assert st["target_provider"] == "openai"
+        assert st["target_source"] == "route"
+
+
+def test_explicit_target_model_beats_executor_route(load_plugin, live_agent,
+                                                    workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    _fake_executor_route(monkeypatch, model="route-exec", provider="openai")
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        armed = json.loads(h.tool("prewalk_arm", {}, session_id="s"))
+        assert armed["target"] == TARGET and armed["target_source"] == "explicit"
+        handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert handed["success"] is True
+        real = [c for c in calls if not c["dry_run"]]
+        assert len(real) == 1
+        assert real[0]["model"] == TARGET and real[0]["provider"] == ""
+        st = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+        assert st["target_source"] == "explicit"
+        agent._create_openai_client.assert_not_called()  # seam handled the switch
+
+
+def test_unresolvable_cross_provider_target_refuses_arm_naming_provider(load_plugin,
+                                                                        live_agent,
+                                                                        monkeypatch):
+    agent = live_agent
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "bedrock"})
+    calls = _fake_switch_seam(monkeypatch, dry_run_ok=False)
+    with bind_subagent_parent(agent):
+        refused = json.loads(h.tool("prewalk_arm", {}, session_id="s"))
+        assert refused["success"] is False
+        assert "bedrock" in refused["error"]
+        assert "no api_key configured" in refused["error"]
+        assert agent.model == "strong-planner"
+        assert json.loads(h.tool("prewalk_status", {}, session_id="s"))["state"] == "inactive"
+        # dry-run probe only: the real switch was never attempted
+        assert calls and all(c["dry_run"] for c in calls)
+
+
+def test_cross_provider_target_without_host_seam_refuses_arm(load_plugin, live_agent,
+                                                             monkeypatch):
+    agent = live_agent
+    from hermes_cli.plugins import PluginContext
+    # deterministic regardless of whether the host has grown the seams
+    monkeypatch.delattr(PluginContext, "switch_agent_model", raising=False)
+    monkeypatch.delattr(PluginContext, "resolve_role_model", raising=False)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    with bind_subagent_parent(agent):
+        refused = json.loads(h.tool("prewalk_arm", {}, session_id="s"))
+        assert refused["success"] is False
+        assert "anthropic" in refused["error"]
+        assert "switch_agent_model" in refused["error"]
+        assert agent.model == "strong-planner"
+
+
+def test_same_provider_target_without_seam_uses_native_switch(load_plugin, live_agent,
+                                                              workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    from hermes_cli.plugins import PluginContext
+    monkeypatch.delattr(PluginContext, "switch_agent_model", raising=False)
+    monkeypatch.delattr(PluginContext, "resolve_role_model", raising=False)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "openai"})
+    with bind_subagent_parent(agent):
+        assert json.loads(h.tool("prewalk_arm", {}, session_id="s"))["success"] is True
+        handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert handed["success"] is True and handed["handed_off"] is True
+        assert agent.model == TARGET and agent.provider == "openai"
+        # native switch_model ran (client construction is its only mock)
+        agent._create_openai_client.assert_called_once()
+
+
+def test_refused_switch_stays_armed_and_states_reason(load_plugin, live_agent,
+                                                      workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic"})
+    _fake_switch_seam(monkeypatch, fail_reason="destination runtime rejected the api_key")
+    with bind_subagent_parent(agent):
+        assert json.loads(h.tool("prewalk_arm", {}, session_id="s"))["success"] is True
+        failed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
+        assert failed["success"] is False
+        # honest receipt: the refusal reason reaches the planner, not silence
+        assert "destination runtime rejected the api_key" in failed["error"]
+        assert agent.model == "strong-planner" and agent.provider == "openai"
+        st = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+        assert st["state"] == "armed"  # stays armed: retry on next ready
+
+
+def test_replan_restores_original_model_and_provider(load_plugin, live_agent,
+                                                     workspace, monkeypatch):
+    agent = live_agent
+    _planned_todo(agent)
+    h = load_plugin("prewalk", settings={"target_model": TARGET,
+                                         "target_provider": "anthropic",
+                                         "replan_enabled": True})
+    calls = _fake_switch_seam(monkeypatch)
+    with bind_subagent_parent(agent):
+        h.tool("prewalk_arm", {}, session_id="s")
+        h.tool("prewalk_ready", _handoff(), session_id="s")
+        assert agent.model == TARGET and agent.provider == "anthropic"
+        back = json.loads(h.tool("prewalk_replan", {
+            "failed_assumption": "the widget guard covers reads",
+            "failed_check": "pytest tests/test_widget.py::test_read"}, session_id="s"))
+        assert back["success"] is True
+        assert back["original_model"] == "strong-planner"
+        assert back["original_provider"] == "openai"
+        restore = [c for c in calls if c["reason"] == "prewalk_replan"]
+        assert len(restore) == 1
+        assert (restore[0]["model"], restore[0]["provider"]) == ("strong-planner", "openai")
+        assert agent.model == "strong-planner" and agent.provider == "openai"
+        assert agent._create_openai_client.call_count == 0  # seam path throughout
+        st = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+        assert st["original_provider"] == "openai"
+
+
 # --- subagent-effort (pure shadow) ---------------------------------------------
 
 
