@@ -39,6 +39,30 @@ Every plan has the same sections: Goal, Evidence, Current state, Design, Host ch
 | 16 | [memory-v2](16-memory-v2.md) | Memory | Memory-provider plugin. Typed observations go to an inbox, a shadow-first Dream pass consolidates them, and a bounded index is injected | 17 (tests) |
 | 17 | [mock-harness](17-mock-harness.md) | QA | `mockmodel/`. A scripted model server for 3 wire formats, with fault injection, an egress tripwire, and a smoke script | — |
 
+## Classifier plans (18–32)
+
+Each one starts in shadow, collects labels through replay, and acts only after its promotion gate. All share plan 01's classifier client and label store.
+
+| # | Plan | Labels | Feeds |
+|---|---|---|---|
+| 18 | [turn-outcome](18-turn-outcome-classifier.md) | done / blocked-needs-user / gave-up / claims-done-without-evidence / mid-task | `continuation` finish gate |
+| 19 | [queued-message-intent](19-queued-message-intent-classifier.md) | steer / interrupt / append-to-queue / unrelated-new-task | 08 boundary-inbox, `/steer` |
+| 20 | [tool-failure](20-tool-failure-classifier.md) | transient / env-missing / permission / bad-args / model-misuse / real-bug | 04 steering, 07 retry budgets, loop-guard |
+| 21 | [compaction-keepset](21-compaction-keepset-classifier.md) | decision / constraint / user-preference / dead-end / noise | 06 compaction summary |
+| 22 | [memory-worthiness](22-memory-worthiness-classifier.md) | durable-fact / preference / procedure / ephemeral / secret | 16 memory-v2 capture gate |
+| 23 | [outbound-content](23-outbound-content-classifier.md) | contains-secret / PII / internal-only / ok | anything sent off the machine |
+| 24 | [recipient-novelty](24-recipient-novelty-classifier.md) | seen-before / new-recipient / new-app / new-domain | 02 standing grants |
+| 25 | [prompt-injection](25-prompt-injection-classifier.md) | instruction-like / benign | tool results (web, files, MCP) |
+| 26 | [screen-state](26-screen-state-classifier.md) | login-or-password / payment / destructive-dialog / system-settings / normal | 12 computer-use-guard |
+| 27 | [task-routing](27-task-routing-classifier.md) | trivial / standard / deep-reasoning / long-context / vision | `model-routing`, `prewalk` |
+| 28 | [delegation-fit](28-delegation-fit-classifier.md) | do-inline / delegate-parallel / delegate-background / needs-user | delegation, `subagent-effort` |
+| 29 | [machine-target](29-machine-target-classifier.md) | box / user-laptop / either | 11 machine-relay, 14 box-lifecycle |
+| 30 | [voice-speak](30-voice-speak-classifier.md) | speak-now / stay-silent / defer-until-pause | 15 voice-relay |
+| 31 | [chat-addressing](31-chat-addressing-classifier.md) | addressed-to-bot / ambient / reply-to-other-human | gateway admission, hosted rooms, Bot Mode |
+| 32 | [notification-urgency](32-notification-urgency-classifier.md) | interrupt / digest / drop | cron, background tasks, Bot Mode delivery |
+
+Suggested first three: 18, 25 and 19. Each feeds a decision that already exists, and a wrong answer there costs something concrete.
+
 ## Suggested order
 
 ```mermaid
