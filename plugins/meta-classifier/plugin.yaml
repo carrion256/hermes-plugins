@@ -1,0 +1,84 @@
+name: meta-classifier
+version: 0.1.0
+description: "Droid's classifier decisions on Hermes hooks: Jev/luna execute-risk tiers with redacted egress and operation-bound approvals, Droid Shield secret triage before git commit/push, Factory-Judge local-signals analytics, an agent-facing decision_model tool, and a replay of droid's captured payloads. Native permissions stay authoritative."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - transform_tool_result
+  - post_tool_call
+  - post_llm_call
+  - pre_verify
+  - subagent_stop
+provides_tools:
+  - decision_model
+config_schema:
+  endpoint:
+    type: str
+    default: "http://192.168.50.149:8787"
+    description: "Classifier service base URL (GET /health, POST /classify)."
+  api_key_env:
+    type: str
+    default: "CLASSIFIER_API_KEY"
+    description: "Env var holding the Bearer key. Name only — value read at call time, never stored."
+  policy:
+    type: str
+    default: "ask"
+    description: "'ask' = require native human approval; 'deny' = block before execution (risk tier and shield warnings)."
+  risk_scale:
+    type: str
+    default: "jev"
+    description: "'jev' = droid Execute LOW/MEDIUM/HIGH criteria; 'luna' = off/low/medium/high autonomy tiers."
+  approve_from:
+    type: str
+    default: "high"
+    description: "Lowest tier on the chosen scale that requires approval (or blocks under policy deny)."
+  transcript_chars:
+    type: int
+    default: 4000
+    description: "Redacted session-transcript tail sent as Jev `sessionTranscript` evidence; 0 disables."
+  shield:
+    type: bool
+    default: true
+    description: "Droid Shield secret triage on git commit/push (block B>=0.3775 on findings, warn B>=0.95 on secret-named lines)."
+  signals:
+    type: bool
+    default: false
+    description: "Factory-Judge local signals (intent/friction/expertise enum heads) persisted as JSONL analytics."
+  signals_triggers:
+    type: list
+    default: ["session_end"]
+    description: "Subset of session_end (finalize/reset) and turn_end (every completed turn, skipped when unchanged)."
+  signals_chars:
+    type: int
+    default: 60000
+    description: "Head+tail window of the rendered transcript sent for signals."
+  signals_path:
+    type: str
+    default: ""
+    description: "JSONL destination; empty = $HERMES_HOME/logs/meta-classifier-signals.jsonl."
+  captures_dir:
+    type: str
+    default: "/var/lib/hermes/projects/droid/notes/captured/classifiers"
+    description: "droid classifier captures used by `hermes meta-classifier-replay`."
+  addons:
+    type: list
+    default: []
+    description: "Optional addons to enable: injection, outcome, completion, subagent, request, friction, memory, test_value, complexity. All off by default; each writes records to signals_path."
+  addon_chars:
+    type: int
+    default: 12000
+    description: "Head+tail window of redacted text sent per addon classification."
+  injection_tools:
+    type: list
+    default: ["web_extract", "web_search", "read_file", "browser_navigate", "browser_snapshot", "browser_get_text", "browser_run", "fetch", "search_files"]
+    description: "Tools whose results are untrusted content for the injection addon (mcp_* tools are always included)."
+  test_value_gate:
+    type: bool
+    default: false
+    description: "test_value addon: require native approval before writing a test labelled tautological/wiring_only (default: record only)."
