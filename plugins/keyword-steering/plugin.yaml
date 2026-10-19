@@ -1,6 +1,6 @@
 name: keyword-steering
-version: 0.4.0
-description: "Explicit steering modes plus OMP-compatible built-in magic keywords: ultrathink, orchestrate, workflow — enabled by default, configurable via magic_keywords, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded). Config-defined modes reference skill/rule paths or identifiers as consult pointers (their text is never copied); declared conflicts surface and withhold both sides; everything is inspectable via steering_status. ultrathink requests maximum host reasoning effort via PluginContext.set_turn_reasoning('ultra') when the host provides it, degrading to guidance-only (recorded) otherwise. Guidance-only apart from that seam: no messages or tool args are ever rewritten."
+version: 0.5.0
+description: "Explicit steering modes plus OMP-compatible built-in magic keywords: ultrathink, orchestrate, workflow — enabled by default, configurable via magic_keywords, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded). Config-defined modes reference skill/rule paths or identifiers as consult pointers (their text is never copied); declared conflicts surface and withhold both sides; everything is inspectable via steering_status. ultrathink requests maximum host reasoning effort via PluginContext.set_turn_reasoning('ultra') when the host provides it, degrading to guidance-only (recorded) otherwise. Common-word keywords orchestrate and workflow need a / or # sigil unless bare: true. Negated and common-word hits are declined deterministically or, with the optional classifier tie-break enabled, judged directive, mention or negated by the self-hosted classifier with native redaction, failing open to decline. Mode refs are resolved at registration; unresolved ones are warned and surfaced. Guidance-only apart from that seam: no messages or tool args are ever rewritten."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -15,9 +15,26 @@ config_schema:
   modes:
     type: dict
     default: {}
-    description: "Mapping of mode name -> {refs: [skill/rule path or identifier], triggers: [activation phrases, default: mode name], conflicts_with: [mode names]}. Activated when a trigger appears in genuine prose (fenced code, inline code, quoted text, identifier/path contexts ignored); guidance names the refs as consult pointers (text is never copied). Mutually conflicting modes in one turn are both withheld and the conflict is surfaced. Mode names must not shadow the built-in magic keywords (registration fails loudly); conflicts_with may name them. Legacy 'keywords' prompt-copy config is rejected: migrate each entry to a mode."
+    description: "Mapping of mode name -> {refs: [skill/rule path or identifier], triggers: [activation phrases, default: mode name], conflicts_with: [mode names], bare: boolean, default true; false requires /trigger or #trigger}. Activated when a trigger appears in genuine prose (fenced code, inline code, quoted text, identifier/path contexts ignored); guidance names the refs as consult pointers (text is never copied). Mutually conflicting modes in one turn are both withheld and the conflict is surfaced. Mode names must not shadow the built-in magic keywords (registration fails loudly); conflicts_with may name them. Legacy 'keywords' prompt-copy config is rejected: migrate each entry to a mode."
   magic_keywords:
     type: dict
     default:
       enabled: true
-    description: "Built-in OMP-compatible magic keywords {ultrathink, orchestrate, workflow}, all enabled by default. Mapping of keyword -> boolean, plus optional top-level 'enabled' (default true) applied to every keyword not named explicitly. ultrathink requests maximum reasoning for the turn through the host PluginContext.set_turn_reasoning('ultra') seam and degrades to guidance-only (surfaced in the reminder and steering_status) when the host lacks it; orchestrate steers toward delegation and parallel subagents with batched independent requests; workflow steers toward an explicit plan, then verification, then a closing review. Unknown keyword names or non-boolean values fail registration loudly."
+    description: "Built-in OMP-compatible magic keywords {ultrathink, orchestrate, workflow}, all enabled by default. Mapping of keyword -> boolean or {enabled: bool, bare: bool}, plus optional top-level 'enabled' (default true) applied to every keyword not named explicitly. bare defaults to true for ultrathink and to false for orchestrate and workflow, where a bare match needs a leading / or # sigil (/workflow, #workflow); bare: true restores OMP's bare matching. ultrathink requests maximum reasoning for the turn through the host PluginContext.set_turn_reasoning('ultra') seam and degrades to guidance-only (surfaced in the reminder and steering_status) when the host lacks it; orchestrate steers toward delegation and parallel subagents with batched independent requests; workflow steers toward an explicit plan, then verification, then a closing review. Unknown keyword names, unknown dict keys or non-boolean values fail registration loudly."
+  classifier:
+    type: dict
+    default:
+      enabled: false
+      endpoint: "http://192.168.50.149:8787"
+      api_key_env: "CLASSIFIER_API_KEY"
+      timeout: 1.5
+      cooldown: 45.0
+    description: "Optional semantic tie-break for ambiguous keyword hits only (a common-word bare hit, or a negation within 3 words). When enabled, the message is redacted with native egress redaction before HTTP POST to endpoint/classify, and the classifier returns one head steering: directive, mention or negated. The key is read from the environment variable named by api_key_env at call time and never stored. An unavailable classifier declines the ambiguous hit. Deterministic hits never consult it."
+  ref_roots:
+    type: list
+    default:
+      - "~/.hermes/rules"
+      - "~/.omp/rules"
+      - "~/.omp/agent/skills"
+      - "~/.omp/agent/managed-skills"
+    description: "Directories searched for mode refs in addition to the active Hermes skills dir and $OMP_RULES. skill://name resolves to name/SKILL.md (up to two levels deep); rule://stem and bare stems resolve to stem, stem.md or stem.mdc. Unresolved refs warn at registration (never refuse), appear in steering_status.unresolved_refs and are annotated in the mode's guidance."

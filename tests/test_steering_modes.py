@@ -190,6 +190,7 @@ def test_empty_config_stays_idle(load_plugin):
     ({"review": {"refs": [REF_A], "triggers": []}}, "triggers"),
     ({"review": {"refs": [REF_A], "conflicts_with": ["ghost"]}}, "unknown mode"),
     ({"review": {"refs": [REF_A], "conflicts_with": ["review"]}}, "itself"),
+    ({"review": {"refs": [REF_A], "bare": "yes"}}, "boolean"),
 ])
 def test_invalid_mode_table_refused(load_plugin, bad_modes, reason):
     with pytest.raises(AssertionError, match=reason):
@@ -209,8 +210,8 @@ def test_session_cleanup_preserves_other_live_turns(steering):
 
 MAGIC_MESSAGES = {
     "ultrathink": "please ultrathink this design",
-    "orchestrate": "orchestrate the migration please",
-    "workflow": "run this as a workflow please",
+    "orchestrate": "/orchestrate the migration please",
+    "workflow": "run this as a /workflow please",
 }
 MAGIC_MARKERS = {
     "ultrathink": "maximum reasoning effort requested",
@@ -221,6 +222,8 @@ MAGIC_MARKERS = {
 
 def test_magic_keywords_active_by_default_from_prose(load_plugin):
     harness = load_plugin("keyword-steering", settings={})
+    bare = {k: v["bare"] for k, v in _status(harness)["magic_keywords"].items()}
+    assert bare == {"ultrathink": True, "orchestrate": False, "workflow": False}
     for keyword, message in MAGIC_MESSAGES.items():
         results = _turn(harness, message, turn_id=f"turn-{keyword}")
         assert len(results) == 1
@@ -244,15 +247,24 @@ def test_magic_keywords_ignored_outside_prose(steering):
         assert _turn(steering, message, turn_id=f"t{i}") == []
 
 
-def test_orchestrate_guidance_documents_model_role_routing(load_plugin):
+def test_orchestrate_guidance_documents_model_role_routing(load_plugin, monkeypatch):
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_entry",
+                        lambda name, **kw: object() if name == "route_status" else None)
     harness = load_plugin("keyword-steering", settings={})
-    results = _turn(harness, "orchestrate the migration please")
-    assert len(results) == 1
-    guidance = results[0]["context"]
-    # Deterministic routing guidance: delegate tasks carry model_role,
-    # route_status is the role registry.
+    guidance = _turn(harness, "/orchestrate the migration please")[0]["context"]
+    # Routing sentence is emitted only when route_status is registered.
     assert "delegate tasks may pass `model_role`" in guidance
     assert "`route_status` tool lists the configured roles" in guidance
+
+
+def test_orchestrate_guidance_omits_routing_without_route_status(load_plugin, monkeypatch):
+    from tools.registry import registry
+    monkeypatch.setattr(registry, "get_entry", lambda name, **kw: None)
+    harness = load_plugin("keyword-steering", settings={})
+    guidance = _turn(harness, "/orchestrate the migration please")[0]["context"]
+    assert "delegate tasks may pass `model_role`" not in guidance
+    assert "route_status" not in guidance
 
 
 def test_ultrathink_calls_set_turn_reasoning_and_reports_applied(load_plugin, monkeypatch):
@@ -309,7 +321,7 @@ def test_magic_keyword_disabled_via_config(load_plugin):
         "magic_keywords": {"ultrathink": False},
     })
     assert _turn(harness, "please ultrathink this design") == []
-    assert _turn(harness, "orchestrate the migration please", turn_id="turn-2") != []
+    assert _turn(harness, "/orchestrate the migration please", turn_id="turn-2") != []
     summary = _status(harness)["magic_keywords"]
     assert summary["ultrathink"]["enabled"] is False
     assert summary["orchestrate"]["enabled"] is True
@@ -349,7 +361,7 @@ def test_user_mode_conflict_with_magic_keyword_withholds_both(load_plugin):
 
 def test_status_lists_magic_keyword_provenance(load_plugin):
     harness = load_plugin("keyword-steering", settings={})
-    _turn(harness, "orchestrate the migration please")
+    _turn(harness, "/orchestrate the migration please")
     status = _status(harness)
     assert set(status["magic_keywords"]) == {"ultrathink", "orchestrate", "workflow"}
     assert all(entry["enabled"] is True
@@ -365,7 +377,54 @@ def test_status_lists_magic_keyword_provenance(load_plugin):
     ({"enabled": "sure"}, "boolean"),
     ({"ultrathink": "yes"}, "boolean"),
     ({"hyperthink": True}, "unknown magic"),
+    ({"workflow": {"enabled": True, "bare": "x"}}, "boolean"),
+    ({"workflow": {"enabled": "x"}}, "boolean"),
+    ({"workflow": {"foo": 1}}, "unknown"),
 ])
 def test_invalid_magic_config_refused(load_plugin, bad_magic, reason):
     with pytest.raises(AssertionError, match=reason):
         load_plugin("keyword-steering", settings={"magic_keywords": bad_magic})
+
+
+# --- hit records: shared helpers ---------------------------------------------
+
+AMBIGUOUS_MESSAGE = "the GitHub workflow is failing again"
+
+
+def _hit_fields(harness, *keys):
+    """This session's hit records, projected onto ``keys``."""
+    return [{key: hit[key] for key in keys} for hit in _status(harness)["hits"]]
+
+
+# --- prose exclusions: contractions, single quotes, fences -------------------
+
+@pytest.mark.parametrize("message", [
+    "don't skip it, it's urgent: please review this",
+    # The trigger sits between two apostrophes: a naive quote matcher would
+    # pair them up and swallow it.
+    "it's fine, please review this, the devs' call",
+])
+def test_contractions_are_prose_not_quoted_spans(steering, message):
+    assert len(_turn(steering, message)) == 1
+    assert _status(steering)["active"] == ["review"]
+
+
+def test_single_quoted_span_is_ignored(steering):
+    assert _turn(steering, "the doc says 'review approved' only") == []
+    assert _status(steering)["hits"] == []
+
+
+# Each case hides a trigger (ultrathink or review) that must not leak. Any leak
+# adds a hit, so the exact-hit assertion fails, not just the activation one.
+@pytest.mark.parametrize("message,active", [
+    # A ~~~ fence closes on tildes only, never on a ``` line inside it.
+    ("~~~\nultrathink\n```\nstill code\n~~~\nplease review this", ["review"]),
+    # A fence opened with an info string hides its body; later prose counts.
+    ("```python\nultrathink this\n```\nreview this", ["review"]),
+    # An N-backtick inline span hides its content.
+    ("run ```review``` now", []),
+], ids=["tilde-fence", "info-string-fence", "triple-backtick-span"])
+def test_fences_and_spans_hide_triggers_but_not_surrounding_prose(steering, message, active):
+    assert bool(_turn(steering, message)) is bool(active)
+    assert _status(steering)["active"] == active
+    assert [hit["mode"] for hit in _status(steering)["hits"]] == active
