@@ -17,6 +17,7 @@ provides_hooks:
   - subagent_stop
 provides_tools:
   - decision_model
+  - browser_decision
 config_schema:
   endpoint:
     type: str

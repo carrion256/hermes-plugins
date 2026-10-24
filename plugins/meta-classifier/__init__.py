@@ -35,6 +35,7 @@ import uuid
 from pathlib import Path
 
 from . import addons, replay, schemas
+from . import browser_decision as browser_decision_mod
 from .client import Classifier
 from .text import canonical as _canonical, egress as _egress, render_transcript, window as _window
 
@@ -576,6 +577,50 @@ def register(ctx):
         handler=decision_model,
         check_fn=lambda: bool(os.environ.get(key_env, "").strip()),
         description="Label classification, yes/no and graded scoring via the classifier service.",
+    )
+
+    # ------------------------------------------------------------ Browser decision (jev-ultrafast port)
+    def browser_decision(args, **_kw):
+        try:
+            state, schema, meta = browser_decision_mod.build_request(
+                (args or {}).get("goal", ""), (args or {}).get("elements"))
+            text = _egress(_canonical(state))
+        except (ValueError, TypeError) as exc:
+            return json.dumps({"success": False, "error": str(exc)})
+        got = classifier.classify(text, schema, timeout=30)
+        if not isinstance(got, dict):
+            return json.dumps({"success": False, "error": "classifier_unavailable"})
+        decision, problems = browser_decision_mod.validate(got, meta)
+        return json.dumps({"success": decision is not None, "decision": decision,
+                           "offered": meta["operations"], "problems": problems,
+                           "note": "labels only, no probabilities: this is a suggested next action, "
+                                   "not a decision. Execute via bladebro and verify the resulting "
+                                   "delta yourself; a wrong pick is recoverable, an unverified one is not."})
+
+    ctx.register_tool(
+        name="browser_decision", toolset="meta-classifier",
+        schema={
+            "name": "browser_decision",
+            "description": ("Suggest the next browser action for a goal, jev-ultrafast style: ONE "
+                            "classifier request returns an operation (click/type/select/scroll_*/"
+                            "wait/done/blocked) plus the compatible target index (and option index "
+                            "for dropdowns). Input: goal + the observed element table "
+                            "([{index, role, name?, value?, state?, options?}...], from an accessibility "
+                            "tree or bladebro 'see'); only elements you observed can be picked. "
+                            "Suggestion only — the caller executes through the browser and verifies."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "What the page should end up doing/showing."},
+                    "elements": {"type": "array", "description":
+                        "Observed controls: [{index:int, role, name?, value?, state?, options?:[str]}]."},
+                },
+                "required": ["goal", "elements"],
+            },
+        },
+        handler=browser_decision,
+        check_fn=lambda: bool(os.environ.get(key_env, "").strip()),
+        description="Next browser action (operation + element index) from an observed table.",
     )
 
     # ------------------------------------------------------------ replay CLI
