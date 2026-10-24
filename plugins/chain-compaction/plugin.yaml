@@ -1,0 +1,58 @@
+name: chain-compaction
+version: 0.1.0
+description: "Ordered compaction cascade: runs configured methods in sequence (classifier prune, tool-output clip, stale-pair drop), advancing to the next whenever a stage fails or under-delivers, stopping when the cumulative reduction is substantial enough, and always falling back to the untouched built-in summary."
+author: "hermes-plugins (cascade design; reuses the fast-compaction pruner)"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - chain_compaction_status
+provides_hooks: []
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "When false the engine defers every compression to the built-in summary path."
+  pipeline:
+    type: string
+    default: "prune,clip,drop_stale"
+    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs). The built-in summary is always the final stage and cannot be removed."
+  target_reduction:
+    type: float
+    default: 0.25
+    description: "Cumulative reduction (of the original request size) at which the cascade stops early and commits verbatim output."
+  stage_min_reduction:
+    type: float
+    default: 0.05
+    description: "Minimum reduction a single stage must produce on its own; below it the stage counts as 'not substantial enough' and the next one runs."
+  endpoint:
+    type: string
+    default: "http://192.168.50.71:8787"
+    description: "GLiNER2.5-Decide classifier base URL (prune stage only). Never log or echo the key."
+  api_key_env:
+    type: string
+    default: "CLASSIFIER_API_KEY"
+    description: "Environment variable holding the classifier bearer key."
+  request_timeout:
+    type: float
+    default: 20.0
+    description: "Seconds per classifier request."
+  preserve_recent_messages:
+    type: int
+    default: 6
+    description: "Newest messages never touched by any stage (shared across prune/drop_stale/clip)."
+  clip_head_chars:
+    type: int
+    default: 1200
+    description: "clip stage: chars kept from each end of an oversized tool result."
+  clip_trigger_chars:
+    type: int
+    default: 8000
+    description: "clip stage: only results longer than this are truncated."
+  drop_stale_keep_pairs:
+    type: int
+    default: 4
+    description: "drop_stale stage: the N most recent tool call/result pairs are kept regardless."
+  prune_defaults:
+    type: object
+    default: {}
+    description: "Overrides forwarded to the fast-compaction pruner (max_state_tokens, max_request_tokens, truncate_head_chars)."
