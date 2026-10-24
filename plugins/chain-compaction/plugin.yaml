@@ -1,5 +1,5 @@
 name: chain-compaction
-version: 0.1.0
+version: 0.2.0
 description: "Ordered compaction cascade: runs configured methods in sequence (classifier prune, tool-output clip, stale-pair drop), advancing to the next whenever a stage fails or under-delivers, stopping when the cumulative reduction is substantial enough, and always falling back to the untouched built-in summary."
 author: "hermes-plugins (cascade design; reuses the fast-compaction pruner)"
 manifest_version: 2
@@ -56,3 +56,15 @@ config_schema:
     type: object
     default: {}
     description: "Overrides forwarded to the fast-compaction pruner (max_state_tokens, max_request_tokens, truncate_head_chars)."
+  proactive_prune_mode:
+    type: string
+    default: "off"
+    description: "Mid-session eviction on the host's proactive seam (runs when the request exceeds the trigger, below the compression threshold). off = host's deterministic passes; fifo = drop oldest unpinned tool pairs with no classifier call; classifier = prune-stage keep/drop pass first, degrading to fifo per-turn on any classifier fault. Requires fast-compaction installed."
+  proactive_trigger_tokens:
+    type: int
+    default: 8000
+    description: "Estimated tokens of context at which proactive eviction runs (used only when compression.proactive_prune_tokens is 0). 0 disables."
+  proactive_target_tokens:
+    type: int
+    default: 2000
+    description: "Approximate tokens to reclaim per proactive pass; the greedy FIFO stops when reached. The host's reclaim floor and regrowth runway still gate the commit."

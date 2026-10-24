@@ -27,6 +27,12 @@ DEFAULTS = {
     "clip_trigger_chars": 8000,
     "drop_stale_keep_pairs": 4,
     "prune_defaults": {},
+    # Proactive mid-session eviction (host turn_preflight seam), same contract as
+    # fast-compaction: off / fifo (positional, no classifier call) / classifier
+    # (keep/drop pass first, degrades to fifo per-turn).
+    "proactive_prune_mode": "off",
+    "proactive_trigger_tokens": 8000,
+    "proactive_target_tokens": 2000,
 }
 
 

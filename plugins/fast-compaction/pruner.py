@@ -35,6 +35,13 @@ DEFAULTS = {
     "max_request_tokens": 28000,
     "truncate_head_chars": 300,
     "request_timeout": 20.0,
+    # Proactive mid-session eviction (host turn_preflight seam). off keeps the
+    # host's deterministic passes; fifo drops oldest unpinned tool pairs with no
+    # classifier call; classifier runs the keep/drop pass first and degrades to
+    # fifo per-turn on any classifier fault.
+    "proactive_prune_mode": "off",
+    "proactive_trigger_tokens": 8000,
+    "proactive_target_tokens": 2000,
 }
 
 

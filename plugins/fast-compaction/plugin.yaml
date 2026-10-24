@@ -1,5 +1,5 @@
 name: fast-compaction
-version: 0.1.0
+version: 0.2.0
 description: "Lossless-by-deletion compaction overlay: the classifier service decides which stale tool calls/results to drop or truncate; kept content stays verbatim and the built-in summary remains the fallback."
 author: "fast-jev-compaction port (tamaratran/fast-jev-compaction)"
 manifest_version: 2
@@ -43,3 +43,15 @@ config_schema:
     type: float
     default: 20.0
     description: "Seconds per /classify request; on timeout the whole attempt falls back to the built-in summary."
+  proactive_prune_mode:
+    type: string
+    default: "off"
+    description: "Mid-session eviction on the host's proactive seam (runs when the request exceeds the trigger, below the compression threshold). off = host's deterministic passes; fifo = drop oldest unpinned tool pairs with no classifier call; classifier = keep/drop pass first, degrading to fifo per-turn on any classifier fault."
+  proactive_trigger_tokens:
+    type: int
+    default: 8000
+    description: "Estimated tokens of context at which proactive eviction runs (used only when compression.proactive_prune_tokens is 0). 0 disables."
+  proactive_target_tokens:
+    type: int
+    default: 2000
+    description: "Approximate tokens to reclaim per proactive pass; the greedy FIFO stops when reached. The host's reclaim floor and regrowth runway still gate the commit."

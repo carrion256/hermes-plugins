@@ -23,6 +23,8 @@ import logging
 
 from . import pruner
 from .client import ClassifierClient
+from .proactive import (MODES, PROACTIVE_STATS, ProactivePruneMixin,
+                        ProactiveUnavailable)
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +35,9 @@ STATUS = {"attempts": 0, "pruned": 0, "fallbacks": 0, "fallback_reasons": {},
 def _engine_class():
     from agent.context_compressor import ContextCompressor
 
-    class FastCompactionEngine(ContextCompressor):
-        """Built-in compressor + a classifier-pruning attempt ahead of the summary."""
+    class FastCompactionEngine(ProactivePruneMixin, ContextCompressor):
+        """Built-in compressor + a classifier-pruning attempt ahead of the summary,
+        and (opt-in) classifier/FIFO eviction on the host's proactive seam."""
 
         def __init__(self, settings, client):
             self._fc = settings
@@ -175,6 +178,22 @@ def _engine_class():
                 raise pruner.PruneError("state_too_long")
             return safe
 
+        # -- proactive seam contract (ProactivePruneMixin) --------------------
+
+        def _proactive_config(self):
+            return {"mode": self._fc.get("proactive_prune_mode", "off"),
+                    "trigger_tokens": self._fc.get("proactive_trigger_tokens", 0),
+                    "target_tokens": self._fc.get("proactive_target_tokens", 0),
+                    "preserve_recent": self._fc["preserve_recent_messages"]}
+
+        _proactive_pruner = pruner
+
+        def _proactive_classifier_prune(self, messages):
+            try:
+                return self._prune_pass(messages)
+            except pruner.PruneError as exc:
+                raise ProactiveUnavailable(str(exc))
+
         def _reduction(self, messages, pruned):
             from agent.model_metadata import estimate_messages_tokens_rough
             pre = estimate_messages_tokens_rough(messages)
@@ -235,6 +254,13 @@ def register(ctx):
     settings["preserve_recent_messages"] = min(64, max(1, int(settings["preserve_recent_messages"])))
     settings["truncate_head_chars"] = min(4000, max(0, int(settings["truncate_head_chars"])))
     settings["min_reduction"] = min(0.95, max(0.05, float(settings["min_reduction"])))
+    mode = str(settings.get("proactive_prune_mode") or "off").strip().lower()
+    if mode not in MODES:
+        logger.error("fast-compaction: unknown proactive_prune_mode %r; using off", mode)
+        mode = "off"
+    settings["proactive_prune_mode"] = mode
+    settings["proactive_trigger_tokens"] = max(0, int(settings["proactive_trigger_tokens"]))
+    settings["proactive_target_tokens"] = max(0, int(settings["proactive_target_tokens"]))
     client = ClassifierClient(timeout=settings["request_timeout"])
     engine = _engine_class()(settings, client)
     handle = ctx.register_context_engine(engine)
@@ -252,5 +278,7 @@ def register(ctx):
         handler=lambda args, **kw: json.dumps({
             "engine": "fast-compaction", "enabled": settings["enabled"],
             "endpoint_configured": bool(settings["endpoint"]),
-            "min_reduction": settings["min_reduction"], **STATUS}),
+            "min_reduction": settings["min_reduction"],
+            "proactive_mode": settings["proactive_prune_mode"],
+            "proactive": dict(PROACTIVE_STATS), **STATUS}),
         check_fn=lambda: True)

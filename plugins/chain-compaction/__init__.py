@@ -41,6 +41,10 @@ STATUS = {"attempts": 0, "committed": 0, "fallbacks": 0, "stage_misses": {},
 # pure stages in stages.py; both are valid pipeline names.
 ENGINE_STAGES = ("prune",)
 
+# Kept in sync with fast-compaction/proactive.MODES; defined locally so register
+# works even when the sibling plugin is absent.
+_PROACTIVE_MODES = ("off", "fifo", "classifier")
+
 
 def _load_fast_compaction():
     """Reuse the fast-compaction pruner/client by path — one classifier
@@ -63,11 +67,39 @@ def _load_fast_compaction():
         return None, None
 
 
+def _load_proactive():
+    """The proactive mixin lives with fast-compaction (one host-seam policy).
+    Absent installation: a no-op base, so the engine keeps host behaviour."""
+    path = Path(__file__).resolve().parent.parent / "fast-compaction" / "proactive.py"
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("chaincomp_proactive", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("cannot load fast-compaction/proactive.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:
+        logger.warning("chain-compaction: proactive module unusable (%s)", exc)
+        return None
+
+
 def _engine_class():
     from agent.context_compressor import ContextCompressor
 
-    class ChainCompactionEngine(ContextCompressor):
-        """Built-in compressor + an ordered stage cascade ahead of the summary."""
+    proactive = _load_proactive()
+
+    class _NoopProactive:  # fast-compaction absent: keep host behaviour entirely
+        pass
+
+    Mixin = proactive.ProactivePruneMixin if proactive else _NoopProactive
+    ProactiveUnavailable = getattr(proactive, "ProactiveUnavailable", Exception)
+    PROACTIVE_STATS = getattr(proactive, "PROACTIVE_STATS", {})
+
+    class ChainCompactionEngine(Mixin, ContextCompressor):  # pyright: ignore[reportGeneralTypeIssues]
+        """Built-in compressor + an ordered stage cascade ahead of the summary,
+        and (opt-in) classifier/FIFO eviction on the host's proactive seam."""
 
         def __init__(self, settings, pruner, client):
             self._cc = settings
@@ -256,6 +288,26 @@ def _engine_class():
             misses = STATUS["stage_misses"]
             misses[reason] = misses.get(reason, 0) + 1
 
+        # -- proactive seam contract (ProactivePruneMixin) --------------------
+
+        def _proactive_config(self):
+            return {"mode": self._cc.get("proactive_prune_mode", "off"),
+                    "trigger_tokens": self._cc.get("proactive_trigger_tokens", 0),
+                    "target_tokens": self._cc.get("proactive_target_tokens", 0),
+                    "preserve_recent": self._cc["preserve_recent_messages"]}
+
+        @property
+        def _proactive_pruner(self):
+            return self._pruner
+
+        def _proactive_classifier_prune(self, messages):
+            if self._pruner is None or self._cc_client is None:
+                raise ProactiveUnavailable("prune_unavailable:not_installed")
+            try:
+                return self._stage_prune(messages, self._cc)
+            except StageError as exc:
+                raise ProactiveUnavailable(str(exc))
+
         def _fallback(self, reason, messages, current_tokens, force, memory_context,
                       bypass_cooldown):
             STATUS["fallbacks"] += 1
@@ -310,7 +362,15 @@ def register(ctx):
     except ValueError as exc:
         logger.error("chain-compaction: bad pipeline config (%s); using default order", exc)
         settings["pipeline"] = "prune,clip,drop_stale"
+    mode = str(settings.get("proactive_prune_mode") or "off").strip().lower()
+    if mode not in _PROACTIVE_MODES:
+        logger.error("chain-compaction: unknown proactive_prune_mode %r; using off", mode)
+        mode = "off"
+    settings["proactive_prune_mode"] = mode
+    settings["proactive_trigger_tokens"] = max(0, int(settings["proactive_trigger_tokens"]))
+    settings["proactive_target_tokens"] = max(0, int(settings["proactive_target_tokens"]))
     pruner, client_mod = _load_fast_compaction()
+    proactive_mod = _load_proactive()
     client = client_mod.ClassifierClient(timeout=settings["request_timeout"]) if client_mod else None
     engine = _engine_class()(settings, pruner, client)
     handle = ctx.register_context_engine(engine)
@@ -330,5 +390,7 @@ def register(ctx):
             "pipeline": engine._pipeline,
             "target_reduction": settings["target_reduction"],
             "stage_min_reduction": settings["stage_min_reduction"],
+            "proactive_mode": settings["proactive_prune_mode"],
+            "proactive": dict(getattr(proactive_mod, "PROACTIVE_STATS", {})),
             "prune_available": pruner is not None, **STATUS}),
         check_fn=lambda: True)
