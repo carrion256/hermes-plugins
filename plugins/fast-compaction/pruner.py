@@ -97,7 +97,13 @@ def collect_tool_calls(messages, preserve_recent):
                 "assistant_index": index, "result_index": result_index,
                 "result_text": (message_text(messages[result_index].get("content"))
                                 if result_index is not None else ""),
-                "pinned": (index == 0 or index >= recent_start or result_index is None),
+                # A pair is recent if EITHER half is: a call sitting just outside
+                # the window whose result is inside it is part of the live task
+                # (found live 2026-10-24: the classifier dropped the fix's
+                # edit_file call exactly on that boundary).
+                "pinned": (index == 0 or index >= recent_start
+                           or result_index is None
+                           or result_index >= recent_start),
             }
             calls.setdefault(call_id, record)
     tag = 0

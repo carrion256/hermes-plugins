@@ -54,10 +54,14 @@ def test_collect_pairs_and_pins_recent_and_head():
     calls = pruner.collect_tool_calls(messages, 6)
     assert len(calls) == 6
     eligible = {c["call_id"] for c in pruner.eligible_calls(calls)}
-    # window = [1, len-6) = [1, 8): c0..c3 sit before it and are eligible; c4/c5 sit in
-    # the recent window and are never touched. The first message itself (index 0) pins
-    # any call whose assistant row lands there.
-    assert eligible == {"c0", "c1", "c2", "c3"}
+    # window = [8, 14): c0..c2 sit fully before it and are eligible. A pair is
+    # recent if EITHER half is: c3's call row is at 7 (outside) but its result at
+    # 8 is inside the window, so dropping it would delete a protected message —
+    # pinned (found live 2026-10-24: exactly this boundary dropped the fix's
+    # edit_file call). c4/c5 sit in the window and are never touched. The first
+    # message itself (index 0) pins any call whose assistant row lands there.
+    assert eligible == {"c0", "c1", "c2"}
+    assert calls["c3"]["pinned"] is True
     assert calls["c4"]["pinned"] is True and calls["c5"]["pinned"] is True
     head_pinned = pruner.collect_tool_calls(
         [msg_assistant("", [call("hx")])] + [msg_tool("hx", "z" * 400)] * 1
@@ -99,21 +103,26 @@ def test_parse_response_strict_and_batching():
 def test_apply_decisions_verbatim_keep_copy_on_write():
     messages = transcript(n_calls=6)
     calls = pruner.collect_tool_calls(messages, 6)
-    decisions = {"c1": {"call": True, "result": True},
-                 "c2": {"call": True, "result": False},
+    # c0..c2 are eligible; c3 is pinned (its result half sits inside the recent
+    # window) so a drop decision for it is ignored — that IS the guard.
+    decisions = {"c0": {"call": True, "result": True},
+                 "c1": {"call": True, "result": False},
+                 "c2": {"call": False, "result": False},
                  "c3": {"call": False, "result": False}}
     out, stats = pruner.apply_decisions(messages, calls, decisions, truncate_head_chars=300)
-    # kept result (messages[4]): the exact same object, not a copy
-    assert any(m is messages[4] for m in out)
+    # kept result (messages[2]): the exact same object, not a copy
+    assert any(m is messages[2] for m in out)
     # truncated result: head + note, call retained
-    truned = [m for m in out if m.get("role") == "tool" and m.get("tool_call_id") == "c2"]
+    truned = [m for m in out if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
     assert len(truned) == 1 and truned[0]["content"].startswith("x" * 300)
     assert "fast-compaction" in truned[0]["content"] and "x" * 301 not in truned[0]["content"]
     # dropped pair: call and result both gone
-    assert not any(m.get("tool_call_id") == "c3" for m in out)
-    assert all("c3" not in json.dumps(m.get("tool_calls") or []) for m in out)
+    assert not any(m.get("tool_call_id") == "c2" for m in out)
+    assert all("c2" not in json.dumps(m.get("tool_calls") or []) for m in out)
+    # pinned drop decision did not delete the window-side pair
+    assert any(m.get("tool_call_id") == "c3" for m in out)
     # untouched calls remain identical objects
-    assert any(m.get("tool_calls") and m["tool_calls"][0]["id"] == "c1" for m in out)
+    assert any(m.get("tool_calls") and m["tool_calls"][0]["id"] == "c0" for m in out)
     assert stats["dropped"] == 1 and stats["truncated"] == 1
 
 
@@ -121,11 +130,15 @@ def test_drop_all_content_removes_message():
     messages = [msg_user("goal")] + [msg_assistant(calls=[call(f"c{i}")]) for i in range(9)]
     messages += [msg_tool(f"c{i}", "r" * 300) for i in range(9)] + [msg_user("next")]
     calls = pruner.collect_tool_calls(messages, 6)
+    eligible = {c["call_id"] for c in pruner.eligible_calls(calls)}
     decisions = {cid: {"call": False, "result": False} for cid in calls}
     out, stats = pruner.apply_decisions(messages, calls, decisions, 300)
     for cid in ("c2", "c3"):  # eligible, empty-text pure-call messages vanish
         assert not any(m.get("tool_calls") and m["tool_calls"][0]["id"] == cid for m in out)
-    assert stats["dropped"] == len(decisions)  # every result row dropped
+    # only the eligible pairs drop; every result inside the recent window is pinned
+    assert stats["dropped"] == len(eligible)
+    kept_results = [m for m in out if m.get("role") == "tool"]
+    assert len(kept_results) == 9 - len(eligible)
 
 
 def test_goal_and_state_fitting_stages():
