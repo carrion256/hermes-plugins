@@ -1,0 +1,45 @@
+name: fast-compaction
+version: 0.1.0
+description: "Lossless-by-deletion compaction overlay: the classifier service decides which stale tool calls/results to drop or truncate; kept content stays verbatim and the built-in summary remains the fallback."
+author: "fast-jev-compaction port (tamaratran/fast-jev-compaction)"
+manifest_version: 2
+api_version: 1
+provides_tools: []
+provides_hooks: []
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "When false the engine defers every compression to the built-in summary path."
+  endpoint:
+    type: string
+    default: "http://192.168.50.71:8787"
+    description: "GLiNER2.5-Decide classifier base URL. Never log or echo the key; set the key in the environment."
+  api_key_env:
+    type: string
+    default: "CLASSIFIER_API_KEY"
+    description: "Environment variable holding the Bearer key, read at call time."
+  preserve_recent_messages:
+    type: int
+    default: 6
+    description: "Newest messages never touched (the first message is always pinned). Clamped 1-64."
+  min_reduction:
+    type: float
+    default: 0.25
+    description: "Minimum estimated-token reduction for the pruned transcript to replace the built-in summary. Below it, fall back."
+  max_state_tokens:
+    type: int
+    default: 20000
+    description: "Estimated-token ceiling for the state sent with each request; fitting stages apply before giving up."
+  max_request_tokens:
+    type: int
+    default: 28000
+    description: "Estimated ceiling for state plus one batch of questions. Questions batch at 16 calls (32 heads, the service head limit) per request."
+  truncate_head_chars:
+    type: int
+    default: 300
+    description: "Characters of a dropped result retained as a truncated excerpt plus a one-line note. Clamped 0-4000."
+  request_timeout:
+    type: float
+    default: 20.0
+    description: "Seconds per /classify request; on timeout the whole attempt falls back to the built-in summary."
