@@ -25,7 +25,7 @@ class Classifier:
         self._down = {}  # endpoint -> monotonic deadline
 
     def endpoint(self):
-        return str(self._ctx.get_config("endpoint", "http://192.168.50.149:8787") or "").rstrip("/")
+        return str(self._ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
 
     def _key(self):
         return os.environ.get(str(self._ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")), "").strip()

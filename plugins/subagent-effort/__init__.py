@@ -68,7 +68,7 @@ _MAX_CLASSIFIERS = 4
 
 
 def register(ctx) -> None:
-    endpoint = (ctx.get_config("endpoint", "http://192.168.50.149:8787") or "").rstrip("/")
+    endpoint = (ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
     api_key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
     low = ctx.get_config("low_effort", "low")
     high = ctx.get_config("high_effort", "high")

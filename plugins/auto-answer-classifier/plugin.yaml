@@ -21,7 +21,7 @@ config_schema:
     description: "Recommend defaults without applying them or claiming a human answer."
   endpoint:
     type: str
-    default: "http://192.168.50.149:8787"
+    default: "http://192.168.50.71:8787"
     description: "Classifier service base URL."
   api_key_env:
     type: str

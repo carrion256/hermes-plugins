@@ -33,7 +33,7 @@ class Tiebreak:
         if not isinstance(enabled, bool):
             raise ValueError("keyword-steering: classifier.enabled must be a boolean")
         self.enabled = enabled
-        self._endpoint = str(cfg.get("endpoint") or "http://192.168.50.149:8787").rstrip("/")
+        self._endpoint = str(cfg.get("endpoint") or "http://192.168.50.71:8787").rstrip("/")
         self._key_env = str(cfg.get("api_key_env") or "CLASSIFIER_API_KEY")
         self._timeout = float(cfg.get("timeout", 1.5))
         self._cooldown = float(cfg.get("cooldown", 45.0))

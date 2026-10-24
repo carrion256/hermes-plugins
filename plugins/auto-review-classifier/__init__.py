@@ -246,7 +246,7 @@ def register(ctx):
     down = {}  # endpoint -> monotonic deadline; a dead endpoint must not tax every tool call
     def classify(text):
         key = os.environ.get(ctx.get_config("api_key_env", "CLASSIFIER_API_KEY"), "")
-        endpoint = str(ctx.get_config("endpoint", "http://192.168.50.149:8787") or "").rstrip("/")
+        endpoint = str(ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
         if down.get(endpoint, 0.0) > time.monotonic():
             return None
         if not key or not endpoint:

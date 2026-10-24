@@ -57,7 +57,7 @@ def _owner(owner_session=None, owner_turn=None):
 
 
 def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
-         endpoint="http://192.168.50.149:8787"):
+         endpoint="http://192.168.50.71:8787"):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
     The service scores every label in one pass (GLiNER2.5-Decide /classify);
@@ -368,7 +368,7 @@ def register(ctx):
 
     def defaults(args, task_id="", **_kw):
         key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
-        endpoint = ctx.get_config("endpoint", "http://192.168.50.149:8787")
+        endpoint = ctx.get_config("endpoint", "http://192.168.50.71:8787")
         owner, workspace = _owner(), _workspace(task_id)
         if not isinstance(args, dict) or not owner or not workspace:
             return json.dumps({"status": "unknown", "reason": "native owner/workspace unavailable"})
