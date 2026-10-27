@@ -34,7 +34,7 @@ config_schema:
   max_request_tokens:
     type: int
     default: 28000
-    description: "Estimated ceiling for state plus one batch of questions. Questions batch at 16 calls (32 heads, the service head limit) per request."
+    description: "Estimated ceiling for state plus one batch of questions. Questions batch at 16 calls (two choice questions each, 32 per request) so a compaction sends the state exactly once."
   truncate_head_chars:
     type: int
     default: 300
@@ -42,7 +42,11 @@ config_schema:
   request_timeout:
     type: float
     default: 20.0
-    description: "Seconds per /classify request; on timeout the whole attempt falls back to the built-in summary."
+    description: "Seconds per classifier request (/v1/systemone); on timeout the whole attempt falls back to the built-in summary."
+  drop_confidence:
+    type: float
+    default: 0.5
+    description: "P(drop) at which a tool call or result is deleted. 0.5 is plain argmax: whatever the service's keep/drop choice says, exactly the previous behaviour. Raising it (e.g. 0.9) demands strong evidence before context is deleted, so a pair the service only weakly favours dropping is kept. Clamped 0-1; an answer carrying no probabilities falls back to the choice itself."
   proactive_prune_mode:
     type: string
     default: "off"

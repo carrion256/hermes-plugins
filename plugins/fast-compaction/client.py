@@ -1,8 +1,8 @@
-"""`/classify` transport for fast-compaction.
+"""`/v1/systemone` transport for fast-compaction.
 
 Mirrors the meta-classifier client contract: Bearer key from the environment at call
 time, never stored or logged; a dead endpoint is blacked out for ``cooldown`` seconds so
-a down service never taxes every compaction. Returns the parsed label dict or None.
+a down service never taxes every compaction. Returns the parsed body dict or None.
 """
 from __future__ import annotations
 
@@ -22,8 +22,17 @@ class ClassifierClient:
         self.cooldown = float(cooldown)
         self._down = {}  # endpoint -> monotonic deadline; set only on failures
 
-    def post(self, endpoint, api_key_env, text, schema, timeout=None):
-        """POST {text, schema} to <endpoint>/classify; returns dict or None (never raises)."""
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
+        """POST {state, questions} to <endpoint>/v1/systemone; returns dict or None (never raises).
+
+        The shared ``_request`` path supplies endpoint resolution, key handling, timeout
+        and cooldown semantics; typed answers ride under ``answers`` in the body.
+        """
+        return self._request(endpoint, api_key_env, text,
+                             {"state": text, "questions": questions}, "/v1/systemone", timeout)
+
+    def _request(self, endpoint, api_key_env, text, body, path, timeout):
+        """One Bearer-authenticated POST with the shared guards and failure handling."""
         endpoint = str(endpoint or "").rstrip("/")
         key = os.environ.get(str(api_key_env or "CLASSIFIER_API_KEY"), "").strip()
         if not endpoint or not key or self._down.get(endpoint, 0.0) > time.monotonic():
@@ -33,8 +42,8 @@ class ClassifierClient:
                            len(text) if isinstance(text, str) else "n/a")
             return None
         request = urllib.request.Request(
-            endpoint + "/classify",
-            data=json.dumps({"text": text, "schema": schema}).encode(),
+            endpoint + path,
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
         try:
             with urllib.request.urlopen(request, timeout=timeout or self.timeout) as reply:

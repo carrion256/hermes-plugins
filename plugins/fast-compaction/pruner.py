@@ -15,11 +15,11 @@ import json
 
 MAX_TEXT = 100_000            # service limit on the text field
 STATE_MAX_CHARS = 90_000      # keeps the body under the 256 KB cap with schema room
-MAX_HEADS = 32                # service limit per request
-# One request carries two heads per tool call ({tag}_call and {tag}_result), so 16 tool
-# calls = 32 heads = one request already at the service cap. Per-request latency is
-# dominated by re-reading the state (measured ~0.1 ms/char), not by head count, so the
-# only lever that matters is how many times the state is sent -- keep it at one.
+MAX_HEADS = 32                # questions per request (the typed endpoint allows far more)
+# One request carries two questions per tool call ({tag}_call and {tag}_result), so 16 tool
+# calls = 32 questions = one request. Per-request latency is dominated by re-reading the
+# state (measured ~0.1 ms/char), not by question count, so the only lever that matters is
+# how many times the state is sent -- keep it at one.
 HEADS_PER_TOOL_CALL = 2
 TOOL_CALLS_PER_REQUEST = MAX_HEADS // HEADS_PER_TOOL_CALL
 _VERDICTS = ("keep", "drop")
@@ -39,6 +39,10 @@ DEFAULTS = {
     "max_request_tokens": 28000,
     "truncate_head_chars": 300,
     "request_timeout": 20.0,
+    # Probability of "drop" required to delete a tool call/result. 0.5 on a binary
+    # keep/drop is plain argmax -- whatever the service answered. Raising it demands
+    # stronger evidence before context is deleted.
+    "drop_confidence": 0.5,
     # Proactive mid-session eviction (host turn_preflight seam). off keeps the
     # host's deterministic passes; fifo drops oldest unpinned tool pairs with no
     # classifier call; classifier runs the keep/drop pass first and degrades to
@@ -209,35 +213,63 @@ def _head_descriptions(record):
     return call, result
 
 
+_QUESTION_INSTRUCTIONS = {
+    "call": "Does this tool call still matter for continuing the current task?",
+    "result": "Is this tool output still needed, or may it be removed from the context?",
+}
+
+
 def build_request(batch, state):
-    """One /classify request: the same full state plus two single-label (choice) heads per
-    tool call -- {tag}_call and {tag}_result, each carrying its own label descriptions.
-    Returns (text, schema); raises PruneError when the request shape is invalid."""
-    schema = {}
+    """One /v1/systemone request: the same full state plus one choice question per tool
+    call side -- {tag}_call and {tag}_result -- each offering the same keep/drop criteria
+    the single-label heads carried, so the model is asked the unchanged task.
+    Returns (text, questions); raises PruneError when the request shape is invalid."""
+    questions = {}
     for record in batch:
-        call_labels, result_labels = _head_descriptions(record)
-        schema[f"{record['tag']}_call"] = {"labels": call_labels}
-        schema[f"{record['tag']}_result"] = {"labels": result_labels}
-    if not 1 <= len(schema) <= MAX_HEADS:
+        call_criteria, result_criteria = _head_descriptions(record)
+        questions[f"{record['tag']}_call"] = {"type": "choice",
+                                              "instructions": _QUESTION_INSTRUCTIONS["call"],
+                                              "criteria": call_criteria}
+        questions[f"{record['tag']}_result"] = {
+            "type": "choice", "instructions": _QUESTION_INSTRUCTIONS["result"],
+            "criteria": result_criteria}
+    if not 1 <= len(questions) <= MAX_HEADS:
         raise PruneError("invalid_head_count")
     if len(state) > MAX_TEXT:
         raise PruneError("state_too_long")
-    return state, schema
+    return state, questions
 
 
-def parse_response(data, batch):
-    """Strict: every head for every call must answer keep|drop, or the whole
-    compression falls back (a malformed answer is never a partial prune)."""
+def parse_response(data, batch, drop_confidence=DEFAULTS["drop_confidence"]):
+    """Strict: every question for every call must answer keep|drop, or the whole
+    compression falls back (a malformed answer is never a partial prune).
+
+    A typed answer is ``{"choice": ..., "probabilities": {"keep": p, "drop": q}}``: a side
+    is dropped only when P(drop) reaches ``drop_confidence``, so 0.5 is plain argmax (the
+    returned choice). An answer with no usable probability -- an older service, or a bare
+    label string -- falls back to that choice, never to an error: a service that answers
+    less precisely must not cost the whole compression.
+    """
     if not isinstance(data, dict):
         raise PruneError("malformed_answer")
+    answers = data.get("answers")
+    if not isinstance(answers, dict):
+        raise PruneError("malformed_answer:answers")
+    threshold = float(drop_confidence)
     decisions = {}
     for record in batch:
         got = {}
         for kind in ("call", "result"):
-            verdict = data.get(f"{record['tag']}_{kind}")
-            if not isinstance(verdict, str) or verdict not in _VERDICTS:
+            verdict = answers.get(f"{record['tag']}_{kind}")
+            choice = verdict.get("choice") if isinstance(verdict, dict) else verdict
+            if not isinstance(choice, str) or choice not in _VERDICTS:
                 raise PruneError(f"malformed_answer:{record['tag']}_{kind}")
-            got[kind] = verdict == "keep"
+            probabilities = verdict.get("probabilities") if isinstance(verdict, dict) else None
+            p_drop = probabilities.get("drop") if isinstance(probabilities, dict) else None
+            if isinstance(p_drop, (int, float)) and not isinstance(p_drop, bool):
+                got[kind] = not (p_drop >= threshold)  # a NaN probability keeps the text
+            else:
+                got[kind] = choice == "keep"
         decisions[record["call_id"]] = got
     return decisions
 
@@ -280,6 +312,9 @@ def apply_decisions(messages, calls, decisions, truncate_head_chars):
                 continue
             if call_id in truncate_results:
                 original = message_text(message.get("content"))
+                if len(original) <= truncate_head_chars:
+                    out.append(message)  # fits the head budget; a note would only grow it
+                    continue
                 head = original[:truncate_head_chars]
                 note = TRUNC_NOTE.format(kept=len(head), total=len(original))
                 truncated += 1

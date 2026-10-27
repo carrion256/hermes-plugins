@@ -84,20 +84,53 @@ def test_orphan_call_pinned_not_dropped():
 def test_parse_response_strict_and_batching():
     batch = [{"tag": f"t{i}", "call_id": f"c{i}", "tool": "Read", "arguments": "{}",
               "result_text": "z" * 100} for i in range(2)]
+    want = {"c0": {"call": True, "result": False}, "c1": {"call": False, "result": False}}
+    # An older service answering with bare label strings yields the same decisions.
     ok = {"t0_call": "keep", "t0_result": "drop", "t1_call": "drop", "t1_result": "drop"}
-    assert pruner.parse_response(ok, batch) == {
-        "c0": {"call": True, "result": False}, "c1": {"call": False, "result": False}}
+    assert pruner.parse_response({"answers": ok}, batch) == want
+    # A typed answer (choice + probabilities) agrees with it: 0.5 is plain argmax.
+    typed = {k: _answer(v == "keep") for k, v in ok.items()}
+    assert pruner.parse_response({"answers": typed}, batch) == want
     with pytest.raises(pruner.PruneError):
-        pruner.parse_response({**ok, "t1_result": "maybe"}, batch)
+        pruner.parse_response({"answers": {**ok, "t1_result": "maybe"}}, batch)
     with pytest.raises(pruner.PruneError):
-        pruner.parse_response({"t0_call": "keep"}, batch)
+        pruner.parse_response({"answers": {"t0_call": "keep"}}, batch)
+    with pytest.raises(pruner.PruneError):
+        pruner.parse_response(ok, batch)  # no answers envelope: never a partial prune
     many = [{"tag": f"t{i}", "call_id": f"c{i}", "tool": "T", "arguments": "{}",
              "result_text": ""} for i in range(40)]
     batches = pruner.build_batches(many)
-    assert [len(b) for b in batches] == [16, 16, 8]      # 32 heads per request
+    assert [len(b) for b in batches] == [16, 16, 8]   # 16 calls = 32 questions per request
     for b in batches:
-        text, schema = pruner.build_request(b, "STATE")
-        assert text == "STATE" and len(schema) == 2 * len(b)
+        text, questions = pruner.build_request(b, "STATE")
+        assert text == "STATE" and len(questions) == 2 * len(b)
+        assert all(q["type"] == "choice" and set(q["criteria"]) == {"keep", "drop"}
+                   for q in questions.values())
+
+
+def test_drop_confidence_demands_evidence_before_deleting():
+    """0.5 is plain argmax; above it a pair needs P(drop) at least that high to go."""
+    batch = [{"tag": "t0", "call_id": "c0", "tool": "Read", "arguments": "{}",
+              "result_text": "z" * 200}]
+    dropped, kept = {"c0": {"call": False, "result": False}}, {"c0": {"call": True,
+                                                                       "result": True}}
+
+    def pair(p_drop):
+        return {"answers": {f"t0_{kind}": {"type": "choice", "choice": "drop",
+                                           "probabilities": {"keep": 1.0 - p_drop,
+                                                             "drop": p_drop}}
+                            for kind in ("call", "result")}}
+
+    assert pruner.parse_response(pair(0.7), batch) == dropped       # default 0.5: argmax
+    assert pruner.parse_response(pair(0.7), batch, drop_confidence=0.95) == kept
+    # The live-measured row, P(drop)=0.9523: clears a 0.9 and a 0.95 bar (the rule is
+    # ">=", so meeting the bar drops), and survives only a bar above the evidence.
+    assert pruner.parse_response(pair(0.9523), batch, drop_confidence=0.9) == dropped
+    assert pruner.parse_response(pair(0.9523), batch, drop_confidence=0.95) == dropped
+    assert pruner.parse_response(pair(0.9523), batch, drop_confidence=0.96) == kept
+    # A pair the service wants kept stays kept at the default threshold.
+    needed = {"answers": {f"t0_{kind}": _answer(True) for kind in ("call", "result")}}
+    assert pruner.parse_response(needed, batch) == kept
 
 
 def test_apply_decisions_verbatim_keep_copy_on_write():
@@ -155,7 +188,7 @@ def test_goal_and_state_fitting_stages():
 # ---------------------------------------------------------------- engine overlay
 
 def _patch_client(monkeypatch, responses):
-    """responses: list of dicts consumed per /classify call, or exceptions to raise."""
+    """responses: list of dicts consumed per /v1/systemone call, or exceptions to raise."""
     from urllib.error import URLError
     requests = []
     it = iter(responses)
@@ -175,7 +208,8 @@ def _patch_client(monkeypatch, responses):
 
     def fake_urlopen(request, *_a, **_kw):
         body = json.loads(request.data.decode())
-        requests.append({"body": body, "auth": request.get_header("Authorization")})
+        requests.append({"body": body, "url": request.full_url,
+                         "auth": request.get_header("Authorization")})
         item = next(it)
         if isinstance(item, Exception):
             raise item
@@ -188,16 +222,36 @@ def _patch_client(monkeypatch, responses):
     return requests
 
 
+def _answer(keep_):
+    """One typed choice answer whose probabilities agree with its own choice."""
+    label = "keep" if keep_ else "drop"
+    return {"type": "choice", "choice": label,
+            "probabilities": {label: 0.9, "drop" if keep_ else "keep": 0.1}}
+
+
 def _verdicts(calls, keep=None, keep_result=None):
-    """Build the label dict for one batch: keep/keep_result are call_id -> bool."""
+    """Build the /v1/systemone answers envelope for one batch: keep/keep_result are
+    call_id -> bool."""
     keep = keep or {}
     keep_result = keep_result or {}
     out = {}
     for record in calls:
         cid = record["call_id"]
-        out[f"{record['tag']}_call"] = "keep" if keep.get(cid, False) else "drop"
-        out[f"{record['tag']}_result"] = "keep" if keep_result.get(cid, False) else "drop"
-    return out
+        out[f"{record['tag']}_call"] = _answer(keep.get(cid, False))
+        out[f"{record['tag']}_result"] = _answer(keep_result.get(cid, False))
+    return {"model": "fake-classifier", "answers": out}
+
+
+def _soft_verdicts(calls, p_drop=0.7):
+    """Every question favours dropping with probability p_drop: argmax-drops at the 0.5
+    default, survives any threshold above p_drop."""
+    out = {}
+    for record in calls:
+        for kind in ("call", "result"):
+            out[f"{record['tag']}_{kind}"] = {
+                "type": "choice", "choice": "drop",
+                "probabilities": {"keep": 1.0 - p_drop, "drop": p_drop}}
+    return {"model": "fake-classifier", "answers": out}
 
 
 def _load_engine(load_plugin, monkeypatch, settings=None):
@@ -234,6 +288,48 @@ def test_prune_success_keeps_text_verbatim(load_plugin, monkeypatch):
     assert engine.compression_count == 1
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["pruned"] == 1 and status["fallbacks"] == 0
+
+
+def test_one_request_carries_every_question(load_plugin, monkeypatch):
+    """16 tool calls = 32 questions = ONE request: the state is sent exactly once."""
+    h, engine = _load_engine(load_plugin, monkeypatch)
+    messages = transcript(n_calls=6, result_size=40_000)
+    eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
+    requests = _patch_client(monkeypatch, [_verdicts(eligible)])
+    engine.compress(list(messages), current_tokens=200_000)
+    assert len(requests) == 1
+    assert requests[0]["url"].endswith("/v1/systemone")
+    body = requests[0]["body"]
+    assert set(body) == {"state", "questions"}
+    assert sorted(body["questions"]) == sorted(f"{r['tag']}_{kind}" for r in eligible
+                                               for kind in ("call", "result"))
+    assert all(q["type"] == "choice" and set(q["criteria"]) == {"keep", "drop"}
+               for q in body["questions"].values())
+
+
+def test_default_confidence_deletes_weakly_favoured_drops(load_plugin, monkeypatch):
+    """P(drop)=0.7 beats the 0.5 default, so the pass still prunes."""
+    h, engine = _load_engine(load_plugin, monkeypatch)
+    messages = transcript(n_calls=6, result_size=40_000)
+    eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
+    _patch_client(monkeypatch, [_soft_verdicts(eligible)])
+    engine.compress(list(messages), current_tokens=200_000)
+    status = json.loads(h.tool("fast_compaction_status", {}))
+    assert status["drop_confidence"] == 0.5
+    assert status["pruned"] == 1 and status["fallbacks"] == 0
+
+
+def test_raised_confidence_holds_the_context_and_falls_back(load_plugin, monkeypatch):
+    """The same answers are refused at drop_confidence=0.95: nothing deleted, summary path."""
+    h, engine = _load_engine(load_plugin, monkeypatch, {"drop_confidence": 0.95})
+    messages = transcript(n_calls=6, result_size=40_000)
+    eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
+    _patch_client(monkeypatch, [_soft_verdicts(eligible)])
+    out = engine.compress(list(messages), current_tokens=200_000)
+    status = json.loads(h.tool("fast_compaction_status", {}))
+    assert status["drop_confidence"] == 0.95
+    assert status["pruned"] == 0 and "insufficient_reduction" in status["fallback_reasons"]
+    assert isinstance(out, list)
 
 
 def test_redaction_runs_before_egress(load_plugin, monkeypatch):

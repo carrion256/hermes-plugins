@@ -132,7 +132,7 @@ def engine_factory(monkeypatch):
     monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
 
     class FakeClient:  # the fake pruner ignores the response body entirely
-        def post(self, endpoint, api_key_env, text, schema, timeout=None):
+        def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
             return {}
 
     def make(pipeline, pruner=None, client=None, **over):
@@ -194,7 +194,7 @@ def fake_pruner(drop_every=True, boom=None):
         def build_request(self, batch, state):
             return state, {}
 
-        def parse_response(self, data, batch):
+        def parse_response(self, data, batch, drop_confidence=0.5):
             return {r["call_id"]: {"call": False, "result": False} for r in batch}
 
         def apply_decisions(self, messages, calls, decisions, trunc):
@@ -224,6 +224,25 @@ def test_prune_reaches_target_and_stops_before_later_stages(engine_factory):
     assert all(any(m is o for m in out) for o in msgs if o.get("role") in ("system", "user"))
     assert any(m is msgs[-2] for m in out)            # recent tool result untouched object
     assert "clip" not in [t["stage"] for t in done] and "drop_stale" not in [t["stage"] for t in done]
+
+
+
+def test_engine_survives_the_host_per_agent_copy(engine_factory, monkeypatch):
+    """agent_init._select_context_engine() gives every agent its own engine via
+    ContextEngine.clone_for_agent() (a copy.deepcopy) and, when that raises, logs a
+    warning and silently installs the built-in ContextCompressor — the cascade would
+    never run and nothing else would report it. The prune stage holds the
+    fast-compaction *module*, which copy cannot clone."""
+    probe = _load_stub(monkeypatch)
+    pruner_mod, _ = probe._load_fast_compaction()
+    assert pruner_mod is not None, "fast-compaction absent: the shared pruner is the point"
+    mod, engine, _ = engine_factory("prune", pruner=pruner_mod)
+    clone = engine.clone_for_agent()                        # the host's own entry point
+    assert type(clone) is type(engine)
+    assert clone._pruner is engine._pruner                  # a module: shared, never copied
+    assert clone._cc == engine._cc and clone._cc is not engine._cc
+    clone.compression_count += 1
+    assert engine.compression_count == 0                    # per-agent budget state is not shared
 
 
 def test_chain_advances_when_prune_fails_and_clips_to_target(engine_factory):

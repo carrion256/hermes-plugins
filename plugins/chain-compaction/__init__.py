@@ -24,9 +24,11 @@ is read from the environment at call time and never stored or logged.
 """
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import logging
+import types
 from pathlib import Path
 
 from . import stages
@@ -119,6 +121,19 @@ def _engine_class():
                 proactive_prune_min_reclaim_tokens=cfg["proactive_prune_min_reclaim_tokens"],
                 min_tail_user_messages=cfg["min_tail_user_messages"], tail_mode=cfg["tail_mode"],
             )
+
+        def __deepcopy__(self, memo):
+            """clone_for_agent() deep-copies the registered engine, and the prune
+            stage holds the fast-compaction *module*, which copy cannot clone —
+            the host would then silently install the built-in compressor and the
+            cascade would never run. Share stateless module references; copy only
+            the per-agent mutable state (settings, client cooldown map, counters)."""
+            clone = self.__class__.__new__(self.__class__)
+            memo[id(self)] = clone
+            for key, value in self.__dict__.items():
+                setattr(clone, key, value if isinstance(value, types.ModuleType)
+                        else copy.deepcopy(value, memo))
+            return clone
 
         @property
         def name(self) -> str:
@@ -219,7 +234,8 @@ def _engine_class():
                     continue
                 candidate = outcome
                 if reduction >= self._cc["target_reduction"]:
-                    self._commit(candidate, messages, current_tokens, force, trace, reduction)
+                    candidate = self._commit(candidate, messages, current_tokens, force,
+                                             trace, reduction)
                     STATUS["committed"] += 1
                     STATUS["last"] = {"trace": trace, "reduction": round(reduction, 4)}
                     if not self.quiet_mode:
@@ -258,18 +274,23 @@ def _engine_class():
                 raise StageError("prune_nothing_eligible")
             goal = pruner.extract_goal(messages)
             prune_cfg = dict(pruner.DEFAULTS)
+            # Precedence for the delete threshold: pruner default < this plugin's
+            # configured drop_confidence < an explicit prune_defaults override.
+            prune_cfg["drop_confidence"] = cfg.get(
+                "drop_confidence", prune_cfg.get("drop_confidence", 0.5))
             prune_cfg.update(cfg.get("prune_defaults") or {})
             state = pruner.fit_state(messages, calls, goal, prune_cfg["max_state_tokens"],
                                      prune_cfg["max_request_tokens"], self._tokens)
             state = self._redact(state)
             decisions = {}
             for batch in pruner.build_batches(eligible):
-                text, schema = pruner.build_request(batch, state)
-                data = client.post(cfg["endpoint"], key_env, text, schema,
-                                   timeout=float(cfg["request_timeout"]))
+                text, questions = pruner.build_request(batch, state)
+                data = client.post_questions(cfg["endpoint"], key_env, text, questions,
+                                             timeout=float(cfg["request_timeout"]))
                 if data is None:
                     raise StageError("prune_classifier_unavailable")
-                decisions.update(pruner.parse_response(data, batch))
+                decisions.update(pruner.parse_response(data, batch,
+                                                       prune_cfg["drop_confidence"]))
             pruned, stats = pruner.apply_decisions(messages, calls, decisions,
                                                    prune_cfg["truncate_head_chars"])
             stats["stage"] = "prune"
@@ -342,6 +363,7 @@ def _engine_class():
             self._last_compression_made_progress = True
             self._reset_micro_compact_cursor_state()
             self._reset_proactive_prune_rearm()
+            return compressed
 
     return ChainCompactionEngine
 
@@ -357,6 +379,7 @@ def register(ctx):
         settings[key] = default if value is None else value
     settings["target_reduction"] = min(0.95, max(0.05, float(settings["target_reduction"])))
     settings["stage_min_reduction"] = min(0.9, max(0.0, float(settings["stage_min_reduction"])))
+    settings["drop_confidence"] = min(1.0, max(0.0, float(settings["drop_confidence"])))
     try:
         parse_pipeline(settings["pipeline"], extra=ENGINE_STAGES)
     except ValueError as exc:
@@ -390,6 +413,7 @@ def register(ctx):
             "pipeline": engine._pipeline,
             "target_reduction": settings["target_reduction"],
             "stage_min_reduction": settings["stage_min_reduction"],
+            "drop_confidence": settings["drop_confidence"],
             "proactive_mode": settings["proactive_prune_mode"],
             "proactive": dict(getattr(proactive_mod, "PROACTIVE_STATS", {})),
             "prune_available": pruner is not None, **STATUS}),

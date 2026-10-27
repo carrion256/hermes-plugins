@@ -26,6 +26,9 @@ DEFAULTS = {
     "clip_head_chars": 1200,
     "clip_trigger_chars": 8000,
     "drop_stale_keep_pairs": 4,
+    # prune stage: P(drop) required to delete a tool call/result. 0.5 is plain argmax
+    # (the service's own choice); higher demands stronger evidence before context goes.
+    "drop_confidence": 0.5,
     "prune_defaults": {},
     # Proactive mid-session eviction (host turn_preflight seam), same contract as
     # fast-compaction: off / fifo (positional, no classifier call) / classifier

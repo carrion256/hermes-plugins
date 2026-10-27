@@ -41,7 +41,7 @@ from test_fast_compaction import (call, msg_assistant, msg_tool, msg_user,  # no
 
 
 def _patch_client(monkeypatch, responses):
-    """urlopen stand-in: consumes responses per /classify call (exceptions raise)."""
+    """urlopen stand-in: consumes responses per /v1/systemone call (exceptions raise)."""
     requests = []
     it = iter(responses)
 
@@ -71,13 +71,18 @@ def _patch_client(monkeypatch, responses):
 
 
 def _verdicts(eligible, keep=None, keep_result=None):
+    """Build the /v1/systemone answers envelope for one keep/drop pass
+    (keep/keep_result map call_id -> bool; probabilities agree with the choice)."""
     keep, keep_result = keep or {}, keep_result or {}
     out = {}
     for record in eligible:
         cid = record["call_id"]
-        out[f"{record['tag']}_call"] = "keep" if keep.get(cid) else "drop"
-        out[f"{record['tag']}_result"] = "keep" if keep_result.get(cid) else "drop"
-    return out
+        for kind, table in (("call", keep), ("result", keep_result)):
+            label = "keep" if table.get(cid) else "drop"
+            out[f"{record['tag']}_{kind}"] = {
+                "type": "choice", "choice": label,
+                "probabilities": {label: 0.9, "drop" if label == "keep" else "keep": 0.1}}
+    return {"model": "fake-classifier", "answers": out}
 
 
 def _prepare(engine):
@@ -227,15 +232,15 @@ def test_classifier_fault_degrades_to_fifo_same_turn(fc_engine, monkeypatch):
 # ------------------------------------------------------------ chain-compaction
 
 class _FakePost:
-    """Chain-style client: post(endpoint, api_key_env, text, schema, timeout)."""
+    """Chain-style client: post_questions(endpoint, api_key_env, text, questions, timeout)."""
 
     def __init__(self, payload_fn):
         self.payload_fn = payload_fn
         self.calls = 0
 
-    def post(self, endpoint, api_key_env, text, schema, timeout=None):
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
         self.calls += 1
-        return self.payload_fn(text, schema)
+        return self.payload_fn(text, questions)
 
 
 def _chain_engine(monkeypatch, **over):
@@ -270,11 +275,7 @@ def test_chain_classifier_mode_uses_prune_stage(monkeypatch):
     keep_id = eligible[0]["call_id"]
     verdicts = _verdicts(eligible, {keep_id: True}, {keep_id: True})
 
-    def payload(text, schema):
-        # the stage builds its own request; answer every head with the verdict map
-        return {"labels": {}} | verdicts
-
-    engine._cc_client = _FakePost(lambda t, s: verdicts)
+    engine._cc_client = _FakePost(lambda text, questions: verdicts)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert engine._cc_client.calls == 1
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
@@ -288,8 +289,8 @@ def test_chain_classifier_down_degrades_to_fifo(monkeypatch):
     msgs = transcript(n_calls=6, result_size=40_000)
     eligible = fp.eligible_calls(fp.collect_tool_calls(msgs, 6))
 
-    def boom(text, schema):
-        return None  # post() returning None == classifier unavailable
+    def boom(text, questions):
+        return None  # post_questions() returning None == classifier unavailable
 
     engine._cc_client = _FakePost(boom)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)

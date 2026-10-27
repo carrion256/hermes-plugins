@@ -133,7 +133,7 @@ def _engine_class():
             if stats["dropped"] + stats["truncated"] == 0 or reduction < self._fc["min_reduction"]:
                 return self._fallback("insufficient_reduction", messages, current_tokens, force,
                                       memory_context, bypass_cooldown)
-            self._commit(pruned, messages, current_tokens, force, stats, reduction)
+            pruned = self._commit(pruned, messages, current_tokens, force, stats, reduction)
             STATUS["pruned"] += 1
             STATUS["last"] = {"decisions": stats, "reduction": round(reduction, 4),
                               "state_tokens": stats.get("state_tokens")}
@@ -155,13 +155,14 @@ def _engine_class():
             state = self._redact(state)
             decisions = {}
             for batch in pruner.build_batches(eligible):
-                text, schema = pruner.build_request(batch, state)
-                data = self._fc_client.post(
-                    self._fc["endpoint"], self._fc["api_key_env"], text, schema,
+                text, questions = pruner.build_request(batch, state)
+                data = self._fc_client.post_questions(
+                    self._fc["endpoint"], self._fc["api_key_env"], text, questions,
                     timeout=self._fc["request_timeout"])
                 if data is None:
                     raise pruner.PruneError("classifier_unavailable")
-                decisions.update(pruner.parse_response(data, batch))
+                decisions.update(pruner.parse_response(data, batch,
+                                                       self._fc["drop_confidence"]))
             pruned, stats = pruner.apply_decisions(messages, calls, decisions,
                                                    self._fc["truncate_head_chars"])
             stats["state_tokens"] = self._tokens(state)
@@ -242,6 +243,7 @@ def _engine_class():
             self._last_compression_made_progress = True
             self._reset_micro_compact_cursor_state()
             self._reset_proactive_prune_rearm()
+            return compressed
 
     return FastCompactionEngine
 
@@ -254,6 +256,7 @@ def register(ctx):
     settings["preserve_recent_messages"] = min(64, max(1, int(settings["preserve_recent_messages"])))
     settings["truncate_head_chars"] = min(4000, max(0, int(settings["truncate_head_chars"])))
     settings["min_reduction"] = min(0.95, max(0.05, float(settings["min_reduction"])))
+    settings["drop_confidence"] = min(1.0, max(0.0, float(settings["drop_confidence"])))
     mode = str(settings.get("proactive_prune_mode") or "off").strip().lower()
     if mode not in MODES:
         logger.error("fast-compaction: unknown proactive_prune_mode %r; using off", mode)
@@ -279,6 +282,7 @@ def register(ctx):
             "engine": "fast-compaction", "enabled": settings["enabled"],
             "endpoint_configured": bool(settings["endpoint"]),
             "min_reduction": settings["min_reduction"],
+            "drop_confidence": settings["drop_confidence"],
             "proactive_mode": settings["proactive_prune_mode"],
             "proactive": dict(PROACTIVE_STATS), **STATUS}),
         check_fn=lambda: True)
