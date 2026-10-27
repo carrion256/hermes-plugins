@@ -11,6 +11,7 @@ import weakref
 
 _POLL_ACTIONS = {"list", "poll", "log", "wait"}
 _HISTORY_LIMIT = 24
+_BLOCK_PREFIX = "LOOP GUARD:"
 logger = logging.getLogger(__name__)
 
 
@@ -194,7 +195,7 @@ def register(ctx) -> None:
             if s["delivered"] + len(s["pending"]) >= cap:
                 return None
             directive = {"action": "block",
-                         "message": "LOOP GUARD: " + json.dumps(s["blocker"], ensure_ascii=False)}
+                         "message": _BLOCK_PREFIX + " " + json.dumps(s["blocker"], ensure_ascii=False)}
             if tool_call_id:
                 directive_id = "loop:" + uuid.uuid4().hex
                 s["pending"][directive_id] = tool_call_id
@@ -228,7 +229,14 @@ def register(ctx) -> None:
             return
         if tool_name == "process_manage" and isinstance(args, dict) and args.get("action") in _POLL_ACTIONS:
             return
-        if result is None or "LOOP GUARD:" in str(result):
+        if result is None:
+            return
+        # Only the guard's OWN delivered block is invisible to tracking: the
+        # host labels it error_type="plugin_block" and carries the directive
+        # text.  Requiring both keeps ordinary results — a source read that
+        # merely mentions the literal — in history, where an identical-call
+        # repetition of them is detectable at all.
+        if error_type == "plugin_block" and str(error_message or "").startswith(_BLOCK_PREFIX):
             return
         payload = _payload(result)
         failure, invariant = _failure(payload, error_type, error_message)

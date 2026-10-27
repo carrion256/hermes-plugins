@@ -37,6 +37,7 @@ import logging
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -54,6 +55,9 @@ _PATH_KEYS = ("path", "file_path", "file", "notebook_path", "target")
 _BODY_BUDGET = 3600  # headroom under the native 4000-char section cap
 _BOOKLET_BUDGET = 3600
 _MAX_SESSIONS = 512
+# Tool calls in one parallel batch share a single session activation, so
+# selecting a reminder and marking it fired must be one atomic step.
+_FIRED_LOCK = threading.Lock()
 _META_KEYS = {"description", "alwaysapply", "always_apply", "enabled", "agents",
               "globs", "condition", "tools", "applies", "id", "check_refs",
               "verification_refs", "constraints"}
@@ -236,6 +240,13 @@ def _runtime_cwd() -> str:
         return str(resolve_agent_cwd() or "")
     except Exception:
         return ""
+
+
+def _release_fired(act: _Activation, names: list[str]) -> None:
+    """Undo a provisional claim: the rules were never delivered, so they stay
+    eligible for a later turn instead of being burned by a failed call."""
+    with _FIRED_LOCK:
+        act.fired.difference_update(names)
 
 def register(ctx) -> None:
     global_dirs = [os.path.abspath(os.path.expanduser(str(raw)))
@@ -480,21 +491,32 @@ def register(ctx) -> None:
                    "cwd": _runtime_cwd()})
             act = activation.get(session_id)
         hits = []
+        claimed = []
         str_args = [v for v in args.values() if isinstance(v, str)]
         resolved_paths = _extract_paths(tool_name, args, task_id)
-        for rule in act.reminders:
-            if rule.name in act.fired:  # already delivered once
-                continue
-            if _matches(rule, tool_name, str_args, resolved_paths, act.cwd):
-                hits.append(rule)
+        # Select and claim in one critical section: two tool calls from the
+        # same parallel batch share this activation and must not both queue
+        # the same reminder. The claim is provisional — it is rolled back
+        # below unless the guidance actually rides the result.
+        with _FIRED_LOCK:
+            for rule in act.reminders:
+                if rule.name in act.fired:  # already delivered once
+                    continue
+                if _matches(rule, tool_name, str_args, resolved_paths, act.cwd):
+                    hits.append(rule)
+                    claimed.append(rule.name)
+            act.fired.update(claimed)
         if not hits:
             return next_call(args)
-        for rule in hits:  # mark fired only for actually delivered rules
-            act.fired.add(rule.name)
         text = "\n\n".join(f"{r.body}\n[rule file: {r.path}]" for r in hits)
         refs = _rule_refs(hits)
-        result = next_call(args)
+        try:
+            result = next_call(args)
+        except BaseException:  # tool failed: nothing was delivered
+            _release_fired(act, claimed)
+            raise
         if not isinstance(result, str):
+            _release_fired(act, claimed)
             return result  # structural result: never corrupt tool output
         note = "\n\n[RULE GUIDANCE — one-time, apply to this change]\n" + text
         if refs:

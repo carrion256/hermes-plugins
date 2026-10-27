@@ -195,13 +195,14 @@ def register(ctx) -> None:
                 logger.debug("continuation: session state clear failed", exc_info=True)
 
     def _active_agent(session_id: str):
-        try:
-            from agent.subagent_lifecycle import get_active_subagent_parent
+        # A failed lookup is NOT the "no agent here" answer: swallowing it
+        # silently switched the whole completion gate off for every coding
+        # turn (no provisional marker, previous turn's blockers carried).
+        # Let it raise so pre_verify's handler records the failed-open,
+        # unverified outcome instead.
+        from agent.subagent_lifecycle import get_active_subagent_parent
 
-            agent = get_active_subagent_parent()
-        except Exception:
-            logger.debug("continuation: parent-agent lookup failed", exc_info=True)
-            return None
+        agent = get_active_subagent_parent()
         if agent is None:
             return None
         # Detached forks and subagent contexts must never route the gate.
@@ -474,7 +475,13 @@ def register(ctx) -> None:
         certifiable (confined, readable sources). None means the check was
         never observed here — the bind must then fail and the declared check
         be rerun; no current-hash fallback exists."""
-        for key, obs in _evidence_obs.items():
+        # A parallel batch (check + bind) mutates the ledger on another
+        # thread; iterating the live dict raises "changed size during
+        # iteration" out of the tool handler. Snapshot under the lock and
+        # scan the snapshot without holding it.
+        with _tool_obs_lock:
+            evidence_snapshot = list(_evidence_obs.items())
+        for key, obs in evidence_snapshot:
             if (str(key).startswith(f"{session_id}|")
                     and obs.get("criterion") == cid
                     and str(obs.get("tool") or "terminal") == "terminal"
@@ -759,7 +766,11 @@ def register(ctx) -> None:
                 # the current task/call, so an absent or stale observation is
                 # denial, never permission.
                 obs = None
-                for k, o in _evidence_obs.items():
+                # Same unsynchronised-ledger hazard as _terminal_observation:
+                # a concurrent observation writes rows while this bind scans.
+                with _tool_obs_lock:
+                    evidence_snapshot = list(_evidence_obs.items())
+                for k, o in evidence_snapshot:
                     if (str(k).startswith(f"{session_id}|")
                             and o.get("criterion") == cid
                             and o.get("evidence_id") == evidence_id
@@ -858,10 +869,14 @@ def register(ctx) -> None:
         # multiplexed-gateway privacy: only the requesting session's own
         # observations; other sessions' criterion ids / evidence ids are
         # never disclosed, regardless of the display window.
+        # Scanned while a concurrent tool call may be committing or evicting
+        # rows: snapshot under the lock, then report off the snapshot.
+        with _tool_obs_lock:
+            evidence_snapshot = list(_evidence_obs.items())
         observations = [{"evidence_id": o.get("evidence_id"),
                          "criterion": o.get("criterion"),
                          "source_stable": (o.get("pre") == o.get("post"))}
-                        for k, o in _evidence_obs.items()
+                        for k, o in evidence_snapshot
                         if str(k).startswith(session_id + "|")][-10:]
         return json.dumps({"success": True, "criteria": report,
                            "native_todos": [{"id": t, "status": s}

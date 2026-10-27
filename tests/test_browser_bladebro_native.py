@@ -734,6 +734,37 @@ def test_vision_attaches_the_backend_screenshot_natively(browser, tmp_path, monk
     assert calls[1][1] == {"marks": True}
 
 
+def test_guard_active_private_page_refuses_content_and_input(browser, monkeypatch):
+    # Built-in parity: with the SSRF guard active in this browser mode, a page
+    # that moved itself to an internal address (JS location=, meta refresh, an
+    # eval) yields no content and takes no input.
+    from tools import browser_tool as _bt
+    ctx, calls, router, _ = browser
+    backend = fake_backend(router)
+    assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
+    monkeypatch.setattr(_bt._eval_policy, "_eval_ssrf_guard_active", lambda task_id: False)
+    assert _call(ctx, "browser_snapshot", {})["success"]  # control: guard inactive
+
+    monkeypatch.setattr(_bt._eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    backend.url[TAB] = "http://169.254.169.254/latest/meta-data"
+    calls.clear()
+    paths = (
+        ("browser_snapshot", {}), ("browser_get_images", {}), ("browser_console", {}),
+        ("browser_console", {"expression": "location.href"}),
+        ("browser_vision", {"question": "q"}),
+        ("browser_click", {"ref": "e1"}), ("browser_type", {"ref": "e1", "text": "x"}),
+        ("browser_press", {"key": "Enter"}),
+        ("browser_run", {"steps": [{"action": "see"}]}),
+    )
+    for name, args in paths:
+        out = _call(ctx, name, args)
+        assert out["success"] is False, (name, out)
+        assert "private or internal address" in out["error"], (name, out)
+    # Nothing the page could act on was dispatched: no click/type/press left.
+    assert not [steps for steps in _runs(calls)
+                if any(step.get("action") in {"click", "type", "press"} for step in steps)]
+
+
 def test_capture_requires_host_connection_token(browser):
     # Host mints no token on the run envelope: evidence cannot be certified.
     ctx, calls, router, browser_mp = browser

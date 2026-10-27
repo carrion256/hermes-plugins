@@ -294,6 +294,12 @@ def test_quota_race_across_processes(load_plugin, tmp_path, monkeypatch):
     assert ctx.context.state.get("auto_capture") == {"day": day, "n": cap}
 
 
+def _native_supports(mode, flag):
+    """True when the installed native build defines ``flag`` for ``mode``."""
+    proc = subprocess.run([BINARY, mode, "--help"], capture_output=True, text=True)
+    return flag in f"{proc.stdout or ''}{proc.stderr or ''}"
+
+
 def test_reported_loss_accumulates_without_imputing_missing_timing(papercuts):
     ctx, store = papercuts
     args = {"mode": "report", "category": "workflow", "severity": "high",
@@ -303,8 +309,16 @@ def test_reported_loss_accumulates_without_imputing_missing_timing(papercuts):
         assert result["success"], result
     rows = _records(store)
     assert len(rows) == 1
-    assert (rows[0]["count"], rows[0]["time_lost_seconds"],
-            rows[0]["timed_report_count"]) == (3, 50.0, 2)
+    assert rows[0]["count"] == 3
+    if _native_supports("report", "--time-lost-seconds"):
+        # A build that owns the timing field accumulates the reported loss itself.
+        assert (rows[0]["time_lost_seconds"], rows[0]["timed_report_count"]) == (50.0, 2)
+    else:
+        # v0.1.0 defines no timing field. Emitting the flag anyway made argparse reject the
+        # whole report, losing the papercut; the plugin must file it and carry the observed
+        # loss in the context instead, and must never invent native columns that do not exist.
+        assert "time_lost_seconds" not in rows[0]
+        assert rows[0]["context"] == "observed time lost: 42.0s"
 
 
 @pytest.mark.parametrize("invalid", [True, -1, float("nan"), float("inf"), "42", 10**400])

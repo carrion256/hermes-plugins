@@ -809,6 +809,16 @@ class CoveyRuntime:
             and "--summary" in str(finish.get("data", {}).get("help_text", ""))
             and "--evidence-digest" in str(finish.get("data", {}).get("help_text", "")),
         }
+        if any(
+            probe.get("ok") is False and probe.get("code") in UNCERTAIN_CODES
+            for probe in (base, meta_list, create, finish)
+        ):
+            # A transient probe fault (timeout/empty output/unparseable JSON)
+            # proves nothing about the binary: never memoize it, or a single
+            # blip refuses every later mutation with a misleading "install a
+            # newer covey binary" for this runtime's whole life.  The next
+            # call re-probes instead.
+            return caps
         self._capabilities = caps
         self._capability_identity = identity
         return caps
@@ -1153,7 +1163,7 @@ class CoveyRuntime:
         if claim is None:
             health = "unclaimed"
         else:
-            if not isinstance(claim, dict) or "lease_deadline" not in claim:
+            if not isinstance(claim, dict) or not _is_int(claim.get("lease_deadline")):
                 return self._fail("invalid_envelope", "subtask status claim had unexpected shape")
             health = "lease_expired" if int(claim["lease_deadline"]) <= observed_at else "held"
         return self._ok(
@@ -1588,6 +1598,8 @@ class CoveyRuntime:
                 data={"subtask_id": action.subtask_id, "completion_policy": task["completion_policy"]},
             )
         bound_workspace = ""
+        lock_acquired = False
+        published = False
         if action.workspace:
             # Workspace binding is refused BEFORE any claim/subprocess side
             # effect: the target must be this machine's canonical LINKED Git
@@ -1604,61 +1616,73 @@ class CoveyRuntime:
             busy = self._acquire_workspace_lock(bound_workspace)
             if busy is not None:
                 return self._with_request_id(busy, action.request_id)
-        token, error = self._ensure_role("executor", state, action)
-        if token is None:
-            # Registration failed/timed out BEFORE the claim was published:
-            # never strand the worktree flock on an unpublished start.
-            self._release_workspace_lock()
-            return error
-        # Try to exit a retired pending token once, on the action thread.
-        pending = self._retired.get("executor")
-        if pending is not None:
-            self._retired["executor"] = None
-            self._attempt_exit("executor", pending, NORMAL_TIMEOUT)
+            lock_acquired = True
+        # Nothing publishes authority until _set_claim succeeds.  Everything
+        # after the acquisition therefore runs under a finally: an exception
+        # the transport does not convert (any other OSError, a host seam
+        # defect) must not strand the machine-wide flock for every runtime
+        # until process exit.  Explicit release paths keep their behaviour;
+        # this only catches what escapes them.
+        try:
+            token, error = self._ensure_role("executor", state, action)
+            if token is None:
+                # Registration failed/timed out BEFORE the claim was published:
+                # never strand the worktree flock on an unpublished start.
+                self._release_workspace_lock()
+                return error
+            # Try to exit a retired pending token once, on the action thread.
+            pending = self._retired.get("executor")
+            if pending is not None:
+                self._retired["executor"] = None
+                self._attempt_exit("executor", pending, NORMAL_TIMEOUT)
 
-        claim_payload = self._call(
-            ["subtask", "claim", _opt("--session-token", token), _opt("--subtask-id", action.subtask_id),
-             _opt("--lease-duration-ms", self.lease_duration_ms),
-             _opt("--idempotency-key", f"{token}:claim:{action.request_id}")]
-        )
-        if claim_payload.get("ok") is True and isinstance(claim_payload.get("data"), dict):
-            claim_data = claim_payload["data"]
-            claim_id = claim_data.get("claim_id")
-            fence_seq = claim_data.get("fence_seq")
-            lease_deadline = claim_data.get("lease_deadline")
-            if not (isinstance(claim_id, str) and _is_int(fence_seq) and _is_int(lease_deadline)):
-                # Malformed claim response: the claim may exist natively but
-                # was never installed locally; drop our unpublished lock so
-                # a retry or peer is not blocked by this runtime's handle.
+            claim_payload = self._call(
+                ["subtask", "claim", _opt("--session-token", token), _opt("--subtask-id", action.subtask_id),
+                 _opt("--lease-duration-ms", self.lease_duration_ms),
+                 _opt("--idempotency-key", f"{token}:claim:{action.request_id}")]
+            )
+            if claim_payload.get("ok") is True and isinstance(claim_payload.get("data"), dict):
+                claim_data = claim_payload["data"]
+                claim_id = claim_data.get("claim_id")
+                fence_seq = claim_data.get("fence_seq")
+                lease_deadline = claim_data.get("lease_deadline")
+                if not (isinstance(claim_id, str) and _is_int(fence_seq) and _is_int(lease_deadline)):
+                    # Malformed claim response: the claim may exist natively but
+                    # was never installed locally; drop our unpublished lock so
+                    # a retry or peer is not blocked by this runtime's handle.
+                    self._release_workspace_lock()
+                    return self._fail(
+                        "invalid_envelope", "claim response had unexpected shape", action.request_id
+                    )
+            else:
+                # A reaped idle executor (SessionNotActive) is retired here so the
+                # next explicit start registers a fresh principal.
+                env = self._failure_or_uncertain(
+                    claim_payload, state, action.request_id, "subtask claim", role="executor",
+                )
+                self._release_workspace_lock()
+                return env
+            # Publication is atomic: _set_claim refuses under the same guard that
+            # serializes close()'s revocation, so a claim whose backend response
+            # passed every earlier _closed check can still never publish into a
+            # revoked runtime (the thread holds the runtime lock and can pass
+            # any check-then-check pattern close's budget branch).
+            if not self._set_claim(claim_id, fence_seq, lease_deadline,
+                                   action.subtask_id, action.request_id,
+                                   bound_workspace):
+                # The native claim truthfully stays with lease expiry; only local
+                # handles (flock/cwd routing) are released, nothing is published.
                 self._release_workspace_lock()
                 return self._fail(
-                    "invalid_envelope", "claim response had unexpected shape", action.request_id
+                    "closed",
+                    "runtime closed before the claim could be applied",
+                    action.request_id,
                 )
-        else:
-            # A reaped idle executor (SessionNotActive) is retired here so the
-            # next explicit start registers a fresh principal.
-            env = self._failure_or_uncertain(
-                claim_payload, state, action.request_id, "subtask claim", role="executor",
-            )
-            self._release_workspace_lock()
-            return env
-        # Publication is atomic: _set_claim refuses under the same guard that
-        # serializes close()'s revocation, so a claim whose backend response
-        # passed every earlier _closed check can still never publish into a
-        # revoked runtime (the thread holds the runtime lock and can pass
-        # any check-then-check pattern close's budget branch).
-        if not self._set_claim(claim_id, fence_seq, lease_deadline,
-                               action.subtask_id, action.request_id,
-                               bound_workspace):
-            # The native claim truthfully stays with lease expiry; only local
-            # handles (flock/cwd routing) are released, nothing is published.
-            self._release_workspace_lock()
-            return self._fail(
-                "closed",
-                "runtime closed before the claim could be applied",
-                action.request_id,
-            )
-        return self._issue_start(action, token, self._claim)
+            published = True
+            return self._issue_start(action, token, self._claim)
+        finally:
+            if lock_acquired and not published and self._ws_lock is not None:
+                self._release_workspace_lock()
 
     def _issue_start(self, action: StartAction, token: str, claim: _Claim) -> dict:
         """Issue (or replay with the retained key) `subtask start` for a held claim."""

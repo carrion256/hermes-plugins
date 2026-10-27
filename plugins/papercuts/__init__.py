@@ -14,6 +14,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import time
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,29 @@ def _passthrough(argv):
     except OSError as exc:
         print(f"papercuts: {exc}", file=sys.stderr)
         return 127
+
+
+_HELP_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _supports(binary: str, mode: str, flag: str) -> bool:
+    """True when this native build advertises ``flag`` for ``mode`` (cached per binary).
+
+    Optional argv must survive native builds that do not define a flag: argparse rejects the
+    whole invocation with exit 2 on an unknown argument, so an unsupported annotation cost
+    the entire papercut instead of itself. Probing the build's own help keeps the record.
+    """
+    key = (binary, mode)
+    text = _HELP_CACHE.get(key)
+    if text is None:
+        try:
+            proc = subprocess.run([binary, mode, "--help"], capture_output=True,
+                                  text=True, timeout=5)
+            text = f"{proc.stdout or ''}{proc.stderr or ''}"
+        except (OSError, subprocess.SubprocessError):
+            text = ""  # unprobeable: treat as unsupported rather than risk the record
+        _HELP_CACHE[key] = text
+    return flag in text
 
 
 def _parse_time_lost(value) -> float:
@@ -129,7 +153,20 @@ def register(ctx) -> None:
                 return _err("redaction unavailable; refusing to file raw summary")
             argv = [binary, "report", "--category", category,
                     "--severity", severity, "--summary", red_summary]
-            context_lines = []
+            time_note = None
+            if args.get("time_lost_seconds") is not None:
+                try:
+                    seconds = _parse_time_lost(args["time_lost_seconds"])
+                except ValueError as exc:
+                    return _err(str(exc))
+                # observed loss only — never inferred from operation success/duration
+                if _supports(binary, "report", "--time-lost-seconds"):
+                    argv += ["--time-lost-seconds", repr(seconds)]
+                else:
+                    # This build has no timing field: keep the observation in the context
+                    # rather than letting argparse reject the whole report.
+                    time_note = f"observed time lost: {seconds}s"
+            context_lines = [time_note] if time_note else []
             for field in ("expected", "observed", "tool_versions", "repro", "reference"):
                 value = args.get(field)
                 if value:
@@ -155,13 +192,6 @@ def register(ctx) -> None:
                 if red_blame is None:
                     return _err("redaction unavailable; refusing to file raw blame")
                 argv += ["--blame", red_blame]
-            if args.get("time_lost_seconds") is not None:
-                try:
-                    seconds = _parse_time_lost(args["time_lost_seconds"])
-                except ValueError as exc:
-                    return _err(str(exc))
-                argv += ["--time-lost-seconds", repr(seconds)]
-                # observed loss only — never inferred from operation success/duration
             return _forward(mode, argv)
 
         if mode == "list":
@@ -173,6 +203,8 @@ def register(ctx) -> None:
             if args.get("limit"):
                 argv += ["--limit", str(int(args["limit"]))]
             if args.get("sort") == "impact":
+                if not _supports(binary, "list", "--sort"):
+                    return _err("sort: this papercuts build has no --sort; impact ranking unavailable")
                 argv += ["--sort", "impact"]
             elif args.get("sort") is not None:
                 return _err("sort must be 'impact'")

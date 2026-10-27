@@ -143,6 +143,42 @@ def test_absent_settings_loads_idle_unit(monkeypatch):
     assert _status(ctx)["config"]["roles"] == {}
 
 
+def _entry_subtree(monkeypatch, entry):
+    """Register against a raw ``plugins.entries.<id>`` table, exercising the real
+    subtree resolution in ``_entry_settings`` instead of stubbing it out."""
+    import hermes_cli.config as host_config
+    monkeypatch.setattr(host_config, "load_config_readonly",
+                        lambda: {"plugins": {"entries": {PLUGIN_ID: entry}}})
+    spec = importlib.util.spec_from_file_location(
+        "model_routing_subtree", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_known_providers", lambda: None)
+    ctx = _FakeCtx()
+    mod.register(ctx)
+    return ctx
+
+
+def test_table_under_legacy_config_subtree_is_not_idle(monkeypatch):
+    # The host's ctx.get_config falls back to the legacy ``config`` subtree on
+    # the same entry; reading only ``settings`` made such a table look empty and
+    # left routing silently idle.
+    ctx = _entry_subtree(monkeypatch, {"config": dict(APPLY_SETTINGS)})
+    assert _status(ctx)["config"]["roles"]["executor"]["model"] == "glm-5.3"
+
+
+def test_settings_key_wins_over_the_legacy_config_subtree(monkeypatch):
+    # Host precedence: a key present under ``settings`` wins; only a missing one
+    # falls back to ``config``.
+    ctx = _entry_subtree(monkeypatch, {
+        "config": {"roles": APPLY_SETTINGS["roles"], "fallback": "inherit"},
+        "settings": {"fallback": "refuse"},
+    })
+    status = _status(ctx)
+    assert status["config"]["fallback"] == "refuse"
+    assert status["config"]["roles"]["observer"]["model"] == "qwen3.8-flash-next"
+
+
 def test_valid_config_loads_and_reports(isolated_hermes, load_plugin):
     isolated_hermes.config["providers"] = {"lilith": LILITH}
     harness = load_plugin(PLUGIN_ID, settings=APPLY_SETTINGS)

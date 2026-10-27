@@ -511,8 +511,13 @@ def register(ctx) -> None:
         description="Inspect steering mode resolution (active/withheld/conflicts, hit verdicts, unresolved refs, built-in magic keywords) for this session.",
     )
 
-    def _drop_turns(session_id="", previous_session_id="", **_kw):
-        for identity in (session_id, previous_session_id):
+    def _drop_turns(session_id="", old_session_id="", new_session_id="",
+                    session_key="", **_kw):
+        # The host rotates with on_session_reset(session_id=<new>, old_session_id=…,
+        # new_session_id=…) and interrupts with agent_loop_stopped(session_key=…); it never
+        # sent the previous_session_id this used to key on, so the outgoing session's
+        # record leaked for the life of the process. Drop every identifier it does send.
+        for identity in (session_id, old_session_id, new_session_id, session_key):
             if isinstance(identity, str) and identity:
                 records.pop(identity, None)
 

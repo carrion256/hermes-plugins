@@ -443,10 +443,14 @@ def register(ctx) -> None:
         switch is logged with the receipt reason and never retried; the child simply
         continues on its current model. Top-level sessions are untouched — they arm
         via prewalk_arm and switch only via a validated prewalk_ready."""
+        # Migration first, as at every other entry point: compaction reassigns
+        # agent.session_id on the SAME object, so a child whose id rotated
+        # mid-turn would fail the child_lane guard below and be dropped with its
+        # armed entry orphaned under the old id.
+        _migrate(session_id)
         if (not session_id or session_id not in child_lane
                 or session_id not in armed or session_id in handed_off):
             return None
-        _migrate(session_id)
         target = armed.get(session_id)
         # Consume the lane BEFORE attempting the switch: exactly once per child, ever.
         armed.pop(session_id, None)

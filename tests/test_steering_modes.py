@@ -91,6 +91,21 @@ def test_session_reset_drops_records(steering):
     assert _turn(steering, "please review this") != []
 
 
+def test_session_reset_drops_the_outgoing_session(steering):
+    # The host rotates a session with on_session_reset(session_id=<new>,
+    # old_session_id=<old>, new_session_id=<new>) (gateway/slash_commands_session.py), so
+    # the outgoing session's steering record must be dropped by the id it actually sends.
+    assert _turn(steering, "please review this", session_id="sess-old") != []
+    assert _turn(steering, "please review this", session_id="sess-new",
+                 turn_id="turn-9") != []
+    steering.hook("on_session_reset", session_id="sess-new", reason="new_session",
+                  platform="cli", old_session_id="sess-old", new_session_id="sess-new")
+    assert _status(steering, session_id="sess-old")["state"] == "inactive"
+    # The continuation is unaffected: its record is rebuilt on the next turn.
+    assert _turn(steering, "please review this", session_id="sess-new",
+                 turn_id="turn-10") != []
+
+
 # --- deterministic conflict resolution ---------------------------------------
 
 CONFLICT_MODES = {

@@ -822,6 +822,32 @@ def test_child_handoff_no_switch_when_already_on_target(load_plugin, live_agent,
     assert json.loads(h.tool("prewalk_status", {}, session_id="c1"))["state"] == "handed_off"
 
 
+def test_child_handoff_follows_same_agent_session_rotation(load_plugin, live_agent,
+                                                           monkeypatch):
+    """Compaction reassigns agent.session_id on the SAME object while the child is
+    mid-turn: its first post_tool_call must still consume the armed lane under the
+    rotated id, not be dropped by the child_lane guard with the entry orphaned and
+    the child never switched."""
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    calls = _fake_switch_seam(monkeypatch)
+    child = _child_agent()
+    with bind_subagent_parent(child):
+        h.hook("subagent_start", parent_session_id="s", child_session_id="c1",
+               child_goal="g", child_model_role="task")
+        # the child's first model turn records its live session identity
+        assert h.hook("pre_llm_call", session_id="c1", user_message="plan",
+                      is_first_turn=True)
+        child.session_id = "c1-rotated"
+        h.hook("post_tool_call", session_id="c1-rotated", tool_name="read_file",
+               args={"path": "widget.py"}, result="ok", status="ok")
+        assert child.model == TARGET
+    real = [c for c in calls if not c["dry_run"]]
+    assert len(real) == 1 and real[0]["model"] == TARGET
+    assert json.loads(h.tool("prewalk_status", {},
+                             session_id="c1-rotated"))["state"] == "handed_off"
+    assert json.loads(h.tool("prewalk_status", {}, session_id="c1"))["state"] == "inactive"
+
+
 def test_child_handoff_failure_warned_and_never_retried(load_plugin, live_agent,
                                                         monkeypatch, caplog):
     import logging

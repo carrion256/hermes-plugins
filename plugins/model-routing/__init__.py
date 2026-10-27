@@ -42,19 +42,35 @@ _REVIEW_SURFACES = ("curator", "background_review", "review")
 
 
 def _entry_settings(ctx):
-    """This plugin's raw ``plugins.entries.<id>.settings`` value via the host
-    config API: a mapping, ``None`` when absent or the host API is unavailable,
-    or whatever malformed value is on disk — ``_read_settings`` decides which
-    is which, so a present-but-broken settings block fails loud instead of
-    silently loading idle."""
+    """This plugin's effective settings mapping via the host config API: a
+    mapping, ``None`` when absent or the host API is unavailable, or whatever
+    malformed value is on disk — ``_read_settings`` decides which is which, so a
+    present-but-broken block fails loud instead of silently loading idle.
+
+    Precedence mirrors ``PluginContext.get_config`` in the host
+    (``hermes_cli/plugins.py``): a key present under
+    ``plugins.entries.<id>.settings`` wins, a missing one falls back to the
+    legacy ``config`` subtree on the same entry. A table configured under
+    ``config:`` is otherwise valid host config that this plugin would read as
+    empty — zero roles, routing silently idle."""
     plugin_id = getattr(ctx, "plugin_id", None) or "model-routing"
     try:
         from hermes_cli.config import load_config_readonly
         entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
         entry = entries.get(plugin_id)
-        settings = entry.get("settings") if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        settings = entry.get("settings")
+        legacy = entry.get("config")
     except Exception:  # host API unavailable — degrade to an idle plugin
         return None
+    if settings is None:
+        return legacy
+    if isinstance(settings, dict) and isinstance(legacy, dict):
+        # Whole-block merge == the host's per-key precedence (settings wins). The
+        # legacy keys are merged, not filtered: a typo there must fail loud like
+        # one under settings, not leave the table silently short a field.
+        return {**legacy, **settings}
     return settings
 
 

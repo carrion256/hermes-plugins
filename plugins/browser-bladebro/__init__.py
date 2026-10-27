@@ -646,6 +646,28 @@ def register(ctx) -> None:
         _in_tab(tab_id, {"action": "navigate", "url": "about:blank"})
         return _err(f"Blocked: page landed on {landed}: {blocked['error']}")
 
+    def _private_page_blocked(kw, why: str) -> str | None:
+        """Host SSRF-guard parity (``browser_tool._blocked_private_page``): when
+        the guard is active in this browser mode, a page that moved itself to a
+        private/internal address (JS ``location=``, meta refresh, an eval) yields
+        no content and takes no input. The URL probe is this plugin's own tab
+        run — the host probe reads the host browser session, which this plugin
+        never drives; the verdict itself is the host's ``_url_blocked``."""
+        if not _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]):
+            return None
+        out, _probe_err = _task_steps(kw, HREF_STEP)
+        if out is None:
+            return None  # probe failed: fail open, like _current_page_private_url
+        landed = _eval_value(out.get(2, ""))
+        if isinstance(landed, str) and _bt._eval_policy._url_blocked(_bt, landed):
+            return _bt._blocked_private_page_json(landed, why)
+        return None
+
+    def _input_blocked(kw, action: str) -> str | None:
+        """Host ``_blocked_private_page_action`` parity for the input tools."""
+        return _private_page_blocked(
+            kw, f"Refusing to {action} on this page in this browser mode.")
+
     def _act(kw, step: dict, fields: dict, failure: str) -> dict:
         """One page action; the backend's verdict + page delta rides along as
         ``result`` so the model rarely needs a separate browser_snapshot."""
@@ -691,12 +713,18 @@ def register(ctx) -> None:
         body = out.get(2, "")
         if body.startswith("see ("):  # drop the "see (N chars):" framing line
             body = body.split("\n", 1)[1] if "\n" in body else ""
+        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        if blocked is not None:
+            return blocked
         return _json({"success": True, **_snapshot_fields(body)})
 
     def browser_click(args: dict, **kw) -> str:
         ref = _native_ref(args.get("ref"))
         if not ref:
             return _err("ref is required")
+        blocked = _input_blocked(kw, "click")
+        if blocked is not None:
+            return blocked
         return _json(_act(kw, {"action": "click", "ref": ref}, {"clicked": f"@{ref}"},
                           f"Failed to click @{ref}"))
 
@@ -707,6 +735,9 @@ def register(ctx) -> None:
             return _err("ref is required")
         # The typed value already went to the page; keep secrets out of history.
         shown = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
+        blocked = _input_blocked(kw, "type")
+        if blocked is not None:
+            return blocked
         response = _act(kw, {"action": "type", "ref": ref, "text": text},
                         {"typed": shown, "element": f"@{ref}"}, f"Failed to type into @{ref}")
         return _json(redact_browser_typed_text_for_display(response, text))
@@ -735,6 +766,9 @@ def register(ctx) -> None:
         key = str(args.get("key", ""))
         if not key:
             return _err("key is required")
+        blocked = _input_blocked(kw, "press")
+        if blocked is not None:
+            return blocked
         return _json(_act(kw, {"action": "press", "key": key}, {"pressed": key},
                           f"Failed to press {key}"))
 
@@ -742,6 +776,9 @@ def register(ctx) -> None:
         out, err = _task_steps(kw, {"action": "eval", "js": GET_IMAGES_JS})
         if out is None:
             return _err(err or "Failed to get images")
+        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        if blocked is not None:
+            return blocked
         images = _eval_value(out.get(2, ""))
         if not isinstance(images, list):
             return _json({"success": True, "images": [], "count": 0,
@@ -755,9 +792,21 @@ def register(ctx) -> None:
             policy_error = _bt._eval_policy._enforce_browser_eval_policy(expression)
             if policy_error:
                 return _err(policy_error)
+            # Built-in pre-scan: a fetch/XHR to an internal address never
+            # updates location.href, so the post-eval recheck cannot see it.
+            if _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]):
+                literal = _bt._eval_policy._expression_targets_private_url(str(expression))
+                if literal:
+                    return _err("Blocked: JavaScript expression targets a private or "
+                                f"internal address ({literal}). Reading internal "
+                                "endpoints via browser_console is not permitted in "
+                                "this browser mode.")
             out, err = _task_steps(kw, {"action": "eval", "js": str(expression)})
             if out is None:
                 return _err(err)
+            blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+            if blocked is not None:
+                return blocked
             value = _snap._redact_browser_output(_eval_value(out.get(2, "")))
             return _json({"success": True, "result": value, "result_type": type(value).__name__})
         tab_id = _task_tab(kw)
@@ -766,6 +815,9 @@ def register(ctx) -> None:
         out, err = _in_tab(tab_id, {"action": "see", "logs": "console"})
         if out is None:
             return _err(err)
+        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        if blocked is not None:
+            return blocked
         entries: list[list[str]] = []
         for line in out.get(2, "").splitlines()[1:]:
             if line.startswith("console"):  # "console (N entries):" / "console: (empty)"
@@ -806,6 +858,9 @@ def register(ctx) -> None:
         # the plugin lock. ponytail: serializes this process only; another
         # process driving the same backend can switch tabs in between. Upgrade
         # path: a backend vision step inside `run` (or a target_id on vision).
+        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        if blocked is not None:
+            return blocked
         with _browser_lock:
             switched = _mcp("state", {"op": "switch-tab", "target_id": tab_id})
             if not switched.get("ok"):
@@ -851,6 +906,14 @@ def register(ctx) -> None:
         expected_url = _eval_value(here.get(2, ""))
         if not isinstance(expected_url, str) or not expected_url:
             return _err("could not read the task tab's current URL; batch refused")
+        # Built-in input-action guard parity: a batch can click/type/press, so a
+        # page sitting on an internal address must not receive it. The URL is the
+        # one already read for the approval binding — no extra probe.
+        if _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]) \
+                and _bt._eval_policy._url_blocked(_bt, expected_url):
+            return _bt._blocked_private_page_json(
+                expected_url, "Refusing to run this batch on this page in this "
+                              "browser mode.")
         if effects:
             # Approval binds session+task+workspace+server+tab+target+the FULL
             # plugin-generated guarded batch; the model cannot self-authorize.
