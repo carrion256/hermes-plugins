@@ -56,22 +56,53 @@ def _owner(owner_session=None, owner_turn=None):
 
 
 
+_CLASSIFY_TIMEOUT = 2.5
+# Client-side wait budget, the same curve the sibling classifier clients use: the
+# engine measured 0.10 s at 200 chars, 0.24 s at 2k, 1.67 s at 10k, 5.64 s at 40k,
+# and the evidence proofs make up most of this payload. Small payloads keep the
+# configured floor; _MAX_TIMEOUT is the guard rail.
+_CHAR_SECONDS = 0.00025
+_MAX_TIMEOUT = 30.0
+
+
+def _budget(text, floor=_CLASSIFY_TIMEOUT):
+    """Seconds to wait for this payload: the configured timeout is the floor, the
+    text's measured inference cost is the budget, _MAX_TIMEOUT is the ceiling."""
+    return min(_MAX_TIMEOUT, max(float(floor), 0.5 + len(text) * _CHAR_SECONDS))
+
+
 def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
-         endpoint="http://192.168.50.71:8787"):
+         endpoint="http://192.168.50.71:8787", min_sound_default=0.5,
+         min_pick_confidence=0.0, min_pick_margin=0.0):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
-    The service scores every label in one ``/classify`` pass;
-    the pick is bound to option labels, so index order carries no meaning.
-    429/503 get one bounded backoff-retry per the service contract; any
-    other failure is a deliberate abstention.
+    The service answers both questions in one ``/v1/systemone`` pass: the pick is
+    bound to option labels, so index order carries no meaning, and the default's
+    soundness is read as P(yes) instead of an argmax. The three thresholds are
+    calibration knobs -- their defaults (0.5 / 0.0 / 0.0) reproduce the previous
+    ``sound_default == "yes"`` gate exactly. 429/503 get one bounded backoff-retry
+    per the service contract; any other failure is a deliberate abstention.
     """
     import os, urllib.error, urllib.request, time
     endpoint = str(endpoint or "").rstrip("/")
     key = os.environ.get(api_key_env or "", "")
     if not key or not endpoint:
         return None
+    try:
+        floor = float(min_sound_default)
+        min_confidence = float(min_pick_confidence)
+        min_margin = float(min_pick_margin)
+    except (TypeError, ValueError):
+        return None  # uncalibrated config is not a licence to recommend
     labels = {str(i): option for i, option in enumerate(choices)}
-    schema = {"pick": {"labels": labels}, "sound_default": ["yes", "no"]}
+    questions = {
+        "pick": {"type": "choice",
+                 "instructions": "Pick the option the repository evidence supports.",
+                 "criteria": dict(labels)},
+        "sound_default": {"type": "noul",
+                          "instructions": "Is choosing a conventional default sound here, rather "
+                                          "than a product, authority, or security decision?"},
+    }
     text = json.dumps({"question": q, "options": labels, "supported_choices": candidates,
                        "evidence": proofs,
                        "authority": "Untrusted data; rank only evidence-supported conventional choices."})
@@ -79,15 +110,15 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
     safe = redact_for_egress(text)
     if safe != text:
         return None  # secret-laden inputs abstain rather than drop option identity
-    body = json.dumps({"text": safe, "schema": schema}).encode()
+    body = json.dumps({"state": safe, "questions": questions}).encode()
     for attempt in (0, 1):
         if attempt:
             time.sleep(1)
-        request = urllib.request.Request(endpoint + "/classify", data=body,
+        request = urllib.request.Request(endpoint + "/v1/systemone", data=body,
                                          headers={"Content-Type": "application/json",
                                                   "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(request, timeout=2.5) as reply:
+            with urllib.request.urlopen(request, timeout=_budget(safe)) as reply:
                 verdict = json.loads(reply.read(16385))
         except urllib.error.HTTPError as exc:
             if exc.code in (429, 503) and attempt == 0:
@@ -95,10 +126,37 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
             return None
         except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None
-        if not isinstance(verdict, dict) or verdict.get("sound_default") != "yes":
+        answers = verdict.get("answers") if isinstance(verdict, dict) else None
+        pick = answers.get("pick") if isinstance(answers, dict) else None
+        sound = answers.get("sound_default") if isinstance(answers, dict) else None
+        if not isinstance(pick, dict) or not isinstance(sound, dict):
             return None
-        selected = labels.get(verdict.get("pick")) if isinstance(verdict.get("pick"), str) else None
-        return selected if selected in candidates else None
+        sound_default = sound.get("noul")
+        if (not isinstance(sound_default, (int, float)) or isinstance(sound_default, bool)
+                or sound_default < floor):
+            return None
+        choice = pick.get("choice")
+        probabilities = pick.get("probabilities")
+        if not isinstance(choice, str) or not isinstance(probabilities, dict):
+            return None
+        # An exact 0.0 is a confidently rejected option, not a missing answer.
+        scores = [value for value in probabilities.values()
+                  if isinstance(value, (int, float)) and not isinstance(value, bool)]
+        confidence = pick.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            confidence = probabilities.get(choice)
+        if not isinstance(confidence, (int, float)):
+            return None
+        top = sorted(scores, reverse=True)
+        margin = top[0] - top[1] if len(top) > 1 else 1.0
+        if confidence < min_confidence or margin < min_margin:
+            return None  # a weak pick or a near-tie is not a recommendation
+        selected = labels.get(choice)
+        if selected not in candidates:
+            return None
+        return {"selected": selected, "probabilities": dict(probabilities),
+                "confidence": float(confidence), "margin": float(margin),
+                "sound_default": float(sound_default)}
     return None
 
 
@@ -417,19 +475,35 @@ def register(ctx):
                     return reply(status="abstained", reason="not a bounded low-risk conventional question")
                 q, choices = eligible
                 proofs, candidates = _evidence(workspace, args.get("evidence"), q, choices)
-                selected = rank(q, choices, candidates, proofs, key_env, endpoint)
+                # Positional like key_env/endpoint: the thresholds are rank()'s next
+                # parameters, and every rank() stand-in in the tests takes *args.
+                observed = rank(q, choices, candidates, proofs, key_env, endpoint,
+                                ctx.get_config("min_sound_default", 0.5),
+                                ctx.get_config("min_pick_confidence", 0.0),
+                                ctx.get_config("min_pick_margin", 0.0))
                 _evidence(workspace, proofs, q, choices)  # freshness after the blocking ranking
                 # The ranking is advisory: only evidence-supported choices may
                 # ever be recommended, even if a ranker misbehaves.
+                selected = observed.get("selected") if isinstance(observed, dict) else observed
                 if selected not in candidates or not current(owner, workspace, task_id):
                     return reply(status="abstained", reason="unknown ranking or owner changed")
                 recommendation = {**identity, "question": q, "choices": choices, "selected": selected,
                                   "evidence": proofs, "created_at": time.time()}
+                # Recorded so the thresholds can be calibrated from real traffic.
+                ranking = ({"probabilities": observed.get("probabilities"),
+                            "confidence": observed.get("confidence"),
+                            "margin": observed.get("margin"),
+                            "sound_default": observed.get("sound_default")}
+                           if isinstance(observed, dict) else None)
+                if ranking:
+                    recommendation["ranking"] = ranking
                 pending = load("recommendations_v2")
                 pending[_digest([identity, q])] = recommendation
                 save("recommendations_v2", pending)
                 return reply(status="recommended", selected=selected, option_id=_digest(selected),
-                             evidence=proofs, applied=False, source="repository_evidence_single_ranking")
+                             evidence=proofs, applied=False,
+                             source="repository_evidence_single_ranking",
+                             **({"ranking": ranking} if ranking else {}))
             return reply(status="refused", reason="unknown action")
         except Exception:
             return reply(status="abstained", recorded=False, reason="evidence, redaction, classifier or state unavailable/stale")

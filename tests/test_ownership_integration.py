@@ -33,8 +33,11 @@ def recommend_indentation(h, agent, tmp_path, monkeypatch, choice="spaces"):
     record_session_cwd("task", str(tmp_path))
     style = {"spaces": "space", "tabs": "tab"}[choice]
     (tmp_path / ".editorconfig").write_text(f"root = true\n[*]\nindent_style = {style}\n")
-    classifier(monkeypatch, h.module, {
-        "pick": str(["spaces", "tabs"].index(choice)), "sound_default": "yes"})
+    index = ["spaces", "tabs"].index(choice)
+    classifier(monkeypatch, h.module, {"answers": {
+        "pick": {"type": "choice", "choice": str(index), "confidence": 0.98,
+                 "probabilities": {str(index): 0.98, str(1 - index): 0.02}},
+        "sound_default": {"type": "noul", "noul": 0.99}}})
     with bind_subagent_parent(agent):
         result = json.loads(h.tool("clarification_defaults", {
             "action": "recommend", "question": "Which indentation?",
@@ -242,7 +245,9 @@ def test_process_mutations_use_native_risk_directives(load_plugin, monkeypatch, 
     from hermes_cli.plugins import get_pre_tool_call_directive
 
     h = load_plugin("auto-review-classifier", {"policy": policy, "api_key_env": "AUDIT_CLASSIFIER_KEY"})
-    classifier(monkeypatch, h.module, {"risk": "risky"})
+    classifier(monkeypatch, h.module, {"answers": {"review": {
+        "type": "choice", "choice": "risky", "confidence": 0.97,
+        "probabilities": {"risky": 0.97, "safe": 0.03}}}})
     for action in ["submit", "write", "kill", "close"]:
         directive, message = get_pre_tool_call_directive("process_manage", {"action":action}, session_id="owner")
         assert directive == expected and "human review" in message

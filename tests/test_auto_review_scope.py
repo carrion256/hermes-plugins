@@ -21,6 +21,15 @@ class Reply:
         return json.dumps(self.body).encode()
 
 
+def envelope(risky_probability, choice=None):
+    """A /v1/systemone answer for the plugin's `review` choice question."""
+    probabilities = {"risky": risky_probability, "safe": 1.0 - risky_probability}
+    answer = {"type": "choice", "probabilities": probabilities,
+              "choice": choice or ("risky" if risky_probability >= 0.5 else "safe")}
+    answer["confidence"] = probabilities[answer["choice"]]
+    return {"model": "synthetic", "usage": {}, "answers": {"review": answer}}
+
+
 def gate_setup(load_plugin, monkeypatch, verdict="risky", policy="ask"):
     h = load_plugin("auto-review-classifier",
                     {"policy": policy, "api_key_env": "REVIEW_TEST_KEY"})
@@ -30,8 +39,10 @@ def gate_setup(load_plugin, monkeypatch, verdict="risky", policy="ask"):
     def fake_urlopen(request, *_a, **_kw):
         raw = json.loads(request.data)
         raws.append(raw)
-        captured.append(raw["text"])
-        return Reply({"risk": verdict})
+        captured.append(raw["state"])
+        if verdict is None:
+            return Reply({"answers": {}})  # no answer for our question: unusable
+        return Reply(envelope(0.97 if verdict == "risky" else 0.03))
 
     monkeypatch.setenv("REVIEW_TEST_KEY", "synthetic-key")
     monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
@@ -78,8 +89,10 @@ def test_secret_values_never_reach_classifier(load_plugin, monkeypatch):
                          "correct horse", "horse battery staple"):
             assert fragment not in h.captured[-1], (args, fragment)
         request = h.raws[-1]
-        assert isinstance(request["text"], str)
-        assert request["schema"]["risk"] == ["safe", "risky"]
+        assert isinstance(request["state"], str)
+        question = request["questions"]["review"]
+        assert question["type"] == "choice"
+        assert sorted(question["criteria"]) == ["risky", "safe"]
         summary = json.loads(h.captured[-1])
         assert "secret_values_redacted" in summary["unknown"]
         if "command" in args:
@@ -299,7 +312,7 @@ def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_
     clock.now += h.module._COOLDOWN_SECONDS + 1
     recovered = []
     monkeypatch.setattr(h.module.urllib.request, "urlopen",
-                        lambda request, *_a, **_kw: recovered.append(1) or Reply({"risk": "safe"}))
+                        lambda request, *_a, **_kw: recovered.append(1) or Reply(envelope(0.03)))
     assert screen(h, agent, "task-expired", "write_file",
                   {"path": str(target), "content": "after"}) == []
     assert recovered == [1]  # classifier retried exactly once after expiry
@@ -310,9 +323,51 @@ def test_classify_timeout_is_bounded(load_plugin, monkeypatch):
     seen = []
 
     def spy(request, *args, timeout=None, **_kw):
-        seen.append(timeout)
-        return Reply({"risk": "safe"})
+        seen.append((timeout, len(json.loads(request.data)["state"])))
+        return Reply(envelope(0.03))
 
     monkeypatch.setattr(h.module.urllib.request, "urlopen", spy)
     screen(h, local_agent(), "task-timeout-bound", "terminal", {"command": "echo hi"})
-    assert seen and all(t is not None and t <= 3 for t in seen)
+    # A many-field call reaches the _MAX_SUMMARY-512 payload the flat timeout this replaced
+    # could never cover: measured ~0.17 ms/char on the live engine, so >15k chars needs
+    # more than 2.5 s and used to black the endpoint out for the whole cooldown.
+    screen(h, local_agent(), "task-timeout-big", "terminal",
+           {chr(97 + i): "x" * 2000 for i in range(10)})
+
+    (small_timeout, small_chars), (big_timeout, big_chars) = seen
+    floor, cap = h.module._CLASSIFY_TIMEOUT, h.module._MAX_TIMEOUT
+    assert small_chars < big_chars and big_chars > 10000
+    assert all(floor <= t <= cap for t, _ in seen)  # bounded, never below the configured floor
+    assert big_timeout > small_timeout  # the wait tracks the payload it is paying for
+    assert h.module._budget("") == floor  # the configured timeout remains the floor
+    assert h.module._budget("x" * 1000000) == cap  # the guard rail still holds
+
+
+@pytest.mark.parametrize("probability,choice,needs_review", [
+    # The label alone would pass this: the head says "safe" while P(risky) is at the
+    # configured boundary. Only the probability may decide.
+    (0.5, "safe", True),
+    # And the label alone would block this: the head says "risky" while P(risky) sits
+    # below the boundary. Only the probability may decide.
+    (0.4999, "risky", False),
+])
+def test_decision_thresholds_the_probability_not_the_label(load_plugin, monkeypatch, tmp_path,
+                                                           probability, choice, needs_review):
+    h = gate_setup(load_plugin, monkeypatch, verdict="safe")
+    workspace_for("task-threshold", tmp_path)
+    target = tmp_path / "f.txt"
+    target.write_text("a")
+    monkeypatch.setattr(h.module.urllib.request, "urlopen",
+                        lambda request, *_a, **_kw: Reply(envelope(probability, choice)))
+    result = screen(h, local_agent(), "task-threshold", "write_file",
+                    {"path": str(target), "content": "b"}, tool_call_id="c1")
+    if not needs_review:
+        assert result == []  # below the threshold: a clean pass, never a block
+        return
+    directive, = result
+    assert directive["action"] == "approve"
+    # The decision row carries what the threshold was compared against, so the
+    # threshold can be recalibrated against observed probabilities later.
+    row = directive["risk_review"]
+    assert row["probability"] == probability
+    assert row["threshold"] == 0.5 == h.module._RISKY_THRESHOLD

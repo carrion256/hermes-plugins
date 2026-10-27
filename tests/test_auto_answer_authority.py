@@ -32,12 +32,29 @@ def bind_agent(agent, task_id, cwd):
     return bind_subagent_parent(agent)
 
 
-def setup(load_plugin, monkeypatch, agent=None):
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "ANSWER_TEST_KEY"})
+def setup(load_plugin, monkeypatch, agent=None, **settings):
+    h = load_plugin("auto-answer-classifier", {"api_key_env": "ANSWER_TEST_KEY", **settings})
     if agent is not None:
         monkeypatch.setattr(h.module, "_owner", lambda *a: (agent, agent.session_id, agent._current_turn_id))
     monkeypatch.delenv("ANSWER_TEST_KEY", raising=False)
     return h
+
+
+def systemone_reply(choice, probabilities, confidence=0.99, sound_default=0.99):
+    """One ``/v1/systemone`` envelope: a choice answer plus a yes/no answer."""
+    class Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self, size=-1):
+            return json.dumps({"model": "test", "usage": {}, "answers": {
+                "pick": {"type": "choice", "choice": choice,
+                         "probabilities": probabilities, "confidence": confidence},
+                "sound_default": {"type": "noul", "noul": sound_default}}}).encode()
+    return Reply()
 
 
 def observed_proof(h, *, session_id="owner", turn_id="turn", task_id="task",
@@ -135,19 +152,11 @@ def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_
     h = setup(load_plugin, monkeypatch, agent)
     captured = []
 
-    class Reply:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
-        def read(self, size=-1):
-            return b'{"pick": "1", "sound_default": "yes"}'
-
     def fake_urlopen(request, *_a, **_kw):
-        captured.append(json.loads(request.data))
-        return Reply()
+        captured.append({"url": request.full_url,
+                         "auth": request.headers.get("Authorization"),
+                         "body": json.loads(request.data)})
+        return systemone_reply("1", {"0": 0.01, "1": 0.98}, confidence=0.98)
 
     monkeypatch.setenv("ANSWER_TEST_KEY", "synthetic-key")
     monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
@@ -163,10 +172,43 @@ def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_
             "choices": ["tabs", "spaces"], "evidence": [reference]}, task_id="task"))
     assert result["status"] == "recommended" and result["applied"] is False
     assert len(captured) == 1  # exactly one ranking call
-    schema = captured[0]["schema"]
+    request = captured[0]
+    assert request["url"].endswith("/v1/systemone")
+    assert request["auth"] == "Bearer synthetic-key"  # the key goes out; the state never does unredacted
+    questions = request["body"]["questions"]
     # ALL options ranked, identity by label; pick "1" maps to spaces, not index 0.
-    assert schema["pick"]["labels"] == {"0": "tabs", "1": "spaces"}
+    assert questions["pick"]["type"] == "choice"
+    assert questions["pick"]["criteria"] == {"0": "tabs", "1": "spaces"}
+    assert questions["sound_default"]["type"] == "noul"
     assert result["selected"] == "spaces"
+    # What the service reported is recorded, so thresholds can be calibrated later.
+    assert result["ranking"]["probabilities"] == {"0": 0.01, "1": 0.98}
+    assert result["ranking"]["confidence"] == pytest.approx(0.98)
+    assert result["ranking"]["margin"] == pytest.approx(0.97)
+    assert result["ranking"]["sound_default"] == pytest.approx(0.99)
+
+
+def test_near_tie_ranking_abstains_until_the_margin_is_decisive(load_plugin, tmp_path, monkeypatch):
+    """P(pick)=0.51 vs 0.49 is a coin flip: the margin gate refuses it, and only the gate does."""
+    agent = native_agent()
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n")
+
+    def fake_urlopen(request, *_a, **_kw):
+        return systemone_reply("0", {"0": 0.51, "1": 0.49}, confidence=0.51)
+
+    for margin, expected in ((0.1, "abstained"), (0.0, "recommended")):
+        h = setup(load_plugin, monkeypatch, agent, min_pick_margin=margin)
+        monkeypatch.setenv("ANSWER_TEST_KEY", "synthetic-key")
+        monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
+        with bind_agent(agent, "task", tmp_path):
+            result = json.loads(h.tool("clarification_defaults", {
+                "action": "recommend", "question": "Which indentation?",
+                "choices": ["tabs", "spaces"],
+                "evidence": [{"path": ".editorconfig"}]}, task_id="task"))
+        assert result["status"] == expected, margin
+        if expected == "recommended":
+            assert result["selected"] == "tabs"
+            assert result["ranking"]["margin"] == pytest.approx(0.02)
 
 
 def test_existing_repo_config_file_supports_default_without_hash(load_plugin, tmp_path, monkeypatch):

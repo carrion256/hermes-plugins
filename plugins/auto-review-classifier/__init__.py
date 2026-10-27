@@ -20,7 +20,27 @@ import uuid
 
 _CLASSIFY_TIMEOUT = 2.5
 _COOLDOWN_SECONDS = 45
+# Client-side wait budget. Measured on the deployed engine (worst of 5 samples per size):
+# 0.10 s at 200 chars, 0.24 s at 2k, 1.67 s at 10k, 5.64 s at 40k, 12.8 s at 90k -- about
+# 0.17 ms/char plus fixed overhead, with a ~2x tail from queueing behind the service's
+# serialised inference lane. `_outbound` may emit up to _MAX_SUMMARY chars, which the flat
+# 2.5 s could not cover: the call timed out and blacked the endpoint out for the cooldown.
+# Small payloads keep the configured floor; _MAX_TIMEOUT is the guard rail.
+_CHAR_SECONDS = 0.00025
+_MAX_TIMEOUT = 30.0
+# Decision boundary on P(risky) from the /v1/systemone choice head. 0.5 is the argmax
+# of the two-label head this replaces, so the documented default reproduces its verdicts
+# exactly; it is a config knob (`threshold`), recorded with every decision so it can be
+# recalibrated against real probabilities.
+_RISKY_THRESHOLD = 0.5
 logger = logging.getLogger(__name__)
+
+
+def _budget(text):
+    """Seconds to wait for this payload: configured timeout is the floor, the text's
+    measured inference cost is the budget, _MAX_TIMEOUT is the ceiling."""
+    return min(_MAX_TIMEOUT, max(_CLASSIFY_TIMEOUT, 0.5 + len(text) * _CHAR_SECONDS))
+
 _SKIP = {"read_file", "search_files", "web_search", "web_extract", "skill_view",
          "skills_list", "ha_get_state", "ha_list_entities", "ha_list_services"}
 _POLLING = {"list", "poll", "log", "wait"}
@@ -251,16 +271,31 @@ def register(ctx):
             return None
         if not key or not endpoint:
             return None
-        request = urllib.request.Request(endpoint + "/classify",
-                                         data=json.dumps({"text": text, "schema": {"risk": ["safe", "risky"]}}).encode(),
+        threshold = _RISKY_THRESHOLD
+        try:
+            threshold = float(ctx.get_config("threshold", _RISKY_THRESHOLD))
+        except (TypeError, ValueError):
+            pass  # unusable config never becomes a block: keep the default boundary
+        request = urllib.request.Request(endpoint + "/v1/systemone",
+                                         data=json.dumps({"state": text, "questions": {"review": {
+                                             "type": "choice",
+                                             "instructions": "Does this tool call need human review before it runs?",
+                                             "criteria": {"risky": "destructive, irreversible, or exfiltrating",
+                                                          "safe": "no destructive, irreversible, or exfiltrating effect"}}}}).encode(),
                                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(request, timeout=_CLASSIFY_TIMEOUT) as reply:
+            with urllib.request.urlopen(request, timeout=_budget(text)) as reply:
                 data = json.loads(reply.read(16385))
-            verdict = data.get("risk") if isinstance(data, dict) else None
-            if verdict in ("safe", "risky"):
-                return verdict
-            logger.warning("auto-review classifier returned unusable verdict: %r", verdict)
+            answers = data.get("answers") if isinstance(data, dict) else None
+            answer = answers.get("review") if isinstance(answers, dict) else None
+            probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
+            probability = probabilities.get("risky") if isinstance(probabilities, dict) else None
+            if not isinstance(probability, bool) and isinstance(probability, (int, float)) \
+                    and 0.0 <= probability <= 1.0:
+                # The threshold decides on P(risky) -- the positive class of the head
+                # this replaces; the returned choice never upgrades a low probability.
+                return float(probability) >= threshold, float(probability), threshold
+            logger.warning("auto-review classifier returned unusable verdict: %r", answer)
         except Exception as exc:
             logger.warning("auto-review classifier unavailable: %s: %s",
                            type(exc).__name__, exc, exc_info=True)
@@ -284,15 +319,20 @@ def register(ctx):
             outbound, incomplete = _outbound(summary)
         except Exception:
             return status("context_or_redaction_unavailable")
-        verdict = classify(outbound)
-        if verdict is None:
+        decision = classify(outbound)
+        if decision is None:  # outage or unusable reply: fail open, exactly as before
             return status("classifier_unavailable_or_invalid")
+        risky, probability, threshold = decision
+        # Both sides of the boundary are logged so the threshold can be recalibrated
+        # against the probabilities actually observed; the row below carries them too.
+        logger.info("auto-review decision: probability=%s threshold=%s risky=%s",
+                    probability, threshold, risky)
         try:
             if _snapshot(tool_name, args, task_id) != summary:
                 return status("target_or_context_changed_during_review")
         except Exception:
             return status("context_recheck_unavailable")
-        if verdict == "safe":
+        if not risky:
             if incomplete:
                 return status("incomplete_context")
             return None
@@ -317,7 +357,10 @@ def register(ctx):
 
         directive = {"action": "block" if policy == "deny" else "approve",
                      "message": "auto-review-classifier: operation classified risky; human review required.",
-                     "rule_key": f"auto-review:{tool_name}:{digest}"}
+                     "rule_key": f"auto-review:{tool_name}:{digest}",
+                     "risk_review": {"status": "risky", "reason": "above_threshold",
+                                     "screened": True, "probability": probability,
+                                     "threshold": threshold}}
         if policy != "deny":
             directive["revalidate"] = revalidate
         return directive

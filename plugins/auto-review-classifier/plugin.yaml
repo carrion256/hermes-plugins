@@ -1,5 +1,5 @@
 name: auto-review-classifier
-version: 0.4.0
+version: 0.5.0
 description: "Effect-aware risk screen with native egress redaction, resolved target/backend context, and approval rule keys bound to the exact operation; incomplete safe evidence remains unknown while native permissions stay authoritative."
 author: "dsh-plugins port"
 manifest_version: 2
@@ -10,7 +10,7 @@ config_schema:
   endpoint:
     type: str
     default: "http://192.168.50.71:8787"
-    description: "Classifier service base URL (GET /health, POST /classify)."
+    description: "Classifier service base URL (GET /health, POST /v1/systemone)."
   api_key_env:
     type: str
     default: "CLASSIFIER_API_KEY"
@@ -19,3 +19,7 @@ config_schema:
     type: str
     default: "ask"
     description: "'ask' = require native human approval; 'deny' = block a risky call before execution."
+  threshold:
+    type: float
+    default: 0.5
+    description: "P(risky) at or above which the operation needs human review (or blocks under policy deny). The default 0.5 is the argmax of the two-label head this replaced; every decision records its probability so this can be recalibrated."
