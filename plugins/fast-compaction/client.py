@@ -1,4 +1,4 @@
-"""GLiNER2.5-Decide /classify transport for fast-compaction.
+"""`/classify` transport for fast-compaction.
 
 Mirrors the meta-classifier client contract: Bearer key from the environment at call
 time, never stored or logged; a dead endpoint is blacked out for ``cooldown`` seconds so

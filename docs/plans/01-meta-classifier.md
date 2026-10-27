@@ -187,7 +187,7 @@ New `tests/test_classifier_client_parity.py`:
 
 ## Risks & open questions
 
-- The service (GLiNER2.5-Decide) exposes labels, not probabilities (`schemas.py:78-81`; `decision_model` note at `:605-606`). Droid's thresholds cannot transfer. Labels plus replay exist to recalibrate. Whether `cls_threshold` semantics match is unverified until the P4 live run.
+- The service exposes labels, not probabilities (`schemas.py:78-81`; `decision_model` note at `:605-606`). Droid's thresholds cannot transfer. Labels plus replay exist to recalibrate. Whether `cls_threshold` semantics match is unverified until the P4 live run.
 - Overriding `terminal` couples us to its handler signature. Reading the live schema at registration limits drift, but a native refactor can still break the wrapper. The test pins the `_handle_terminal` call shape. Fallback: leave `declared_risk: off`.
 - Roughly 2.5 s per-call latency on a LAN service sits on the tool path. The cooldown bounds a dead service. Declared-risk rows add no extra calls, since the gate already classifies.
 - `implied` labels can encode user fatigue, not truth. They are never used for thresholds.

@@ -1,9 +1,9 @@
 """fast-compaction: lossless-by-deletion compaction overlay for Hermes.
 
 Ports tamaratran/fast-jev-compaction to the Hermes plugin surface: instead of asking
-an LLM to summarize old turns, the self-hosted classifier service (GLiNER2.5-Decide,
-fistandantilus) scores every unpinned tool call/result in one pass and stale pairs are
-dropped or head-truncated. Everything kept stays verbatim; user and assistant text is
+an LLM to summarize old turns, the self-hosted classifier service scores every unpinned
+tool call/result in one pass and stale pairs are dropped or head-truncated. Everything
+kept stays verbatim; user and assistant text is
 never rewritten.
 
 It registers as a ContextEngine (replacing the built-in compressor for this profile)

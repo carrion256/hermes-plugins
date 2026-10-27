@@ -27,7 +27,7 @@ config_schema:
   endpoint:
     type: string
     default: "http://192.168.50.71:8787"
-    description: "GLiNER2.5-Decide classifier base URL (prune stage only). Never log or echo the key."
+    description: "Classifier base URL (prune stage only). Never log or echo the key."
   api_key_env:
     type: string
     default: "CLASSIFIER_API_KEY"

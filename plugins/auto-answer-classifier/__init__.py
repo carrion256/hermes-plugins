@@ -60,7 +60,7 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
          endpoint="http://192.168.50.71:8787"):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
-    The service scores every label in one pass (GLiNER2.5-Decide /classify);
+    The service scores every label in one ``/classify`` pass;
     the pick is bound to option labels, so index order carries no meaning.
     429/503 get one bounded backoff-retry per the service contract; any
     other failure is a deliberate abstention.

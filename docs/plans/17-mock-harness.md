@@ -104,7 +104,7 @@ None. All hooks used are provider-level (`base_url`, `api_mode`) and `HTTP(S)_PR
 - **Proxy honouring.** The tripwire only catches clients that respect `HTTP(S)_PROXY` (httpx does). Raw-socket code (e.g. `urllib` with proxies disabled, subprocess tools that ignore env) is only covered by the in-process socket guard; the CLI subprocess has no second layer. State this limit in the fixture docstring.
 - **Helper detection by regex is brittle** against upstream prompt wording changes (e.g. the title prompt in `title_generator.py`); the tool-less default plus `json_schema` name is the stable signal, regex matches are per-test opt-in.
 - Anthropic SDK path assumptions (`/v1/messages` appended to base URL) are inferred from SDK behaviour, not read in the SDK; the P1 self-test settles it.
-- Whether the meta-classifier GLiNER service (`CLASSIFIER_URL`) deserves its own route set is open; the `helpers` table covers canned replies, not the service protocol.
+- Whether the meta-classifier service (`CLASSIFIER_URL`) deserves its own route set is open; the `helpers` table covers canned replies, not the service protocol.
 
 ## Non-goals
 - Not a model-quality or paired-effort *result*; mock runs can never qualify routing or effort.
