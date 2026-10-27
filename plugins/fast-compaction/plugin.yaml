@@ -7,6 +7,10 @@ api_version: 1
 provides_tools: []
 provides_hooks: []
 config_schema:
+  register_engine:
+    type: bool
+    default: true
+    description: "Claim the host's single context-engine slot. Set false when chain-compaction (or another engine) composes this plugin's pruner as a stage and therefore owns the slot; this plugin then stays enabled for its settings, status tool and pruner, without contending for the slot — otherwise which of the two runs would depend on plugin load order."
   enabled:
     type: bool
     default: true

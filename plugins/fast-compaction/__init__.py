@@ -265,12 +265,19 @@ def register(ctx):
     settings["proactive_trigger_tokens"] = max(0, int(settings["proactive_trigger_tokens"]))
     settings["proactive_target_tokens"] = max(0, int(settings["proactive_target_tokens"]))
     client = ClassifierClient(timeout=settings["request_timeout"])
-    engine = _engine_class()(settings, client)
-    handle = ctx.register_context_engine(engine)
-    if handle is None:
-        logger.warning("fast-compaction: no context-engine slot (another engine is "
-                       "registered); the overlay is inactive")
-        return
+    # The host allows exactly one context-engine registrant and rejects the second, so two
+    # cooperating plugins would otherwise decide between themselves by plugin load order.
+    # chain-compaction composes this plugin's pruner as its own `prune` stage, so it must
+    # own the slot; `register_engine: false` says so explicitly. Standalone use keeps the
+    # default and is unchanged.
+    claims_engine = ctx.get_config("register_engine", True)
+    claims_engine = True if claims_engine is None else bool(claims_engine)
+    if claims_engine:
+        engine = _engine_class()(settings, client)
+        handle = ctx.register_context_engine(engine)
+        if handle is None:
+            logger.warning("fast-compaction: no context-engine slot (another engine is "
+                           "registered); the overlay is inactive")
     ctx.register_tool(
         name="fast_compaction_status", toolset="fast-compaction",
         schema={"name": "fast_compaction_status",

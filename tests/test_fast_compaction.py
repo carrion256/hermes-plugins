@@ -372,3 +372,52 @@ def test_short_transcript_no_classifier_call(load_plugin, monkeypatch):
     messages = [msg_user("hi"), msg_assistant("hello!")]
     engine.compress(messages, current_tokens=200_000)
     assert requests == []  # nothing eligible: straight to the built-in path
+
+
+class _RecordingCtx:
+    """Minimal plugin context: records what the plugin claims from the host."""
+
+    def __init__(self, settings=None):
+        self._settings = settings or {}
+        self.engines = []
+        self.tools = {}
+
+    def get_config(self, key, default=None):
+        return self._settings.get(key, default)
+
+    def register_context_engine(self, engine):
+        self.engines.append(engine)
+        return object()
+
+    def register_tool(self, **kw):
+        self.tools[kw.get("name")] = kw.get("handler")
+
+
+def _load_plugin_module():
+    import importlib.util
+    from pathlib import Path
+    plugin = Path(__file__).resolve().parents[1] / "plugins" / "fast-compaction"
+    spec = importlib.util.spec_from_file_location(
+        "fc_plugin_under_test", plugin / "__init__.py",
+        submodule_search_locations=[str(plugin)])
+    module = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules["fc_plugin_under_test"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_register_engine_false_yields_the_slot_but_keeps_the_status_tool():
+    """An overlay engine composing this pruner owns the slot; this plugin must not contend."""
+    module = _load_plugin_module()
+    ctx = _RecordingCtx({"register_engine": False})
+    module.register(ctx)
+    assert ctx.engines == [], "must not claim the single context-engine slot"
+    assert "fast_compaction_status" in ctx.tools, "diagnostics stay available"
+
+
+def test_register_engine_default_still_claims_the_slot():
+    module = _load_plugin_module()
+    ctx = _RecordingCtx({})
+    module.register(ctx)
+    assert [engine.name for engine in ctx.engines] == ["fast-compaction"]
