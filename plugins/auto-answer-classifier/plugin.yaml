@@ -29,13 +29,13 @@ config_schema:
     description: "Bearer-key environment variable name; never a credential value."
   min_sound_default:
     type: float
-    default: 0.5
-    description: "Minimum P(the default is sound) from the classifier before any ranking counts; 0.5 is the old yes/no argmax. Raise it (e.g. 0.8) when recommendations keep landing on questions that are really product, authority, or security decisions."
+    default: 0.8
+    description: "Minimum P(the default is sound) from the classifier before any ranking counts. Measured on the deployed engine (2026-10-27, 6 labelled cases): conventional defaults scored 0.988-0.9995 while product/authority/security decisions scored 0.050-0.055, so the gate sits in a wide gap -- 0.8 keeps a 5x margin under every legitimate default observed and still rejects an authority question outright. 0.5 is the old yes/no argmax; lower it only if legitimate defaults start abstaining."
   min_pick_confidence:
     type: float
     default: 0.0
-    description: "Minimum confidence the classifier reports for the picked option; 0.0 accepts every ranking, as before. Raise it when low-confidence picks keep contradicting the human answers that follow."
+    description: "Minimum confidence the classifier reports for the picked option; 0.0 accepts every ranking, as before. Ambiguity does NOT show up here: cases with balanced evidence still scored 0.79-0.90, so raising this abstains on decisive-but-unwanted picks rather than on genuine ties. Prefer min_sound_default."
   min_pick_margin:
     type: float
     default: 0.0
-    description: "Minimum probability margin between the top option and the runner-up; 0.0 accepts a near-tie, as before. Raise it when the same question flips between options across runs, which means the evidence does not actually decide it."
+    description: "Minimum probability margin between the top option and the runner-up; 0.0 accepts a near-tie, as before. Same caveat as the confidence floor: measured margins were 0.79-0.997 even when the evidence was balanced, so this mostly measures how sharply the classifier prefers its pick, not whether the question is decidable."

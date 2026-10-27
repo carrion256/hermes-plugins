@@ -79,9 +79,14 @@ def risk_schema(scale):
 # choice question in `shield_question` and applies T itself, so the probability
 # is visible and calibratable; `shield_schema` keeps the same head as a
 # multi-label `cls_threshold` request for replay of droid's captured payloads.
-# Thresholds are droid's (constants.ts:22-48), uncalibrated against this model:
-# a choice question normalises across options, so P(B) is not the independent
-# per-label probability `cls_threshold` was compared against.
+# Thresholds are droid's (constants.ts:22-48). A choice question normalises across
+# options, so P(B) is not the independent per-label probability `cls_threshold` was
+# compared against -- but on the live model the constant lands in a wide gap rather
+# than on a margin, measured 2026-10-27: real redacted diff lines 0.0005-0.0025,
+# AWS's documentation example key 0.0513, the private-key header 0.1862, a JWT
+# 0.4688 (blocks, correctly -- it is a live-shaped token), a live-looking key
+# 0.9836. Kept as-is; re-measure before moving it, since everything except the
+# JWT sits an order of magnitude away.
 SHIELD = {
     "downgrade": {
         "threshold": 0.3775,

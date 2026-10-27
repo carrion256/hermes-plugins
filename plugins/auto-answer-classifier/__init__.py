@@ -72,7 +72,7 @@ def _budget(text, floor=_CLASSIFY_TIMEOUT):
 
 
 def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
-         endpoint="http://192.168.50.71:8787", min_sound_default=0.5,
+         endpoint="http://192.168.50.71:8787", min_sound_default=0.8,
          min_pick_confidence=0.0, min_pick_margin=0.0):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
@@ -478,7 +478,7 @@ def register(ctx):
                 # Positional like key_env/endpoint: the thresholds are rank()'s next
                 # parameters, and every rank() stand-in in the tests takes *args.
                 observed = rank(q, choices, candidates, proofs, key_env, endpoint,
-                                ctx.get_config("min_sound_default", 0.5),
+                                ctx.get_config("min_sound_default", 0.8),
                                 ctx.get_config("min_pick_confidence", 0.0),
                                 ctx.get_config("min_pick_margin", 0.0))
                 _evidence(workspace, proofs, q, choices)  # freshness after the blocking ranking

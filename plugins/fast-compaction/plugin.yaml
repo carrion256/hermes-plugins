@@ -46,7 +46,7 @@ config_schema:
   drop_confidence:
     type: float
     default: 0.5
-    description: "P(drop) at which a tool call or result is deleted. 0.5 is plain argmax: whatever the service's keep/drop choice says, exactly the previous behaviour. Raising it (e.g. 0.9) demands strong evidence before context is deleted, so a pair the service only weakly favours dropping is kept. Clamped 0-1; an answer carrying no probabilities falls back to the choice itself."
+    description: "P(drop) at which a tool call or result is deleted. 0.5 is plain argmax: whatever the service's keep/drop choice says, exactly the previous behaviour. Raising it (e.g. 0.9) demands strong evidence before context is deleted, so a pair the service only weakly favours dropping is kept. Clamped 0-1; an answer carrying no probabilities falls back to the choice itself. Measured 2026-10-27: the engine returned P(drop) 0.82-0.99 even for results the task still needed, because the criteria judge reproducibility and relevance from the state alone and re-running a tool is usually possible -- so read 0.5 as aggressive and 0.9 as conservative, not as a calibrated split, and tune from the recorded probabilities."
   proactive_prune_mode:
     type: string
     default: "off"
