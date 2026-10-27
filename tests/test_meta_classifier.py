@@ -25,11 +25,27 @@ class Reply:
         return json.dumps(self.body).encode()
 
 
-def setup(load_plugin, monkeypatch, answers=None, **settings):
-    """Load the plugin with a schema-dispatching fake classifier.
+def choice_body(got):
+    """A multi-label reply (`{"verdict": ["B"]}`) meant the service had applied the
+    head's own `cls_threshold`, so it stands for "above threshold" here: P(B)=1.0,
+    and an absent label is P(B)=0.0. An envelope from `choice` is served untouched."""
+    verdict = got.get("verdict") if isinstance(got, dict) else None
+    if not isinstance(verdict, list):
+        return got  # an explicit `choice` envelope, or a body meant to be unusable
+    yes = "B" in verdict
+    return {"model": "fake", "usage": {},
+            "answers": {"verdict": {"type": "choice", "choice": "B" if yes else "S",
+                                    "probabilities": {"B": 1.0 if yes else 0.0,
+                                                      "S": 0.0 if yes else 1.0},
+                                    "confidence": 1.0}}}
 
-    `answers` maps a head name present in the request schema to the reply body.
-    A reply of Exception means the service is unreachable for that call.
+
+def setup(load_plugin, monkeypatch, answers=None, **settings):
+    """Load the plugin with a head-dispatching fake classifier.
+
+    `answers` maps a head name present in a `/classify` schema or a `/v1/systemone`
+    question to the reply body. A reply of Exception means the service is
+    unreachable for that call.
     """
     h = load_plugin("meta-classifier", {"api_key_env": "META_TEST_KEY", **settings})
     answers = answers or {}
@@ -38,12 +54,14 @@ def setup(load_plugin, monkeypatch, answers=None, **settings):
     def fake_urlopen(request, *_a, **_kw):
         raw = json.loads(request.data)
         requests.append(raw)
+        heads = raw["schema"] if "schema" in raw else raw["questions"]
         for head, body in answers.items():
-            if head in raw["schema"]:
+            if head in heads:
                 if isinstance(body, Exception):
                     raise body
-                return Reply(body(raw) if callable(body) else body)
-        raise AssertionError(f"unexpected classify heads {sorted(raw['schema'])}")
+                body = body(raw) if callable(body) else body
+                return Reply(body if "schema" in raw else choice_body(body))
+        raise AssertionError(f"unexpected classifier heads {sorted(heads)}")
 
     monkeypatch.setenv("META_TEST_KEY", "synthetic-key")
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
@@ -141,6 +159,22 @@ def stage(repo, name, text):
     subprocess.run(["git", "add", name], cwd=repo, check=True, env=env)
 
 
+def choice(probability, argmax=None):
+    """A `/v1/systemone` choice envelope. `argmax` may disagree with the gate on
+    purpose: the plugin compares P(B) with the threshold and never the label."""
+    return {"model": "fake", "usage": {},
+            "answers": {"verdict": {"type": "choice",
+                                    "choice": argmax or ("B" if probability >= 0.5 else "S"),
+                                    "probabilities": {"B": probability, "S": 1.0 - probability},
+                                    "confidence": max(probability, 1.0 - probability)}}}
+
+
+def shield_lines(h):
+    """The rows the shield recorded: each line's P(B) beside the threshold used."""
+    path = h.home / "logs" / "meta-classifier-signals.jsonl"
+    return [row for line in path.read_text().splitlines() for row in json.loads(line).get("lines", [])]
+
+
 @git
 def test_shield_blocks_likely_real_secret_and_never_sends_it(load_plugin, monkeypatch, tmp_path):
     h = setup(load_plugin, monkeypatch, {"verdict": {"verdict": ["B"]}, "riskLevel": {"riskLevel": "medium"}})
@@ -149,13 +183,17 @@ def test_shield_blocks_likely_real_secret_and_never_sends_it(load_plugin, monkey
     directive, = screen(h, "t-sh", "terminal", {"command": "git commit -m 'add env'"})
     assert directive["action"] == "block"
     assert "deploy.env:2" in directive["message"]
-    shield_request = [r for r in h.requests if "verdict" in r["schema"]][0]
-    payload = json.loads(shield_request["text"])
+    shield_request, = [r for r in h.requests if "questions" in r]
+    question = shield_request["questions"]["verdict"]
+    assert question["type"] == "choice" and set(question["criteria"]) == {"S", "B"}
+    payload = json.loads(shield_request["state"])
     assert payload["extension"] == "env" and payload["focus_line"] == 1
-    assert "wJalrXUtnFEMI" not in shield_request["text"]
-    assert shield_request["schema"]["verdict"]["cls_threshold"] == 0.3775
-    assert shield_request["schema"]["verdict"]["multi_label"] is True
-    assert not [r for r in h.requests if "riskLevel" in r["schema"]], "blocked before the risk head"
+    assert "wJalrXUtnFEMI" not in shield_request["state"]
+    row, = shield_lines(h)
+    assert row == {"location": "deploy.env:2", "kind": "downgrade", "probability": 1.0,
+                   "threshold_used": h.module.schemas.SHIELD["downgrade"]["threshold"],
+                   "decision": "block"}
+    assert not [r for r in h.requests if "riskLevel" in r.get("schema", {})], "blocked before the risk head"
 
 
 @git
@@ -187,9 +225,94 @@ def test_shield_risk_context_warns_only_on_b(load_plugin, monkeypatch, tmp_path)
     workspace_for("t-rk", tmp_path)
     first, = screen(h, "t-rk", "terminal", {"command": "git commit -m notes"})
     assert first["risk_review"]["reason"] == "incomplete_context"  # risk S: nothing to say
-    assert h.requests[0]["schema"]["verdict"]["cls_threshold"] == 0.95
+    row, = shield_lines(h)  # the number and the threshold it was judged against
+    assert row["kind"] == "risk" and row["probability"] == 0.0
+    assert row["threshold_used"] == h.module.schemas.SHIELD["risk"]["threshold"] == 0.95
     second, = screen(h, "t-rk", "terminal", {"command": "git commit -m notes"}, tool_call_id="c2")
     assert second["action"] == "approve" and "possible hardcoded credential" in second["message"]
+
+
+@git
+@pytest.mark.parametrize("offset,expected", [(-0.001, "approve"), (0.001, "block")])
+def test_shield_probability_gate_is_the_configured_threshold(load_plugin, monkeypatch, tmp_path,
+                                                            offset, expected):
+    """P(B) just under the threshold approves, just over it blocks. The threshold is
+    the constant the multi-label head was handed, not a second number: the service
+    no longer applies it, so the plugin compares the returned probability with it."""
+    h = setup(load_plugin, monkeypatch, {"verdict": lambda _r: choice(threshold + offset),
+                                         "riskLevel": {"riskLevel": "medium"}})
+    threshold = h.module.schemas.SHIELD["downgrade"]["threshold"]
+    stage(tmp_path, "deploy.env", f"{SECRET_LINE}\n")
+    workspace_for("t-gate", tmp_path)
+    directive, = screen(h, "t-gate", "terminal", {"command": "git commit -m x"})
+    assert directive["action"] == expected
+    row, = [r for r in shield_lines(h) if r["kind"] == "downgrade"]
+    assert row["probability"] == pytest.approx(threshold + offset)
+    assert row["threshold_used"] == threshold
+    assert row["decision"] == ("block" if expected == "block" else "warn")
+
+
+@git
+def test_shield_approves_the_documented_aws_example_key(load_plugin, monkeypatch, tmp_path):
+    """AKIAIOSFODNN7EXAMPLE is AWS's own documentation key. Measured on the deployed
+    engine (2026-10-27) the choice question answers S with P(B)=0.0513, so the line
+    is only warned about and the commit goes ahead. The multi-label path blocked it:
+    it asked for P(S) and P(B) independently, and both cleared 0.3775 at once, while
+    a choice question normalises across the two options. Deliberate precision gain on
+    a security gate, and the recorded row keeps the class auditable."""
+    h = setup(load_plugin, monkeypatch, {"verdict": choice(0.0513, "S"),
+                                         "riskLevel": {"riskLevel": "medium"}})
+    stage(tmp_path, "deploy.env", "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n")
+    workspace_for("t-aws", tmp_path)
+    directive, = screen(h, "t-aws", "terminal", {"command": "git commit -m x"})
+    assert directive["action"] == "approve"
+    assert "possible hardcoded credential" in directive["message"]
+    row, = shield_lines(h)
+    assert row["probability"] == 0.0513 and row["decision"] == "warn"
+
+
+@git
+def test_shield_blocks_on_probability_not_on_the_argmax_answer(load_plugin, monkeypatch, tmp_path):
+    """The engine's own choice is never consulted. Measured JWT: `S` wins the argmax
+    but P(B)=0.4688, which is over 0.3775, so the shield still blocks."""
+    h = setup(load_plugin, monkeypatch, {"verdict": choice(0.4688, "S"),
+                                         "riskLevel": {"riskLevel": "medium"}})
+    stage(tmp_path, "deploy.env", "TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                                  ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+                                  ".dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk\n")
+    workspace_for("t-jwt", tmp_path)
+    directive, = screen(h, "t-jwt", "terminal", {"command": "git commit -m x"})
+    assert directive["action"] == "block"
+    assert "deploy.env:1" in directive["message"]
+    row, = shield_lines(h)
+    assert row["probability"] == 0.4688 and row["decision"] == "block"
+
+
+@git
+def test_shield_fails_closed_on_an_unusable_answer(load_plugin, monkeypatch, tmp_path):
+    """Every way an answer can fail to be a number is the same thing to the gate: no
+    number, so the line blocks. A transport error is the same path (see
+    test_shield_fails_closed_when_classifier_down); no key is the same path without
+    a call, checked last."""
+    for unusable in ({"model": "fake"}, {}, {"answers": None}, {"answers": {"verdict": "B"}},
+                     {"answers": {"verdict": {"probabilities": {"B": "0.9"}}}},
+                     {"answers": {"verdict": {"probabilities": {"B": 4.0}}}},
+                     {"answers": {"verdict": {"probabilities": {}}}}):
+        h = setup(load_plugin, monkeypatch, {"verdict": unusable, "riskLevel": {"riskLevel": "low"}})
+        stage(tmp_path, "deploy.env", f"{SECRET_LINE}\n")
+        workspace_for("t-bad", tmp_path)
+        directive, = screen(h, "t-bad", "terminal", {"command": "git commit -m x"})
+        assert directive["action"] == "block", unusable
+        assert shield_lines(h)[-1] == {"location": "deploy.env:1", "kind": "downgrade",
+                                       "probability": None,
+                                       "threshold_used": h.module.schemas.SHIELD["downgrade"]["threshold"],
+                                       "decision": "block"}
+    h = setup(load_plugin, monkeypatch, {"riskLevel": {"riskLevel": "low"}})
+    monkeypatch.delenv("META_TEST_KEY")  # after load: the client reads the key per call
+    workspace_for("t-nokey", tmp_path)
+    directive, = screen(h, "t-nokey", "terminal", {"command": "git commit -m x"})
+    assert directive["action"] == "block"
+    assert not [r for r in h.requests if "questions" in r]
 
 
 @git
@@ -199,7 +322,42 @@ def test_shield_ignores_clean_diff_and_non_git_push_words(load_plugin, monkeypat
     workspace_for("t-clean", tmp_path)
     screen(h, "t-clean", "terminal", {"command": "git commit -m hi"})
     screen(h, "t-clean", "terminal", {"command": "git log | grep push"})
+    assert not [r for r in h.requests if "questions" in r], "nothing to screen"
     assert all("riskLevel" in r["schema"] for r in h.requests)
+
+
+@git
+def test_shield_screens_worktree_changes_that_commit_stages_later(load_plugin, monkeypatch, tmp_path):
+    """`git commit -a`/pathspec stage at commit time, so the index is still empty here."""
+    h = setup(load_plugin, monkeypatch, {"verdict": {"verdict": ["B"]},
+                                         "riskLevel": {"riskLevel": "medium"}})
+    stage(tmp_path, "tracked.txt", "clean\n")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", "HOME": str(tmp_path)}
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True, env=env)
+    (tmp_path / "tracked.txt").write_text(f"clean\n{SECRET_LINE}\n")  # edited, never staged
+    workspace_for("t-wt", tmp_path)
+    directive, = screen(h, "t-wt", "terminal", {"command": "git commit -am 'edit'"})
+    assert directive["action"] == "block"
+    assert "tracked.txt:2" in directive["message"]
+
+
+@git
+def test_shield_refuses_a_push_whose_range_cannot_be_determined(load_plugin, monkeypatch, tmp_path):
+    """Unpushed commits with nothing staged must not read as 'nothing to screen'."""
+    h = setup(load_plugin, monkeypatch, {"verdict": {"verdict": ["B"]}})
+    stage(tmp_path, "deploy.env", f"{SECRET_LINE}\n")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", "HOME": str(tmp_path)}
+    subprocess.run(["git", "commit", "-qm", "secret"], cwd=tmp_path, check=True, env=env)
+    # A remote that was never fetched: no remote-tracking ref, no upstream, so the publish
+    # range is genuinely unknowable. The shield must refuse instead of passing silently.
+    subprocess.run(["git", "remote", "add", "origin", "https://example.invalid/x.git"],
+                   cwd=tmp_path, check=True, env=env)
+    workspace_for("t-p2", tmp_path)
+    directive, = screen(h, "t-p2", "terminal", {"command": "git push origin master"})
+    assert directive["action"] == "block"
+    assert "cannot determine" in directive["message"]
 
 
 def test_shield_contexts_from_diff(load_plugin):
@@ -246,6 +404,19 @@ def test_signals_garbage_reply_is_an_error_not_defaults(load_plugin, monkeypatch
     row, = [json.loads(line) for line in
             (h.home / "logs" / "meta-classifier-signals.jsonl").read_text().splitlines()]
     assert row["error"] == "classifier_unavailable_or_invalid" and "classification" not in row
+
+
+def test_session_reset_forgets_the_outgoing_sessions_transcript(load_plugin, monkeypatch):
+    """The host rotates with old_session_id; keying on previous_session_id kept the outgoing
+    transcript forever, so a later turn_end still classified a session that had ended."""
+    h = setup(load_plugin, monkeypatch, {"primaryIntent": LABELS}, signals=True,
+              signals_triggers=["turn_end"])
+    h.hook("pre_llm_call", session_id="sess-old", conversation_history=HISTORY)
+    h.hook("on_session_reset", session_id="sess-new", reason="new_session", platform="cli",
+           old_session_id="sess-old", new_session_id="sess-new")
+    h.hook("on_turn_end", session_id="sess-old")  # the dead session must find no transcript
+    path = h.home / "logs" / "meta-classifier-signals.jsonl"
+    assert not path.exists() or not path.read_text().strip(), path.read_text()
 
 
 def test_signals_off_by_default(load_plugin, monkeypatch):

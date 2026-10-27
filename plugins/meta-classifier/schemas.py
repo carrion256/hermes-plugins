@@ -75,13 +75,17 @@ def risk_schema(scale):
 
 # ---------------------------------------------------------------- Droid Shield
 # Verdict heads from the shield-downgrade / shield-risk system prompts. Droid
-# decides `B iff P(B) >= T` on token logprobs; this service exposes no scores,
-# so the threshold is applied as a multi-label `cls_threshold` and the decision
-# is `"B" in result`. Thresholds are droid's (constants.ts:22-48), uncalibrated
-# against this model.
+# decides `B iff P(B) >= T` on token logprobs. The live shield asks the typed
+# choice question in `shield_question` and applies T itself, so the probability
+# is visible and calibratable; `shield_schema` keeps the same head as a
+# multi-label `cls_threshold` request for replay of droid's captured payloads.
+# Thresholds are droid's (constants.ts:22-48), uncalibrated against this model:
+# a choice question normalises across options, so P(B) is not the independent
+# per-label probability `cls_threshold` was compared against.
 SHIELD = {
     "downgrade": {
         "threshold": 0.3775,
+        "ask": "Does `focus_line` in `lines` hold a credential that must not be committed?",
         "labels": {
             "S": "Clear safe false positive: placeholder, example, generated/vendor data, non-secret identifier, or clearly non-production context.",
             "B": "Likely real credential, should-block secret, or ambiguous detection that should remain blocked.",
@@ -89,6 +93,7 @@ SHIELD = {
     },
     "risk": {
         "threshold": 0.95,
+        "ask": "Does `focus_line` in `lines` hold a real secret credential the detector missed?",
         "labels": {
             "S": "No actionable missed-secret risk, or a safe placeholder/test/docs example.",
             "B": "Likely real secret credential missed by the regex.",
@@ -98,9 +103,19 @@ SHIELD = {
 
 
 def shield_schema(kind):
+    """Multi-label head for replaying droid's captured shield requests."""
     head = SHIELD[kind]
     return {"verdict": {"labels": dict(head["labels"]), "multi_label": True,
                         "cls_threshold": head["threshold"]}}
+
+
+def shield_question(kind):
+    """The same decision as `shield_schema` as one typed choice question, plus the
+    threshold to compare P(B) against. One source for both, so the recorded
+    threshold can never drift from the question that produced the number."""
+    head = SHIELD[kind]
+    return ({"verdict": {"type": "choice", "instructions": head["ask"],
+                         "criteria": dict(head["labels"])}}, head["threshold"])
 
 
 # ---------------------------------------------------------------- Local Signals

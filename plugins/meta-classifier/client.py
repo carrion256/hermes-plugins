@@ -1,4 +1,9 @@
-"""Shared `/classify` client with a dead-endpoint cooldown.
+"""Shared classifier client with a dead-endpoint cooldown.
+
+Two transports, one failure contract: `/classify` takes a label schema and
+`/v1/systemone` takes typed questions whose probabilities come back to the
+caller (the same decision the service makes with `cls_threshold` server-side,
+except the caller sees the number and can calibrate it).
 
 The Bearer key is read from the environment at call time and never stored,
 logged or echoed. Failure semantics: no key / no endpoint / transport error /
@@ -47,6 +52,14 @@ class Classifier:
 
     def classify(self, text, schema, timeout=None):
         """POST {text, schema}; returns the parsed label dict or None (never raises)."""
+        return self._post("/classify", {"text": text, "schema": schema}, text, timeout)
+
+    def ask(self, state, questions, timeout=None):
+        """POST {state, questions} to /v1/systemone; returns the parsed envelope
+        (`{"answers": {...}}`) or None (never raises)."""
+        return self._post("/v1/systemone", {"state": state, "questions": questions}, state, timeout)
+
+    def _post(self, path, payload, text, timeout=None):
         endpoint, key = self.endpoint(), self._key()
         if not endpoint or not key or self._down.get(endpoint, 0.0) > time.monotonic():
             return None
@@ -55,8 +68,8 @@ class Classifier:
                            len(text) if isinstance(text, str) else "n/a")
             return None
         request = urllib.request.Request(
-            endpoint + "/classify",
-            data=json.dumps({"text": text, "schema": schema}).encode(),
+            endpoint + path,
+            data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
         try:
             with urllib.request.urlopen(request, timeout=timeout or self._budget(text)) as reply:

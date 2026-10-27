@@ -12,6 +12,7 @@ these labels are ported from jev-ultrafast's questions.py/action space.
 from __future__ import annotations
 
 MAX_ELEMENTS = 64  # target-head label budget (service limit is 256/head; keep small + cheap)
+MAX_HEAD_LABELS = 256  # hard service limit: an overshoot 422s the WHOLE request, not one head
 
 CLICK_ROLES = {"button", "link", "tab", "menuitem", "checkbox", "radio", "switch", "a"}
 TYPE_ROLES = {"textbox", "searchbox", "input", "textarea"}
@@ -100,6 +101,19 @@ def build_request(goal, elements):
     head_pool = {"click": by_cap["click"], "type": by_cap["type"],
                  "select": [el for el in by_cap["select"]
                             if isinstance(el.get("options"), list) and len(el["options"]) >= 2]}
+    # The select_option head carries up to 20 options per dropdown, so a page full of
+    # dropdowns can exceed the 256-labels-per-head limit and 422 the entire request, taking
+    # the operation head and every other target with it. Budget the select pool first so
+    # select_target and select_option describe the same set; trimmed elements stay visible
+    # in the table but are not offered as select targets.
+    budget, kept = MAX_HEAD_LABELS, []
+    for el in head_pool["select"]:
+        cost = min(20, len(el["options"]))
+        if budget - cost < 2:
+            break
+        budget -= cost
+        kept.append(el)
+    head_pool["select"] = kept
     offered = {k: bool(v) for k, v in head_pool.items()}
     operations = [op for op in ("click", "type", "select") if offered[op]]
     operations += ["scroll_down", "scroll_up", "wait", "done", "blocked"]

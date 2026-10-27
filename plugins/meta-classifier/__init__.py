@@ -10,9 +10,12 @@ from droid 0.244.0 (droid repo notes/arch/classifiers.md):
   (or blocks under policy deny).
 - Droid Shield (`pre_tool_call` on `git commit`/`git push`): staged/unpushed
   added lines are scrubbed with native redaction; scrubbed-value lines are
-  findings (downgrade head: block at P(B)>=0.3775 else warn), secret-named
-  lines without a finding are risk contexts (risk head: warn at >=0.95).
-  Fail-closed exactly like droid: downgrade failure blocks, risk failure is silent.
+  findings (downgrade question: block at P(B)>=0.3775 else warn), secret-named
+  lines without a finding are risk contexts (risk question: warn at P(B)>=0.95).
+  Unlike droid, the plugin applies the threshold itself, so each screened line
+  records its P(B) beside the threshold used and either can be fitted to real
+  data. Fail-closed exactly like droid: downgrade failure blocks, risk failure
+  is silent.
 - Local Signals (`pre_llm_call` snapshot + session triggers): Factory-Judge's
   intent/friction/expertise enum heads in one request, persisted as JSONL
   analytics. Unlike droid, unusable replies are recorded as errors, never as
@@ -260,9 +263,48 @@ def _outbound(summary):
 
 
 # ---------------------------------------------------------------- Droid Shield
+def _has_remote_refs(workspace):
+    """True when the repo knows any remote-tracking ref (--not --remotes is meaningless
+    without one: it succeeds with empty output, which reads as 'nothing to screen')."""
+    try:
+        run = subprocess.run(["git", "for-each-ref", "--count=1", "--format=%(refname)",
+                              "refs/remotes"], cwd=workspace, capture_output=True,
+                             text=True, errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0 and bool(run.stdout.strip())
+
+
+def _is_repo(workspace):
+    """True when workspace is inside a git work tree (.git is a file in a worktree)."""
+    try:
+        run = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=workspace,
+                             capture_output=True, text=True, errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0
+
+
 def _git_diff(workspace, mode):
     base = ["git", "-c", "core.quotepath=off", "diff", "--no-color", "--unified=1", "--no-ext-diff"]
-    attempts = [["@{upstream}...HEAD"], ["--cached"]] if mode == "push" else [["--cached"]]
+    if not _is_repo(workspace):
+        return ""  # nothing outside a repository can be published by a git write
+    if mode == "push":
+        # @{upstream} covers the tracked branch; @{push} covers push.default with no upstream;
+        # --not --remotes covers a branch no remote has seen. There is deliberately no --cached
+        # fallback: an empty index says nothing about what a push publishes, and treating it as
+        # clean is how unscreened commits were published. An unknowable range raises, so the
+        # operator sees shield=unknown instead of a silent pass.
+        attempts = [["@{upstream}...HEAD"], ["@{push}...HEAD"]]
+        if _has_remote_refs(workspace):
+            attempts.append(["--not", "--remotes"])
+    else:
+        # The worktree, not the index: `git commit -a`, `-p` and a pathspec all stage at commit
+        # time, after this hook has run, so --cached was empty for exactly the commit forms
+        # that publish the most work. Over-screening costs a review prompt; under-screening
+        # commits the secret. HEAD is unborn in a repository with no commits yet, where the
+        # index is the only meaningful comparison.
+        attempts = [["HEAD"], ["--cached"]]
     for extra in attempts:
         try:
             run = subprocess.run(base + extra, cwd=workspace, capture_output=True, text=True,
@@ -355,6 +397,13 @@ def register(ctx):
             if "redaction" in str(exc):
                 return {"action": "block", "message": "meta-classifier shield: native redaction "
                         "unavailable; cannot scrub staged secrets before review."}
+            if match.group(1) == "push":
+                # Nothing measurable describes what this push publishes (no upstream, no
+                # @{push}, no remote-tracking ref). An empty index is not evidence of a clean
+                # push, so refuse rather than let unscreened commits leave the machine.
+                return {"action": "block", "message": "meta-classifier shield: cannot determine "
+                        "which commits this push publishes; push to a fetched remote (or an "
+                        "explicit remote/branch) so the range can be screened."}
             return {"shield": {"status": "unknown", "reason": str(exc)}}
         if not contexts:
             return None
@@ -363,19 +412,43 @@ def register(ctx):
         if len(downgrade) > _SHIELD_CAP:
             return {"action": "block", "message": f"meta-classifier shield: {len(downgrade)} "
                     "secret-shaped lines staged; review and unstage them before committing."}
-        blocking, warnings = [], []
+        blocking, warnings, rows = [], [], []
+
+        def probability(kind, context_row):
+            """(P(B), threshold) for one staged line; P(B) is None when the answer
+            carries no usable number. The service applies no threshold on this path,
+            so the number and the threshold it is compared against are both recorded
+            below -- that pairing is what lets a real threshold be fitted to real data."""
+            questions, threshold = schemas.shield_question(kind)
+            envelope = classifier.ask(_canonical(context_row["payload"]), questions)
+            answers = envelope.get("answers") if isinstance(envelope, dict) else None
+            answer = answers.get("verdict") if isinstance(answers, dict) else None
+            options = answer.get("probabilities") if isinstance(answer, dict) else None
+            value = options.get("B") if isinstance(options, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None, threshold
+            value = float(value)
+            # NaN and out-of-range fail the comparison, so they are no answer at all.
+            return (value if 0.0 <= value <= 1.0 else None), threshold
+
         for context_row in downgrade:
-            got = classifier.classify(_canonical(context_row["payload"]), schemas.shield_schema("downgrade"))
-            verdict = got.get("verdict") if isinstance(got, dict) else None
-            if verdict is None or "B" in verdict:  # fail-closed: unavailable -> block
-                blocking.append(context_row["location"])
-            else:
-                warnings.append(context_row["location"])
+            score, threshold = probability("downgrade", context_row)
+            blocked = score is None or score >= threshold  # fail-closed: unavailable -> block
+            rows.append({"location": context_row["location"], "kind": "downgrade",
+                         "probability": score, "threshold_used": threshold,
+                         "decision": "block" if blocked else "warn"})
+            (blocking if blocked else warnings).append(context_row["location"])
         for context_row in risk:
-            got = classifier.classify(_canonical(context_row["payload"]), schemas.shield_schema("risk"))
-            verdict = got.get("verdict") if isinstance(got, dict) else None
-            if verdict is not None and "B" in verdict:  # risk failure -> no warning
+            score, threshold = probability("risk", context_row)
+            warned = score is not None and score >= threshold  # risk failure -> no warning
+            rows.append({"location": context_row["location"], "kind": "risk",
+                         "probability": score, "threshold_used": threshold,
+                         "decision": "warn" if warned else "none"})
+            if warned:
                 warnings.append(context_row["location"])
+        if rows:
+            append_record({"shieldedAt": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+                           "command": match.group(1), "workspace": context["workspace"], "lines": rows})
         if blocking:
             return {"action": "block", "message": "meta-classifier shield: likely real secrets in the "
                     f"diff ({', '.join(blocking)}). STOP: do not retry this command; remove the "
@@ -491,11 +564,14 @@ def register(ctx):
         if rendered is not None:
             digest = hashlib.sha256(rendered.encode()).hexdigest()
             if signals_seen.get(session_id) == digest:
-                return None  # unchanged since the last classification: skipped like droid
-            signals_seen[session_id] = digest
+                return None  # unchanged since the last successful classification
             record["windowMetrics"] = {"chars": len(rendered)}
             got = classifier.classify(rendered, schemas.SIGNALS_SCHEMA, timeout=15)
             if isinstance(got, dict):
+                # Only a completed classification may suppress the next trigger. Caching the
+                # digest before the call turned one transient outage into a permanent skip of
+                # that transcript, with no error row and no retry after the cooldown expired.
+                signals_seen[session_id] = digest
                 record["classification"] = got
             else:
                 record["error"] = "classifier_unavailable_or_invalid"
@@ -522,8 +598,12 @@ def register(ctx):
         if "turn_end" in triggers():
             classify_signals(str(session_id), "turn_end")
 
-    def on_boundary(session_id="", previous_session_id="", **_kw):
-        for identity in (session_id, previous_session_id):
+    def on_boundary(session_id="", old_session_id="", new_session_id="", session_key="", **_kw):
+        # The host rotates with on_session_reset(session_id=<new>, old_session_id=...,
+        # new_session_id=...) and interrupts with agent_loop_stopped(session_key=...); it
+        # never sent the previous_session_id this keyed on, so the outgoing session's
+        # transcript and digest were never dropped and grew for the life of the process.
+        for identity in (session_id, old_session_id, new_session_id, session_key):
             identity = str(identity or "")
             if not identity:
                 continue

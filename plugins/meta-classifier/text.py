@@ -56,12 +56,24 @@ def render_transcript(messages, keep=600):
 
 
 def window(text, limit, head_share=0.33):
-    """Head+tail window with an explicit gap marker, mirroring droid's TooLarge handling."""
+    """Head+tail window with an explicit gap marker, mirroring droid's TooLarge handling.
+
+    The marker is charged against ``limit`` rather than added on top, so the returned string
+    never exceeds it. Callers size this against the service's text cap, where an overshoot of
+    even the marker length caused the whole payload to be rejected as too long.
+    """
     if len(text) <= limit:
         return text
-    head = int(limit * head_share)
-    gap = len(text) - limit
-    return f"{text[:head]}\n[{gap} characters left out here. Their content is unknown.]\n{text[-(limit - head):]}"
+    # Upper bound on the marker: the omitted count can never need more digits than len(text).
+    marker_len = len(f"\n[{len(text)} characters left out here. Their content is unknown.]\n")
+    keep = limit - marker_len
+    if keep <= 0:  # limit smaller than the marker itself: nothing but a hard cut is honest
+        return text[:limit]
+    gap = len(text) - keep
+    marker = f"\n[{gap} characters left out here. Their content is unknown.]\n"
+    head = int(keep * head_share)
+    tail = keep - head
+    return f"{text[:head]}{marker}{text[-tail:] if tail else ''}"[:limit]
 
 
 def last_user_message(messages):
