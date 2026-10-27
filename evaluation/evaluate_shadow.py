@@ -27,7 +27,7 @@ import urllib.request
 
 MODEL = "qwen3.8-flash-next"
 BASE_URL = "http://localhost:8001/v1"
-CLASSIFIER = "http://192.168.50.149:8787"
+CLASSIFIER = "http://192.168.50.71:8787"
 SEED = 20261009
 LIMIT = 16384
 SECRETS = []

@@ -30,7 +30,7 @@ Plugin `voice-speak-classifier`, plus one host seam. The plugin owns the verdict
 - Vendors the byte-identical shared `client.py` from plan 01 P1.
 
 Config (`plugin.yaml` `config_schema`):
-- `endpoint` default `http://192.168.50.149:8787`; `api_key_env` default `CLASSIFIER_API_KEY` (same as siblings).
+- `endpoint` default `http://192.168.50.71:8787`; `api_key_env` default `CLASSIFIER_API_KEY` (same as siblings).
 - `mode: shadow` (`shadow` | `apply`). `shadow` records and never changes delivery.
 - `timeout_ms: 600`; `cooldown_s: 45`.
 - `defer_idle_ms: 1200` (caller silence required before a deferred item is injected); `defer_max_hold_ms: 15000` (then speak regardless).
