@@ -109,11 +109,17 @@ def _engine_class():
         """Built-in compressor + an ordered stage cascade ahead of the summary,
         and (opt-in) classifier/FIFO eviction on the host's proactive seam."""
 
-        def __init__(self, settings, pruner, client):
+        def __init__(self, settings, pruner, client, external=None):
             self._cc = settings
             self._pruner = pruner
             self._cc_client = client
-            self._pipeline = parse_pipeline(settings["pipeline"], extra=ENGINE_STAGES)
+            # Composition seam: stage modules named by `stage_modules`, resolved by name in
+            # the pipeline like the built-in ones. chain-compaction stays the overlay; any
+            # strategy that honours run_stage(messages, cfg, tokens) plugs in without
+            # touching this file.
+            self._external = dict(external or {})
+            self._pipeline = parse_pipeline(
+                settings["pipeline"], extra=ENGINE_STAGES + tuple(self._external))
             cfg = self._compression_config()
             super().__init__(
                 model="", threshold_percent=cfg["threshold"],
@@ -282,6 +288,9 @@ def _engine_class():
                 return self._stage_prune(messages, cfg)
             if name == "summary":
                 return self._stage_summary(messages, **kwargs)
+            external = self._external.get(name)
+            if external is not None:
+                return external(messages, cfg, self._tokens)
             return stages.run_stage(name, messages, cfg, self._tokens)
 
         def _stage_prune(self, messages, cfg):
@@ -427,8 +436,13 @@ def register(ctx):
     settings["target_reduction"] = min(0.95, max(0.05, float(settings["target_reduction"])))
     settings["stage_min_reduction"] = min(0.9, max(0.0, float(settings["stage_min_reduction"])))
     settings["drop_confidence"] = min(1.0, max(0.0, float(settings["drop_confidence"])))
+    external, stage_problems = stages.load_stage_modules(
+        ctx.get_config("stage_modules", []),
+        reserved=tuple(stages.STAGES) + ENGINE_STAGES)
+    for problem in stage_problems:
+        logger.error("chain-compaction: stage module skipped (%s)", problem)
     try:
-        parse_pipeline(settings["pipeline"], extra=ENGINE_STAGES)
+        parse_pipeline(settings["pipeline"], extra=ENGINE_STAGES + tuple(external))
     except ValueError as exc:
         logger.error("chain-compaction: bad pipeline config (%s); using default order", exc)
         settings["pipeline"] = "prune,clip,drop_stale"
@@ -442,7 +456,7 @@ def register(ctx):
     pruner, client_mod = _load_fast_compaction()
     proactive_mod = _load_proactive()
     client = client_mod.ClassifierClient(timeout=settings["request_timeout"]) if client_mod else None
-    engine = _engine_class()(settings, pruner, client)
+    engine = _engine_class()(settings, pruner, client, external)
     handle = ctx.register_context_engine(engine)
     if handle is None:
         logger.warning("chain-compaction: no context-engine slot (another engine is "
@@ -458,6 +472,7 @@ def register(ctx):
         handler=lambda args, **kw: json.dumps({
             "engine": "chain-compaction", "enabled": settings["enabled"],
             "pipeline": engine._pipeline,
+            "external_stages": sorted(external),
             "target_reduction": settings["target_reduction"],
             "stage_min_reduction": settings["stage_min_reduction"],
             "drop_confidence": settings["drop_confidence"],

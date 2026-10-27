@@ -404,3 +404,74 @@ def test_summary_miss_falls_back_and_is_tallied(monkeypatch):
     assert out is not None
     assert mod.STATUS["fallbacks"] == fallbacks_before + 1
     assert mod.STATUS["stage_misses"].get("summary:summary_unavailable") == 1
+
+
+SNAP_STAGE = '''
+STAGE_NAME = "snap"
+
+def run_stage(messages, cfg, tokens):
+    """A stand-in for any strategy: keep the newest four messages."""
+    return messages[:4], {"snap": True}
+'''
+
+
+def _write_stage(tmp_path, filename="snap_stage.py", source=SNAP_STAGE):
+    import pathlib
+    path = pathlib.Path(tmp_path) / filename
+    path.write_text(source, encoding="utf-8")
+    return str(path)
+
+
+def test_stage_module_plugs_into_the_pipeline(tmp_path, monkeypatch):
+    """A strategy shipped as a module runs by name, with the built-in after it."""
+    from agent.context_compressor import ContextCompressor
+
+    seen = []
+
+    def fake_compress(self, messages, current_tokens=None, focus_topic=None,
+                      force=False, memory_context="", bypass_cooldown=False):
+        seen.append(len(messages))
+        return messages[:2]
+
+    monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
+    mod = _load_stub(monkeypatch)
+    loaded, problems = mod.stages.load_stage_modules(
+        [_write_stage(tmp_path)], reserved=tuple(mod.stages.STAGES) + mod.ENGINE_STAGES)
+    assert problems == [] and list(loaded) == ["snap"]
+
+    settings = dict(CFG)
+    settings.update(pipeline="snap,summary", stage_min_reduction=0.0)
+    engine = mod._engine_class()(settings, None, None, loaded)
+
+    messages = transcript(old=6)
+    out = engine.compress(messages, current_tokens=5000)
+
+    assert len(out) == 2
+    assert seen == [4], "the summariser must receive the stage's output, not the original"
+    assert [t["stage"] for t in mod.STATUS["last"]["trace"]] == ["snap", "summary"]
+
+
+def test_bad_stage_modules_are_reported_not_raised(tmp_path):
+    """A broken or shadowing module is skipped; the engine still registers."""
+    ok, problems = stages.load_stage_modules(
+        [_write_stage(tmp_path, "no_name.py", "def run_stage(m, c, t):\n    return m, {}\n")],
+        reserved=("clip",))
+    assert ok == {} and problems and "STAGE_NAME" in problems[0]
+
+    ok, problems = stages.load_stage_modules(
+        [_write_stage(tmp_path, "shadow.py",
+                      'STAGE_NAME = "clip"\n'
+                      "def run_stage(m, c, t):\n    return m, {}\n")],
+        reserved=("clip",))
+    assert ok == {} and problems and "shadows" in problems[0]
+
+    ok, problems = stages.load_stage_modules(
+        [_write_stage(tmp_path, "not_callable.py", 'STAGE_NAME = "judge"\nrun_stage = 3\n')],
+        reserved=("clip",))
+    assert ok == {} and problems and "run_stage" in problems[0]
+
+
+def test_unregistered_stage_name_is_still_rejected():
+    """The pipeline may only name stages that are actually available."""
+    with pytest.raises(ValueError):
+        stages.parse_pipeline("snap,summary", extra=("prune", "summary"))

@@ -168,3 +168,60 @@ STAGES = {
     # "prune" is injected by the engine (needs the classifier client); kept out of
     # this module so the pure policy imports nothing beyond stdlib.
 }
+
+
+def load_stage_modules(specs, reserved=()):
+    """Import configured stage modules: file paths or dotted module names.
+
+    A stage module exposes ``STAGE_NAME`` (a non-empty string) and
+    ``run_stage(messages, cfg, tokens) -> (messages, stats)`` — the same contract the
+    built-in stages honour. Names must not shadow a built-in or engine stage, because a
+    pipeline resolves stage names to callables.
+
+    Returns ``(stages, problems)``. A module that will not load is reported and skipped
+    rather than raised: a bad third-party stage must not take the engine down with it.
+    """
+    import importlib
+    import importlib.util
+    from pathlib import Path
+
+    loaded, problems = {}, []
+    if specs is None:
+        return loaded, problems
+    if isinstance(specs, str):
+        specs = [specs]
+    if not isinstance(specs, (list, tuple)):
+        return loaded, [f"stage_modules must be a list, got {type(specs).__name__}"]
+    reserved = {str(name) for name in reserved}
+    for spec in specs:
+        text = str(spec or "").strip()
+        if not text:
+            continue
+        try:
+            if text.endswith(".py") or "/" in text:
+                path = Path(text).expanduser()
+                if not path.is_file():
+                    raise ValueError(f"no such file: {path}")
+                module_spec = importlib.util.spec_from_file_location(
+                    f"chain_stage_{path.stem}", path)
+                if module_spec is None or module_spec.loader is None:
+                    raise ValueError(f"cannot load {path}")
+                module = importlib.util.module_from_spec(module_spec)
+                module_spec.loader.exec_module(module)
+            else:
+                module = importlib.import_module(text)
+            stage_name = getattr(module, "STAGE_NAME", None)
+            runner = getattr(module, "run_stage", None)
+            if not isinstance(stage_name, str) or not stage_name.strip():
+                raise ValueError("missing STAGE_NAME")
+            stage_name = stage_name.strip().lower()
+            if not callable(runner):
+                raise ValueError("missing run_stage(messages, cfg, tokens)")
+            if stage_name in reserved:
+                raise ValueError(f"stage name {stage_name!r} shadows a built-in stage")
+            if stage_name in loaded:
+                raise ValueError(f"stage name {stage_name!r} already registered")
+            loaded[stage_name] = runner
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            problems.append(f"{text}: {type(exc).__name__}: {exc}")
+    return loaded, problems

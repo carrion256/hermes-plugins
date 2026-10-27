@@ -15,7 +15,11 @@ config_schema:
   pipeline:
     type: string
     default: "prune,clip,drop_stale"
-    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs), summary (the normal compaction engine itself). Without summary the cascade commits verbatim output and the built-in only runs as the under-delivery backstop — one or the other, never both. With summary last (for example \"prune,summary\") they compose: the earlier stages reduce, the built-in then summarises what survived, and no earlier stage may commit early and skip it."
+    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs), summary (the normal compaction engine itself), plus any stage registered through stage_modules. Without summary the cascade commits verbatim output and the built-in only runs as the under-delivery backstop — one or the other, never both. With summary last (for example \"prune,summary\") they compose: the earlier stages reduce, the built-in then summarises what survived, and no earlier stage may commit early and skip it."
+  stage_modules:
+    type: list
+    default: []
+    description: "Extra pipeline stages, each a .py file path or a dotted module name. A module must expose STAGE_NAME (a non-empty string) and run_stage(messages, cfg, tokens) -> (messages, stats), the same contract the built-in stages honour; its name may not shadow prune/clip/drop_stale/summary. This is the seam that makes the cascade an overlay rather than a fixed list: implement a strategy — a judge pass, a snapshot compactor — ship it as a module, list it here, and name it in pipeline. Modules that fail to load are logged and skipped; they never take the engine down."
   target_reduction:
     type: float
     default: 0.25
