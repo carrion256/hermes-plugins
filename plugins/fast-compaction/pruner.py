@@ -16,8 +16,12 @@ import json
 MAX_TEXT = 100_000            # service limit on the text field
 STATE_MAX_CHARS = 90_000      # keeps the body under the 256 KB cap with schema room
 MAX_HEADS = 32                # service limit per request
-HEADS_PER_CALL = 2
-CALLS_PER_REQUEST = MAX_HEADS // HEADS_PER_CALL  # 16 calls = 32 heads
+# One request carries two heads per tool call ({tag}_call and {tag}_result), so 16 tool
+# calls = 32 heads = one request already at the service cap. Per-request latency is
+# dominated by re-reading the state (measured ~0.1 ms/char), not by head count, so the
+# only lever that matters is how many times the state is sent -- keep it at one.
+HEADS_PER_TOOL_CALL = 2
+TOOL_CALLS_PER_REQUEST = MAX_HEADS // HEADS_PER_TOOL_CALL
 _VERDICTS = ("keep", "drop")
 
 TRUNC_NOTE = ("[fast-compaction: tool output no longer needed; first {kept} of {total} "
@@ -186,7 +190,7 @@ def fit_state(messages, calls, goal, max_state_tokens, max_request_tokens, text_
 
 
 def build_batches(calls):
-    return [calls[i:i + CALLS_PER_REQUEST] for i in range(0, len(calls), CALLS_PER_REQUEST)]
+    return [calls[i:i + TOOL_CALLS_PER_REQUEST] for i in range(0, len(calls), TOOL_CALLS_PER_REQUEST)]
 
 
 def _head_descriptions(record):
@@ -206,7 +210,8 @@ def _head_descriptions(record):
 
 
 def build_request(batch, state):
-    """One /classify request: the same full state plus two noul heads per call.
+    """One /classify request: the same full state plus two single-label (choice) heads per
+    tool call -- {tag}_call and {tag}_result, each carrying its own label descriptions.
     Returns (text, schema); raises PruneError when the request shape is invalid."""
     schema = {}
     for record in batch:
