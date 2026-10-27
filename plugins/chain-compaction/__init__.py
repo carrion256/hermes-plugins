@@ -18,6 +18,11 @@ Stages (default pipeline: prune,clip,drop_stale):
                 catches the one case prune cannot (a single huge kept result).
   drop_stale  - positional removal of tool pairs beyond the keep window; blunt,
                 runs last precisely because it is the least selective.
+  summary     - the normal compaction engine itself, as a stage: the earlier stages
+                reduce first and the built-in summarises what survived, so
+                ``pipeline: prune,summary`` is a real chain rather than the usual
+                either/or. Terminal — it keeps its own token bookkeeping, so the
+                cascade returns its result instead of committing over it.
 
 Settings live under ``plugins.entries.chain-compaction.settings``; the API key
 is read from the environment at call time and never stored or logged.
@@ -40,8 +45,9 @@ STATUS = {"attempts": 0, "committed": 0, "fallbacks": 0, "stage_misses": {},
           "last": None}
 
 # Stages the engine owns (need I/O or cross-plugin imports) as opposed to the
-# pure stages in stages.py; both are valid pipeline names.
-ENGINE_STAGES = ("prune",)
+# pure stages in stages.py; both are valid pipeline names. `summary` is the normal
+# compaction engine itself, run as the pipeline's terminal step.
+ENGINE_STAGES = ("prune", "summary")
 
 # Kept in sync with fast-compaction/proactive.MODES; defined locally so register
 # works even when the sibling plugin is absent.
@@ -210,9 +216,15 @@ def _engine_class():
                 return self._fallback("baseline_unavailable", messages, current_tokens,
                                       force, memory_context, bypass_cooldown)
             candidate, trace = messages, []
+            # A pipeline that ends in `summary` is a chain, not a race: the tail is the
+            # point, so an earlier stage reaching target_reduction must not commit and
+            # skip the built-in.
+            terminal_summary = bool(self._pipeline) and self._pipeline[-1] == "summary"
             for name in self._pipeline:
                 try:
-                    outcome, stats = self._run_stage(name, candidate)
+                    outcome, stats = self._run_stage(
+                        name, candidate, current_tokens=current_tokens, force=force,
+                        memory_context=memory_context, bypass_cooldown=bypass_cooldown)
                 except StageError as exc:
                     trace.append({"stage": name, "miss": str(exc)})
                     self._miss(f"{name}:{exc}")
@@ -226,6 +238,15 @@ def _engine_class():
                 reduction = self._base_reduction(baseline, outcome)
                 own = self._own_delta(candidate, outcome)
                 trace.append({"stage": name, "reduction": round(reduction, 4), **stats})
+                if name == "summary":
+                    # Terminal: the parent compressor already booked this pass, so its
+                    # result IS the commit. Committing again would double-count.
+                    STATUS["committed"] += 1
+                    STATUS["last"] = {"trace": trace, "reduction": round(reduction, 4)}
+                    if not self.quiet_mode:
+                        logger.info("chain-compaction: summarised after %d stage(s)",
+                                    len([t for t in trace if "reduction" in t]))
+                    return outcome
                 if own < self._cc["stage_min_reduction"]:
                     # contributed nothing meaningful: keep the candidate (no bytes lost)
                     # but continue to the next stage — "not substantial enough" is the
@@ -233,6 +254,8 @@ def _engine_class():
                     self._miss(f"{name}:below_stage_min")
                     continue
                 candidate = outcome
+                if terminal_summary:
+                    continue
                 if reduction >= self._cc["target_reduction"]:
                     candidate = self._commit(candidate, messages, current_tokens, force,
                                              trace, reduction)
@@ -253,10 +276,12 @@ def _engine_class():
                 return 0.0
             return (pre - estimate_messages_tokens_rough(after)) / pre
 
-        def _run_stage(self, name, messages):
+        def _run_stage(self, name, messages, **kwargs):
             cfg = self._cc
             if name == "prune":
                 return self._stage_prune(messages, cfg)
+            if name == "summary":
+                return self._stage_summary(messages, **kwargs)
             return stages.run_stage(name, messages, cfg, self._tokens)
 
         def _stage_prune(self, messages, cfg):
@@ -295,6 +320,28 @@ def _engine_class():
                                                    prune_cfg["truncate_head_chars"])
             stats["stage"] = "prune"
             return pruned, stats
+
+        def _stage_summary(self, messages, current_tokens=None, force=False,
+                           memory_context="", bypass_cooldown=False, **_kw):
+            """The normal compaction engine, applied to the cascade's own output.
+
+            The under-delivery fallback hands the ORIGINAL transcript to the built-in, so
+            pruning and summarising never compose — one or the other runs. Here the parent
+            summarises what the earlier stages left behind, which is what makes
+            ``prune,summary`` a chain. It is terminal and self-booking (the parent keeps
+            its own token bookkeeping), so ``compress`` returns its result directly
+            instead of committing a second time.
+            """
+            compressed = super().compress(
+                messages, current_tokens=current_tokens, focus_topic=None,
+                # The cascade has already decided this pass must compact, so the
+                # parent's own threshold and cooldown checks would only veto it.
+                force=True, memory_context=memory_context, bypass_cooldown=True)
+            if not isinstance(compressed, list) or not compressed:
+                raise StageError("summary_unavailable")
+            if compressed == messages:
+                raise StageError("summary_no_change")
+            return compressed, {"stage": "summary"}
 
         def _redact(self, state):
             from agent.redact import REDACTION_UNAVAILABLE, redact_for_egress

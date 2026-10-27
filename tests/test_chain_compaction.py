@@ -316,3 +316,91 @@ def test_register_rejects_bad_pipeline_and_status_tool_reports():
     assert manifest["config_schema"]["pipeline"]["default"] == "prune,clip,drop_stale"
     with pytest.raises(ValueError):
         stages.parse_pipeline("nonsense", extra=mod.ENGINE_STAGES)
+
+
+class _SummaryClient:
+    """Transport stub: the summary stage never touches it."""
+
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
+        return {}
+
+
+def test_summary_stage_runs_the_normal_engine_once(monkeypatch):
+    """`summary` is the built-in compressor applied to the cascade output, booked once."""
+    from agent.context_compressor import ContextCompressor
+
+    seen = []
+
+    def fake_compress(self, messages, current_tokens=None, focus_topic=None,
+                      force=False, memory_context="", bypass_cooldown=False):
+        seen.append({"n": len(messages), "force": force, "cooldown": bypass_cooldown})
+        return messages[:3]
+
+    monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
+    mod = _load_stub(monkeypatch)
+    settings = dict(CFG)
+    settings["pipeline"] = "summary"
+    engine = mod._engine_class()(settings, None, None)
+    committed_before = mod.STATUS["committed"]
+
+    messages = transcript(old=2)
+    out = engine.compress(messages, current_tokens=1000)
+
+    assert out == messages[:3]
+    assert len(seen) == 1, "the summary must run exactly once"
+    assert seen[0] == {"n": len(messages), "force": True, "cooldown": True}
+    # The parent books its own pass; committing over it would double-count.
+    assert engine.compression_count == 0
+    assert mod.STATUS["committed"] == committed_before + 1
+    assert mod.STATUS["last"]["trace"][0]["stage"] == "summary"
+
+
+def test_chain_prune_then_summary_summarises_the_pruned_transcript(monkeypatch):
+    """The point of the chain: the built-in sees prune's output, not the original."""
+    from agent.context_compressor import ContextCompressor
+
+    seen = []
+
+    def fake_compress(self, messages, current_tokens=None, focus_topic=None,
+                      force=False, memory_context="", bypass_cooldown=False):
+        seen.append(list(messages))
+        return messages[:4]
+
+    monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
+    mod = _load_stub(monkeypatch)
+    settings = dict(CFG)
+    settings.update(pipeline="prune,summary", stage_min_reduction=0.0, drop_confidence=0.5)
+    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic")
+    engine = mod._engine_class()(settings, fake_pruner(drop_every=True), _SummaryClient())
+
+    messages = transcript(old=6)
+    out = engine.compress(messages, current_tokens=5000)
+
+    assert len(out) == 4
+    assert seen and len(seen[0]) < len(messages), "summary must see prune's shorter transcript"
+    assert [t["stage"] for t in mod.STATUS["last"]["trace"]][:2] == ["prune", "summary"]
+
+
+def test_summary_miss_falls_back_and_is_tallied(monkeypatch):
+    """A summariser that refuses must degrade to the documented fallback, not vanish."""
+    from agent.context_compressor import ContextCompressor
+
+    calls = []
+
+    def fake_compress(self, messages, current_tokens=None, focus_topic=None,
+                      force=False, memory_context="", bypass_cooldown=False):
+        calls.append(len(messages))
+        return None if len(calls) == 1 else messages[:2]
+
+    monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
+    mod = _load_stub(monkeypatch)
+    settings = dict(CFG)
+    settings["pipeline"] = "summary"
+    engine = mod._engine_class()(settings, None, None)
+    fallbacks_before = mod.STATUS["fallbacks"]
+
+    out = engine.compress(transcript(old=1), current_tokens=100)
+
+    assert out is not None
+    assert mod.STATUS["fallbacks"] == fallbacks_before + 1
+    assert mod.STATUS["stage_misses"].get("summary:summary_unavailable") == 1

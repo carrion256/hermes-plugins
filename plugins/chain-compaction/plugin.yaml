@@ -15,7 +15,7 @@ config_schema:
   pipeline:
     type: string
     default: "prune,clip,drop_stale"
-    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs). The built-in summary is always the final stage and cannot be removed."
+    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs), summary (the normal compaction engine itself). Without summary the cascade commits verbatim output and the built-in only runs as the under-delivery backstop — one or the other, never both. With summary last (for example \"prune,summary\") they compose: the earlier stages reduce, the built-in then summarises what survived, and no earlier stage may commit early and skip it."
   target_reduction:
     type: float
     default: 0.25
