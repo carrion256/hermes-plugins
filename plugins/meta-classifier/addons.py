@@ -233,8 +233,12 @@ def register_addons(ctx, classifier, record, history):
     if enabled & {"test_value", "complexity"}:
         ctx.register_hook("pre_tool_call", pre_tool_call)
 
-    def forget(session_id="", previous_session_id="", **_kw):
-        for identity in (session_id, previous_session_id):
+    def forget(session_id="", old_session_id="", new_session_id="", session_key="", **_kw):
+        # The host rotates with on_session_reset(session_id=<new>, old_session_id=...,
+        # new_session_id=...) and interrupts with agent_loop_stopped(session_key=...); it
+        # never sent the previous_session_id this keyed on, so the outgoing session's
+        # outcomes leaked for the life of the process.
+        for identity in (session_id, old_session_id, new_session_id, session_key):
             outcomes.pop(str(identity or ""), None)
 
     ctx.register_hook("on_session_finalize", forget)
