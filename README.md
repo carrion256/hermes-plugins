@@ -11,6 +11,7 @@ Coding-oriented Hermes plugins derived from [dsh-plugins](https://github.com/car
 | `continuation` | Explicit requirement declarations and owned check observations bind native evidence IDs to source hashes, execution workspace and task. Independent review runs asynchronously and releases the turn while pending; its binding and verdict still gate the next completion. Reviewer coverage applies to declared criteria, not undeclared todo bookkeeping. |
 | `prewalk` | Only `prewalk_ready` performs the model handoff, after a native todo plan and evidence-grounded execution brief. Core located context is required; falsification/replan/acceptance lists are optional. Scratch writes do not signal readiness. Optional replanning is bounded and off by default. |
 | `covey-tasks` | Native durable worklists, fenced claims, compact checkpoint/resume handoffs and native discovery diagnostics. Optional linked-worktree ownership guards prevent cooperative workers sharing one workspace. |
+| `intake` | Text→worklist sink for `covey_tasks`: the profile chat model extracts first-person follow-ups (imperative, one action each) with quote grounding, the profile classifier labels survivors high/medium/low urgency (a decoration that never blocks filing), cross-run dedupe reads the store BEFORE extraction so the model is told not to restate filed work — matches are reported `existing`, never re-filed. One persistent orchestrator session (principal `intake`) is reused across runs. Reports are `{status, submitted, existing, failed, reason}`; nothing raises. |
 | `rules` | Scoped rule delivery plus `rules_explain`: applicability, provenance, precedence, explicit conflicts, omitted entries and check references. Guidance is never executable authorization. |
 | `browser-bladebro` | bladebro real-browser lane: provides the `browser_*` tools (names, schemas and results carried over from Hermes' built-in browser tools, which upstream removed 2026-11-03) plus `browser_run` batches and certified local HTML scenarios, which bind immutable artifact bytes and observed interactions to native verification evidence. Separate lane from core `browser_exec` (CDP/browser-harness), no behavioral coupling; no override grant needed. Ordinary HTTP browsing is not build attestation. Tabs are per task. `on_session_finalize`/`on_session_reset` close a session's tabs and clear its state, and `subagent_stop` closes a child's tabs. Per-turn `on_session_end` is deliberately not used, so tabs survive across turns. |
 | `loop-guard` | Bounded structured-error, failed-verification and short-cycle recovery. Delivered interventions, exact next-call hypotheses and matching recovery are distinguished from suppression or exhausted budgets. |
@@ -165,6 +166,26 @@ Change an agent's DB configuration only while its tool and claim operations are 
 Mutations expose a non-secret `request_id`. `outcome_unknown` is not rollback: inspect the native task, reconcile, and explicitly reuse the same request ID if retrying. Leases last 300 seconds and renew every 60 seconds only while a claim exists. Normal teardown releases ownership; after process loss, the lease expires and a newer fence is required.
 
 Session tokens are cooperative handles, visible to same-user processes through CLI argv and the DB; redaction does not make them a security boundary. Back up an existing DB with SQLite's backup API before migration, not a copy that omits WAL sidecars. Disable the plugin/start a new session to roll back integration; never downgrade a migrated DB in place.
+
+## Text intake
+
+`intake` is the sink that turns arbitrary text (transcripts, digests, notes) into `covey_tasks` worklist entries. Point it at the same binary and DB the profile's `covey-tasks` plugin uses, and at the profile's inference node:
+
+```yaml
+plugins:
+  entries:
+    intake:
+      settings:
+        binary: /home/common/.hermes/bin/covey-tasks
+        db_path: /home/common/.hermes/profiles/lilith/covey.db
+        endpoint: http://127.0.0.1:8102
+        served_model: qwen3.8-flash-next
+        api_key_env: CLASSIFIER_API_KEY
+```
+
+`intake(text, dry_run=true)` previews the extracted items with urgency labels without touching the store; a preview needs no `binary`/`db_path`. Filing runs under one persistent orchestrator session (principal `intake`) that is reused across runs and never exited — the store is only touched when there is something to file. `meta submit` has no priority field, so urgency lives as an `Urgency: high|medium|low` line inside the task prompt text; a dead classifier costs the label, never the intake (`classifier_endpoint` overrides the node, `classifier_timeout` defaults to 1.5s).
+
+Cross-run dedupe cannot ride on idempotency keys (they are session-scoped), so it is content-based: the store is read before extraction, its filed items are listed in the prompt as do-not-restate work (extraction runs at `temperature: 0` so repeats stay recognizable), and an exact normalized first-line match lands in the report's `existing` bucket instead of re-filing. Paraphrases that survive both the instruction and the match are the known ceiling of this design; the idempotency key still collapses same-session repeats.
 
 ## Rules and operating modes
 
