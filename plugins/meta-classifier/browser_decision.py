@@ -1,6 +1,6 @@
 """Browser decision heads ported from browser-use/jev-ultrafast.
 
-One /classify request carries the operation head plus speculative target heads
+One /v1/systemone request carries the operation head plus speculative target heads
 (each containing only compatible elements), exactly like jev-ultrafast's
 TypeSafe fan-out: two decisions, one round trip. The model never produces
 selectors, coordinates or JavaScript — it picks an observed index or nothing;

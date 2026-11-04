@@ -72,7 +72,8 @@ def _budget(text, floor=_CLASSIFY_TIMEOUT):
 
 
 def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
-         endpoint="http://192.168.50.71:8787", min_sound_default=0.8,
+         endpoint="http://127.0.0.1:8102", model="qwen3.8-flash-next",
+         min_sound_default=0.8,
          min_pick_confidence=0.0, min_pick_margin=0.0):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
@@ -110,7 +111,8 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
     safe = redact_for_egress(text)
     if safe != text:
         return None  # secret-laden inputs abstain rather than drop option identity
-    body = json.dumps({"state": safe, "questions": questions}).encode()
+    body = json.dumps({"model": str(model or "qwen3.8-flash-next"),
+                       "state": safe, "questions": questions}).encode()
     for attempt in (0, 1):
         if attempt:
             time.sleep(1)
@@ -426,7 +428,8 @@ def register(ctx):
 
     def defaults(args, task_id="", **_kw):
         key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
-        endpoint = ctx.get_config("endpoint", "http://192.168.50.71:8787")
+        endpoint = ctx.get_config("endpoint", "http://127.0.0.1:8102")
+        model = ctx.get_config("served_model", "qwen3.8-flash-next")
         owner, workspace = _owner(), _workspace(task_id)
         if not isinstance(args, dict) or not owner or not workspace:
             return json.dumps({"status": "unknown", "reason": "native owner/workspace unavailable"})
@@ -477,7 +480,7 @@ def register(ctx):
                 proofs, candidates = _evidence(workspace, args.get("evidence"), q, choices)
                 # Positional like key_env/endpoint: the thresholds are rank()'s next
                 # parameters, and every rank() stand-in in the tests takes *args.
-                observed = rank(q, choices, candidates, proofs, key_env, endpoint,
+                observed = rank(q, choices, candidates, proofs, key_env, endpoint, model,
                                 ctx.get_config("min_sound_default", 0.8),
                                 ctx.get_config("min_pick_confidence", 0.0),
                                 ctx.get_config("min_pick_margin", 0.0))

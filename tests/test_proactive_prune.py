@@ -238,7 +238,7 @@ class _FakePost:
         self.payload_fn = payload_fn
         self.calls = 0
 
-    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
         self.calls += 1
         return self.payload_fn(text, questions)
 

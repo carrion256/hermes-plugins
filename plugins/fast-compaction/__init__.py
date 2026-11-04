@@ -158,7 +158,7 @@ def _engine_class():
                 text, questions = pruner.build_request(batch, state)
                 data = self._fc_client.post_questions(
                     self._fc["endpoint"], self._fc["api_key_env"], text, questions,
-                    timeout=self._fc["request_timeout"])
+                    timeout=self._fc["request_timeout"], model=self._fc.get("served_model"))
                 if data is None:
                     raise pruner.PruneError("classifier_unavailable")
                 decisions.update(pruner.parse_response(data, batch,

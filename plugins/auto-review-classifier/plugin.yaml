@@ -9,8 +9,12 @@ provides_hooks:
 config_schema:
   endpoint:
     type: str
-    default: "http://192.168.50.71:8787"
+    default: "http://127.0.0.1:8102"
     description: "Classifier service base URL (GET /health, POST /v1/systemone)."
+  served_model:
+    type: str
+    default: "qwen3.8-flash-next"
+    description: "Model name sent as the top-level `model` field; the flare engine requires it."
   api_key_env:
     type: str
     default: "CLASSIFIER_API_KEY"

@@ -900,7 +900,9 @@ def classifier(monkeypatch):
 
     class Reply:  # real context manager — urlopen result is used with `with`
         def __init__(self, verdict):
-            self._body = json.dumps({"difficulty": verdict}).encode()
+            self._body = json.dumps({"model": "fake", "usage": {},
+                                     "answers": {"difficulty": {"type": "choice",
+                                                                "choice": verdict}}}).encode()
 
         def __enter__(self):
             return self

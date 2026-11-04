@@ -17,8 +17,12 @@ config_schema:
     description: "When false the engine defers every compression to the built-in summary path."
   endpoint:
     type: string
-    default: "http://192.168.50.71:8787"
+    default: "http://127.0.0.1:8102"
     description: "Classifier base URL. Never log or echo the key; set the key in the environment."
+  served_model:
+    type: string
+    default: "qwen3.8-flash-next"
+    description: "Model name sent as the top-level `model` field; the flare engine requires it."
   api_key_env:
     type: string
     default: "CLASSIFIER_API_KEY"

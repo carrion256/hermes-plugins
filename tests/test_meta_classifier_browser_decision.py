@@ -142,10 +142,12 @@ def test_tool_one_round_trip_per_observation(load_plugin, monkeypatch):
         raw = json.loads(request.data)
         requests.append(raw)
         if len(requests) == 1:
-            assert "click_target" in raw["schema"] and "type_target" in raw["schema"], \
+            assert "click_target" in raw["questions"] and "type_target" in raw["questions"], \
                 "operation+targets must share ONE request"
-        assert "sk-secret" not in raw["text"]  # egress redaction ran on the table
-        return Reply({"operation": "click", "click_target": "1"})
+        assert "sk-secret" not in raw["state"]  # egress redaction ran on the table
+        return Reply({"model": "fake", "usage": {}, "answers": {
+            "operation": {"type": "choice", "choice": "click"},
+            "click_target": {"type": "choice", "choice": "1"}}})
 
     monkeypatch.setenv("META_TEST_KEY", "synthetic-key")
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)

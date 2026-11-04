@@ -22,14 +22,17 @@ class ClassifierClient:
         self.cooldown = float(cooldown)
         self._down = {}  # endpoint -> monotonic deadline; set only on failures
 
-    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
-        """POST {state, questions} to <endpoint>/v1/systemone; returns dict or None (never raises).
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None,
+                       model="qwen3.8-flash-next"):
+        """POST {model, state, questions} to <endpoint>/v1/systemone; returns dict or None (never raises).
 
         The shared ``_request`` path supplies endpoint resolution, key handling, timeout
-        and cooldown semantics; typed answers ride under ``answers`` in the body.
+        and cooldown semantics; typed answers ride under ``answers`` in the body. The
+        flare engine requires a top-level ``model`` field.
         """
         return self._request(endpoint, api_key_env, text,
-                             {"state": text, "questions": questions}, "/v1/systemone", timeout)
+                             {"model": str(model or "qwen3.8-flash-next"),
+                              "state": text, "questions": questions}, "/v1/systemone", timeout)
 
     def _request(self, endpoint, api_key_env, text, body, path, timeout):
         """One Bearer-authenticated POST with the shared guards and failure handling."""

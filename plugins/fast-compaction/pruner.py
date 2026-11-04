@@ -31,7 +31,8 @@ OMITTED_NOTE = "ok, {total} chars (omitted)"
 
 DEFAULTS = {
     "enabled": True,
-    "endpoint": "http://192.168.50.71:8787",
+    "endpoint": "http://127.0.0.1:8102",
+    "served_model": "qwen3.8-flash-next",
     "api_key_env": "CLASSIFIER_API_KEY",
     "preserve_recent_messages": 6,
     "min_reduction": 0.25,

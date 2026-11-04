@@ -15,7 +15,7 @@ def records(h, addon):
 
 
 def head_requests(h, head):
-    return [r for r in h.requests if head in r["schema"]]
+    return [r for r in h.requests if head in r.get("questions", {})]
 
 
 def test_addons_off_by_default_register_no_hooks(load_plugin, monkeypatch):
@@ -37,7 +37,7 @@ def test_injection_fences_results_that_steer_the_agent(load_plugin, monkeypatch)
     assert replaced.endswith(page)
     row, = records(h, "injection")
     assert row["tool"] == "web_extract" and row["classification"]["injection_target"] == "credentials"
-    assert list(h.requests[-1]["schema"]) == ["instructions_to_agent", "injection_target"]
+    assert list(h.requests[-1]["questions"]) == ["instructions_to_agent", "injection_target"]
 
 
 def test_injection_leaves_clean_and_trusted_results_alone(load_plugin, monkeypatch):
@@ -64,12 +64,12 @@ def test_outcome_redacts_secret_output_and_feeds_completion(load_plugin, monkeyp
     output = f"export KEY={SECRET}\nnpm ERR! build failed"
     replaced, = h.hook("transform_tool_result", tool_name="terminal", result=output, session_id="s", status="ok")
     assert SECRET not in replaced and "npm ERR! build failed" in replaced
-    assert SECRET not in h.requests[0]["text"]
+    assert SECRET not in h.requests[0]["state"]
     h.hook("pre_llm_call", session_id="s", conversation_history=[{"role": "user", "content": "build the app"}])
     nudge, = h.hook("pre_verify", session_id="s", attempt=0, final_response="Built successfully.", changed_paths=["a"])
     assert "classified as failed" in nudge["message"] and nudge["action"] == "continue"
-    assert "Tool outcomes this turn: terminal=failed" in head_requests(h, "finished")[0]["text"]
-    assert "Goal: build the app" in head_requests(h, "finished")[0]["text"]
+    assert "Tool outcomes this turn: terminal=failed" in head_requests(h, "finished")[0]["state"]
+    assert "Goal: build the app" in head_requests(h, "finished")[0]["state"]
     row, = records(h, "completion")
     assert row["toolOutcomes"] == ["failed"]
 
@@ -100,7 +100,7 @@ def test_subagent_report_quality_recorded_and_warned(load_plugin, monkeypatch, c
                child_summary="Fixed the bug and also refactored the whole module; tests pass.")
     row, = records(h, "subagent")
     assert row["hostStatus"] == "completed" and row["classification"]["scope"] == "creep"
-    assert "Host status: completed" in h.requests[-1]["text"]
+    assert "Host status: completed" in h.requests[-1]["state"]
     assert any("meta-classifier subagent c" in m for m in caplog.messages)
 
 
@@ -114,7 +114,7 @@ def test_request_adds_context_for_underspecified_or_destructive(load_plugin, mon
     context = next(r for r in result if isinstance(r, dict) and r.get("context"))["context"]
     assert "ONE clarifying question" in context and "irreversible change" in context
     assert "intent=code_generation" in context
-    assert list(h.requests[-1]["schema"]) == ["primaryIntent", "ambiguity", "destructive_request"]
+    assert list(h.requests[-1]["questions"]) == ["primaryIntent", "ambiguity", "destructive_request"]
 
 
 def test_request_clear_turn_adds_nothing_and_skips_short_text(load_plugin, monkeypatch):
@@ -136,7 +136,7 @@ def test_friction_records_category_for_tool_errors_only(load_plugin, monkeypatch
     row, = records(h, "friction")
     assert row["papercutsSignature"] == "terminal|CommandError|tool_error"
     assert row["classification"]["frictionCategory"] == ["environment"]
-    assert h.requests[-1]["text"].startswith("Tool: terminal\nError type: CommandError\nexit 127")
+    assert h.requests[-1]["state"].startswith("Tool: terminal\nError type: CommandError\nexit 127")
 
 
 # ---------------------------------------------------------------- memory
@@ -146,7 +146,7 @@ def test_memory_records_durable_candidates(load_plugin, monkeypatch):
            assistant_response="Noted, I'll use jj for this repo.")
     row, = records(h, "memory")
     assert row["turnId"] == "t1" and row["classification"]["durable"] == "preference"
-    assert h.requests[-1]["text"].startswith("USER: always use jj")
+    assert h.requests[-1]["state"].startswith("USER: always use jj")
 
 
 # ---------------------------------------------------------------- test_value
@@ -196,7 +196,7 @@ def test_complexity_shadow_records_per_task_without_directive(load_plugin, monke
     assert not any(isinstance(r, dict) and r.get("action") for r in results)
     rows = records(h, "complexity")
     assert [r["taskIndex"] for r in rows] == [0, 1] and rows[0]["chosenEffort"] == "high"
-    assert head_requests(h, "complexity")[0]["text"] == "Goal: find the deadlock\nContext: no repro"
+    assert head_requests(h, "complexity")[0]["state"] == "Goal: find the deadlock\nContext: no repro"
     with bind_subagent_parent(local_agent()):
         h.hook("pre_tool_call", tool_name="delegate_task", task_id="t-cx", tool_call_id="c2", session_id="s",
                args={"action": "list"})

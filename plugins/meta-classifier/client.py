@@ -1,14 +1,20 @@
 """Shared classifier client with a dead-endpoint cooldown.
 
-Two transports, one failure contract: `/classify` takes a label schema and
-`/v1/systemone` takes typed questions whose probabilities come back to the
-caller (the same decision the service makes with `cls_threshold` server-side,
-except the caller sees the number and can calibrate it).
+One transport (`/v1/systemone`), one failure contract. `ask()` sends typed
+questions and returns the raw envelope with probabilities; `classify()` keeps
+the historical label-schema API by translating each head into one typed choice
+question (criteria descriptions carry the old label descriptions verbatim),
+scoring it in a single request, and back-mapping each answer to the original
+label key. `multi_label` heads cannot be answered jointly by a logprob scorer:
+they are asked as a choice among their labels plus an explicit none and
+answered as a list of at most one label — the shape every caller tolerates.
 
-The Bearer key is read from the environment at call time and never stored,
-logged or echoed. Failure semantics: no key / no endpoint / transport error /
-unusable body -> None, and the endpoint is blacked out for `cooldown` seconds
-so a dead service does not tax every tool call.
+The endpoint is a flare node (127.0.0.1:8102) which REQUIRES a top-level
+`model` field; the Bearer key is still read from the environment at call time
+and never stored, logged or echoed (nodes ignore it; the key gate keeps the
+tools registered). Failure semantics unchanged: no key / no endpoint /
+transport error / unusable body -> None, and the endpoint is blacked out for
+`cooldown` seconds so a dead service does not tax every tool call.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 MAX_TEXT = 100000  # service limit; longer texts must be clipped by the caller
+DEFAULT_MODEL = "qwen3.8-flash-next"  # what the flare nodes serve
 
 # Client-side wait budget. Measured on the deployed engine (5 samples per size, worst
 # observed): 0.10 s at 200 chars, 0.24 s at 2k, 1.67 s at 10k, 5.64 s at 40k, 12.8 s at
@@ -40,7 +47,10 @@ class Classifier:
         self._down = {}  # endpoint -> monotonic deadline
 
     def endpoint(self):
-        return str(self._ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
+        return str(self._ctx.get_config("endpoint", "http://127.0.0.1:8102") or "").rstrip("/")
+
+    def _model(self):
+        return str(self._ctx.get_config("served_model", DEFAULT_MODEL) or DEFAULT_MODEL)
 
     def _key(self):
         return os.environ.get(str(self._ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")), "").strip()
@@ -51,13 +61,60 @@ class Classifier:
         return min(MAX_TIMEOUT, max(self.timeout, 0.5 + len(text) * CHAR_SECONDS))
 
     def classify(self, text, schema, timeout=None):
-        """POST {text, schema}; returns the parsed label dict or None (never raises)."""
-        return self._post("/classify", {"text": text, "schema": schema}, text, timeout)
+        """Translate a label schema to typed questions, score them in ONE
+        /v1/systemone pass, back-map each answer to its original label key;
+        returns the parsed label dict or None (never raises).
+
+        Each head `{labels: {key: description}}` becomes one choice question
+        whose criteria carry the descriptions verbatim; the answer key is
+        validated against the offered set. `multi_label` heads also see a
+        `none` option and answer as a list of at most one label. A head with
+        no usable answer yields no key — the shape /classify produced when a
+        head abstained.
+        """
+        if not isinstance(schema, dict) or not schema:
+            return None
+        questions, multiheads = {}, {}
+        for head, spec in schema.items():
+            if isinstance(spec, dict) and "labels" in spec:
+                labels = spec["labels"]
+                multi = bool(spec.get("multi_label"))
+            elif isinstance(spec, list):
+                labels, multi = {str(k): str(k) for k in spec}, False
+            else:
+                return None
+            if isinstance(labels, list):  # bare label lists carry no descriptions
+                labels = {str(k): str(k) for k in labels}
+            if not isinstance(labels, dict) or not labels:
+                return None
+            criteria = {str(k): str(labels.get(k, k)) for k in labels}
+            if multi:
+                criteria["none"] = "none of the listed labels applies"
+                multiheads[head] = True
+            questions[head] = {"type": "choice", "criteria": criteria}
+        envelope = self.ask(text, questions, timeout=timeout)
+        answers = envelope.get("answers") if isinstance(envelope, dict) else None
+        if not isinstance(answers, dict):
+            return None
+        labels_out = {}
+        for head in questions:
+            answer = answers.get(head)
+            choice = answer.get("choice") if isinstance(answer, dict) else None
+            key = str(choice) if choice is not None else None
+            if key is None or key not in questions[head]["criteria"]:
+                continue  # head unanswered or off-menu: absent key, never a guess
+            if multiheads.get(head):
+                labels_out[head] = [] if key == "none" else [key]
+            else:
+                labels_out[head] = key
+        return labels_out or None
 
     def ask(self, state, questions, timeout=None):
-        """POST {state, questions} to /v1/systemone; returns the parsed envelope
+        """POST {model, state, questions} to /v1/systemone; returns the parsed envelope
         (`{"answers": {...}}`) or None (never raises)."""
-        return self._post("/v1/systemone", {"state": state, "questions": questions}, state, timeout)
+        return self._post("/v1/systemone", {"model": self._model(),
+                                            "state": state, "questions": questions},
+                         state, timeout)
 
     def _post(self, path, payload, text, timeout=None):
         endpoint, key = self.endpoint(), self._key()

@@ -25,11 +25,12 @@ config_schema:
     type: dict
     default:
       enabled: false
-      endpoint: "http://192.168.50.71:8787"
+      endpoint: "http://127.0.0.1:8102"
+      served_model: "qwen3.8-flash-next"
       api_key_env: "CLASSIFIER_API_KEY"
       timeout: 1.5
       cooldown: 45.0
-    description: "Optional semantic tie-break for ambiguous keyword hits only (a common-word bare hit, or a negation within 3 words). When enabled, the message is redacted with native egress redaction before HTTP POST to endpoint/classify, and the classifier returns one head steering: directive, mention or negated. The key is read from the environment variable named by api_key_env at call time and never stored. An unavailable classifier declines the ambiguous hit. Deterministic hits never consult it."
+    description: "Optional semantic tie-break for ambiguous keyword hits only (a common-word bare hit, or a negation within 3 words). When enabled, the message is redacted with native egress redaction before HTTP POST to endpoint/v1/systemone (the top-level model field carries served_model; the flare engine requires it), and the classifier returns one head steering: directive, mention or negated. The key is read from the environment variable named by api_key_env at call time and never stored. An unavailable classifier declines the ambiguous hit. Deterministic hits never consult it."
   ref_roots:
     type: list
     default:

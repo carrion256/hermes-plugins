@@ -58,7 +58,10 @@ from contextvars import copy_context
 
 logger = logging.getLogger(__name__)
 
-SCHEMA = {"difficulty": ["simple", "complex"]}
+_DIFFICULTY_CRITERIA = {
+    "simple": "The goal is well-scoped, mechanical, or needs no design judgment: a small edit, a lookup, a single-file change, a routine command.",
+    "complex": "The goal needs investigation, design, or multi-step judgment: understanding unfamiliar code, weighing tradeoffs, touching several components, or verifying non-trivial behavior.",
+}
 _MAX_ROWS = 50
 _BOOKKEEPING_INTERVAL = 30
 # Classifier workers are daemon threads capped by a bounded semaphore: no
@@ -68,7 +71,8 @@ _MAX_CLASSIFIERS = 4
 
 
 def register(ctx) -> None:
-    endpoint = (ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
+    endpoint = (ctx.get_config("endpoint", "http://127.0.0.1:8102") or "").rstrip("/")
+    model = str(ctx.get_config("served_model", "qwen3.8-flash-next") or "qwen3.8-flash-next")
     api_key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
     low = ctx.get_config("low_effort", "low")
     high = ctx.get_config("high_effort", "high")
@@ -153,14 +157,19 @@ def register(ctx) -> None:
         key = os.environ.get(api_key_env or "", "")
         if config_error or not key or not endpoint or not goal:
             return None
-        body = json.dumps({"text": goal[:100000], "schema": SCHEMA}).encode()
+        body = json.dumps({"model": model, "state": goal[:100000],
+                           "questions": {"difficulty": {
+                               "type": "choice", "criteria": _DIFFICULTY_CRITERIA}}}).encode()
         req = urllib.request.Request(
-            f"{endpoint}/classify", data=body,
+            f"{endpoint}/v1/systemone", data=body,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                v = json.loads(resp.read()).get("difficulty")
+                data = json.loads(resp.read())
+            answers = data.get("answers") if isinstance(data, dict) else None
+            answer = answers.get("difficulty") if isinstance(answers, dict) else None
+            v = answer.get("choice") if isinstance(answer, dict) else None
             return v if v in ("simple", "complex") else None
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
             return None

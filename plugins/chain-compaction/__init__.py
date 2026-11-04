@@ -320,7 +320,8 @@ def _engine_class():
             for batch in pruner.build_batches(eligible):
                 text, questions = pruner.build_request(batch, state)
                 data = client.post_questions(cfg["endpoint"], key_env, text, questions,
-                                             timeout=float(cfg["request_timeout"]))
+                                             timeout=float(cfg["request_timeout"]),
+                                             model=cfg.get("served_model"))
                 if data is None:
                     raise StageError("prune_classifier_unavailable")
                 decisions.update(pruner.parse_response(data, batch,

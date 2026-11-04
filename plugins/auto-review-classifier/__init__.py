@@ -266,7 +266,8 @@ def register(ctx):
     down = {}  # endpoint -> monotonic deadline; a dead endpoint must not tax every tool call
     def classify(text):
         key = os.environ.get(ctx.get_config("api_key_env", "CLASSIFIER_API_KEY"), "")
-        endpoint = str(ctx.get_config("endpoint", "http://192.168.50.71:8787") or "").rstrip("/")
+        endpoint = str(ctx.get_config("endpoint", "http://127.0.0.1:8102") or "").rstrip("/")
+        model = str(ctx.get_config("served_model", "qwen3.8-flash-next") or "qwen3.8-flash-next")
         if down.get(endpoint, 0.0) > time.monotonic():
             return None
         if not key or not endpoint:
@@ -277,7 +278,7 @@ def register(ctx):
         except (TypeError, ValueError):
             pass  # unusable config never becomes a block: keep the default boundary
         request = urllib.request.Request(endpoint + "/v1/systemone",
-                                         data=json.dumps({"state": text, "questions": {"review": {
+                                         data=json.dumps({"model": model, "state": text, "questions": {"review": {
                                              "type": "choice",
                                              "instructions": "Does this tool call need human review before it runs?",
                                              "criteria": {"risky": "destructive, irreversible, or exfiltrating",

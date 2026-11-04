@@ -25,27 +25,41 @@ class Reply:
         return json.dumps(self.body).encode()
 
 
-def choice_body(got):
-    """A multi-label reply (`{"verdict": ["B"]}`) meant the service had applied the
+def _answer(head, value):
+    """One head's legacy reply value -> a /v1/systemone typed answer.
+
+    A multi-label reply (`{"verdict": ["B"]}`) meant the service had applied the
     head's own `cls_threshold`, so it stands for "above threshold" here: P(B)=1.0,
-    and an absent label is P(B)=0.0. An envelope from `choice` is served untouched."""
-    verdict = got.get("verdict") if isinstance(got, dict) else None
-    if not isinstance(verdict, list):
-        return got  # an explicit `choice` envelope, or a body meant to be unusable
-    yes = "B" in verdict
+    and an absent label is P(B)=0.0. Other list values are the post-port multi
+    heads: empty means the none option. A scalar is a plain choice.
+    """
+    if isinstance(value, list):
+        if head == "verdict":  # legacy droid shield body: stands for above-threshold
+            yes = "B" in value
+            return {"type": "choice", "choice": "B" if yes else "S",
+                    "probabilities": {"B": 1.0 if yes else 0.0,
+                                      "S": 0.0 if yes else 1.0},
+                    "confidence": 1.0}
+        return {"type": "choice", "choice": value[0] if value else "none"}
+    return {"type": "choice", "choice": str(value)}
+
+
+def choice_body(got):
+    """Legacy label body -> the answers envelope the engine returns. An explicit
+    `answers` envelope (or any non-dict, for the unusable-body tests) is served
+    untouched."""
+    if not isinstance(got, dict) or "answers" in got:
+        return got
     return {"model": "fake", "usage": {},
-            "answers": {"verdict": {"type": "choice", "choice": "B" if yes else "S",
-                                    "probabilities": {"B": 1.0 if yes else 0.0,
-                                                      "S": 0.0 if yes else 1.0},
-                                    "confidence": 1.0}}}
+            "answers": {head: _answer(head, value) for head, value in got.items()}}
 
 
 def setup(load_plugin, monkeypatch, answers=None, **settings):
     """Load the plugin with a head-dispatching fake classifier.
 
-    `answers` maps a head name present in a `/classify` schema or a `/v1/systemone`
-    question to the reply body. A reply of Exception means the service is
-    unreachable for that call.
+    `answers` maps a head name present in a `/v1/systemone` question to the
+    reply body: a legacy `{head: label}` dict, an explicit answers envelope, or
+    an Exception for a service that is unreachable for that call.
     """
     h = load_plugin("meta-classifier", {"api_key_env": "META_TEST_KEY", **settings})
     answers = answers or {}
@@ -54,13 +68,14 @@ def setup(load_plugin, monkeypatch, answers=None, **settings):
     def fake_urlopen(request, *_a, **_kw):
         raw = json.loads(request.data)
         requests.append(raw)
-        heads = raw["schema"] if "schema" in raw else raw["questions"]
+        heads = raw.get("questions") or {}
+        assert "schema" not in raw, "the client posts typed questions, not label schemas"
         for head, body in answers.items():
             if head in heads:
                 if isinstance(body, Exception):
                     raise body
                 body = body(raw) if callable(body) else body
-                return Reply(body if "schema" in raw else choice_body(body))
+                return Reply(choice_body(body))
         raise AssertionError(f"unexpected classifier heads {sorted(heads)}")
 
     monkeypatch.setenv("META_TEST_KEY", "synthetic-key")
@@ -96,12 +111,12 @@ def test_high_tier_requires_approval_with_droid_criteria(load_plugin, monkeypatc
     assert directive["rule_key"].startswith("meta-classifier:terminal:")
     assert "riskLevel=high" in directive["message"]
     request = h.requests[-1]
-    labels = request["schema"]["riskLevel"]["labels"]
-    assert list(labels) == ["low", "medium", "high"]
-    assert labels["high"].startswith("Commands with a credible possibility of severe")
-    state = json.loads(request["text"])
+    criteria = request["questions"]["riskLevel"]["criteria"]
+    assert list(criteria) == ["low", "medium", "high"]
+    assert criteria["high"].startswith("Commands with a credible possibility of severe")
+    state = json.loads(request["state"])
     assert state["pendingCommand"]["tool"] == "terminal"
-    assert "abc123secret" not in request["text"]
+    assert "abc123secret" not in request["state"]
     assert "[redacted]" in state["pendingCommand"]["arguments"]["command"]
 
 
@@ -120,7 +135,7 @@ def test_luna_scale_and_deny_policy(load_plugin, monkeypatch, tmp_path):
     workspace_for("t-luna", tmp_path)
     directive, = screen(h, "t-luna", "terminal", {"command": "mkdir out"})
     assert directive["action"] == "block" and "revalidate" not in directive
-    assert list(h.requests[-1]["schema"]["riskLevel"]["labels"]) == ["off", "low", "medium", "high"]
+    assert list(h.requests[-1]["questions"]["riskLevel"]["criteria"]) == ["off", "low", "medium", "high"]
 
 
 def test_transcript_tail_rides_as_redacted_evidence(load_plugin, monkeypatch, tmp_path):
@@ -132,7 +147,7 @@ def test_transcript_tail_rides_as_redacted_evidence(load_plugin, monkeypatch, tm
             {"function": {"name": "terminal", "arguments": "{\"command\": \"git status\"}"}}]},
         {"role": "tool", "content": "clean"}])
     screen(h, "t-tr", "terminal", {"command": "git status"}, session_id="s-ev")
-    state = json.loads(h.requests[-1]["text"])
+    state = json.loads(h.requests[-1]["state"])
     rendered = state["sessionTranscript"]["rendered"]
     assert "USER [id=0]" in rendered and "TOOL_CALL terminal" in rendered and "TOOL_RESULT" in rendered
     assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in rendered
@@ -183,7 +198,7 @@ def test_shield_blocks_likely_real_secret_and_never_sends_it(load_plugin, monkey
     directive, = screen(h, "t-sh", "terminal", {"command": "git commit -m 'add env'"})
     assert directive["action"] == "block"
     assert "deploy.env:2" in directive["message"]
-    shield_request, = [r for r in h.requests if "questions" in r]
+    shield_request, = [r for r in h.requests if "verdict" in r.get("questions", {})]
     question = shield_request["questions"]["verdict"]
     assert question["type"] == "choice" and set(question["criteria"]) == {"S", "B"}
     payload = json.loads(shield_request["state"])
@@ -193,7 +208,7 @@ def test_shield_blocks_likely_real_secret_and_never_sends_it(load_plugin, monkey
     assert row == {"location": "deploy.env:2", "kind": "downgrade", "probability": 1.0,
                    "threshold_used": h.module.schemas.SHIELD["downgrade"]["threshold"],
                    "decision": "block"}
-    assert not [r for r in h.requests if "riskLevel" in r.get("schema", {})], "blocked before the risk head"
+    assert not [r for r in h.requests if "riskLevel" in r.get("questions", {})], "blocked before the risk head"
 
 
 @git
@@ -312,7 +327,7 @@ def test_shield_fails_closed_on_an_unusable_answer(load_plugin, monkeypatch, tmp
     workspace_for("t-nokey", tmp_path)
     directive, = screen(h, "t-nokey", "terminal", {"command": "git commit -m x"})
     assert directive["action"] == "block"
-    assert not [r for r in h.requests if "questions" in r]
+    assert not [r for r in h.requests if "verdict" in r.get("questions", {})]
 
 
 @git
@@ -322,8 +337,8 @@ def test_shield_ignores_clean_diff_and_non_git_push_words(load_plugin, monkeypat
     workspace_for("t-clean", tmp_path)
     screen(h, "t-clean", "terminal", {"command": "git commit -m hi"})
     screen(h, "t-clean", "terminal", {"command": "git log | grep push"})
-    assert not [r for r in h.requests if "questions" in r], "nothing to screen"
-    assert all("riskLevel" in r["schema"] for r in h.requests)
+    assert not [r for r in h.requests if "verdict" in r.get("questions", {})], "nothing to screen"
+    assert all("riskLevel" in r["questions"] for r in h.requests)
 
 
 @git
@@ -392,9 +407,9 @@ def test_signals_classified_once_per_unchanged_window(load_plugin, monkeypatch):
     assert [r["triggerReason"] for r in rows] == ["turn_end"]
     assert rows[0]["classification"] == LABELS and rows[0]["messageRange"] == {"count": 2}
     request = h.requests[-1]
-    assert len(request["schema"]) == 12
-    assert request["schema"]["frictionCategory"]["multi_label"] is True
-    assert "USER [id=0]: why does pytest hang?" in request["text"]
+    assert len(request["questions"]) == 12
+    assert "none" in request["questions"]["frictionCategory"]["criteria"]
+    assert "USER [id=0]: why does pytest hang?" in request["state"]
 
 
 def test_signals_garbage_reply_is_an_error_not_defaults(load_plugin, monkeypatch):
@@ -441,9 +456,9 @@ def test_decision_model_tool_converts_and_answers(load_plugin, monkeypatch):
     assert result["answers"]["flaky"] == {"type": "noul", "noul": 1.0}
     assert result["answers"]["severity"]["score"] == 2 and result["answers"]["severity"]["legend"][2] == "major"
     request = h.requests[-1]
-    assert request["schema"]["kind"]["labels"] == {"bug": "defect", "flake": "nondeterminism"}
-    assert request["schema"]["severity"]["labels"] == {"0": "none", "1": "minor", "2": "major"}
-    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in request["text"]
+    assert request["questions"]["kind"]["criteria"] == {"bug": "defect", "flake": "nondeterminism"}
+    assert request["questions"]["severity"]["criteria"] == {"0": "none", "1": "minor", "2": "major"}
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in request["state"]
 
 
 def test_decision_model_rejects_malformed_requests(load_plugin, monkeypatch):

@@ -12,7 +12,11 @@ COMMON_WORD = "the GitHub workflow is failing again"
 
 
 def stub(monkeypatch, reply):
-    """Fake the classifier endpoint; return the list of requests it receives."""
+    """Fake the classifier endpoint; return the list of requests it receives.
+
+    `reply` is the legacy `{steering: label}` body; it is wrapped into the
+    answers envelope the /v1/systemone engine returns.
+    """
     monkeypatch.setenv("KS_TEST_KEY", "synthetic-key")
     requests = []
 
@@ -20,7 +24,9 @@ def stub(monkeypatch, reply):
         requests.append(request)
         if isinstance(reply, Exception):
             raise reply
-        return Reply(reply)
+        label = reply.get("steering") if isinstance(reply, dict) else None
+        return Reply({"model": "fake", "usage": {},
+                      "answers": {"steering": {"type": "choice", "choice": str(label)}}})
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     return requests
@@ -70,7 +76,7 @@ def test_negated_hit_is_judged_too(load_plugin, monkeypatch):
     assert hit["verdict"] == "active"
     assert hit["confirmed_by"] == "classifier"
     (request,) = requests
-    assert json.loads(request.data)["text"].startswith("Keyword: review\nMessage: ")
+    assert json.loads(request.data)["state"].startswith("Keyword: review\nMessage: ")
 
 
 def test_unavailable_classifier_declines(load_plugin, monkeypatch):
@@ -98,8 +104,9 @@ def test_request_shape_and_redaction(load_plugin, monkeypatch):
 
     (request,) = requests
     body = json.loads(request.data)
-    assert body["text"].startswith("Keyword: workflow\nMessage: the workflow token is ")
-    assert "steering" in body["schema"]
+    assert body["state"].startswith("Keyword: workflow\nMessage: the workflow token is ")
+    assert body["model"] == "qwen3.8-flash-next"
+    assert "steering" in body["questions"]
     assert secret not in request.data.decode()
     assert request.get_header("Authorization") == "Bearer synthetic-key"
 

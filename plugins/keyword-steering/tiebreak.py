@@ -33,7 +33,8 @@ class Tiebreak:
         if not isinstance(enabled, bool):
             raise ValueError("keyword-steering: classifier.enabled must be a boolean")
         self.enabled = enabled
-        self._endpoint = str(cfg.get("endpoint") or "http://192.168.50.71:8787").rstrip("/")
+        self._endpoint = str(cfg.get("endpoint") or "http://127.0.0.1:8102").rstrip("/")
+        self._model = str(cfg.get("served_model") or "qwen3.8-flash-next")
         self._key_env = str(cfg.get("api_key_env") or "CLASSIFIER_API_KEY")
         self._timeout = float(cfg.get("timeout", 1.5))
         self._cooldown = float(cfg.get("cooldown", 45.0))
@@ -63,17 +64,23 @@ class Tiebreak:
                 self._last_error = "redaction unavailable"
                 return None
             request = urllib.request.Request(
-                self._endpoint + "/classify",
+                self._endpoint + "/v1/systemone",
                 data=json.dumps({
-                    "text": f"Keyword: {trigger}\nMessage: {redacted}",
-                    "schema": STEERING_SCHEMA,
+                    "model": self._model,
+                    "state": f"Keyword: {trigger}\nMessage: {redacted}",
+                    "questions": {"steering": {
+                        "type": "choice",
+                        "criteria": STEERING_SCHEMA["steering"]["labels"],
+                    }},
                 }).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
             )
             try:
                 with urllib.request.urlopen(request, timeout=self._timeout) as reply:
                     body = json.loads(reply.read(65536))
-                label = body.get("steering") if isinstance(body, dict) else None
+                answers = body.get("answers") if isinstance(body, dict) else None
+                answer = answers.get("steering") if isinstance(answers, dict) else None
+                label = answer.get("choice") if isinstance(answer, dict) else None
                 if label not in LABELS:
                     raise ValueError("unusable classifier body")
             except Exception as exc:

@@ -132,7 +132,7 @@ def engine_factory(monkeypatch):
     monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
 
     class FakeClient:  # the fake pruner ignores the response body entirely
-        def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
+        def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
             return {}
 
     def make(pipeline, pruner=None, client=None, **over):
@@ -321,7 +321,7 @@ def test_register_rejects_bad_pipeline_and_status_tool_reports():
 class _SummaryClient:
     """Transport stub: the summary stage never touches it."""
 
-    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None):
+    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
         return {}
 
 

@@ -67,7 +67,9 @@ def _stalled_reply(parked, gate, verdict="complex"):
         def read(self):
             parked.set()
             gate.wait()
-            return json.dumps({"difficulty": verdict}).encode()
+            return json.dumps({"model": "fake", "usage": {},
+                               "answers": {"difficulty": {"type": "choice",
+                                                          "choice": verdict}}}).encode()
     return StalledReply()
 
 

@@ -300,7 +300,7 @@ def test_one_request_carries_every_question(load_plugin, monkeypatch):
     assert len(requests) == 1
     assert requests[0]["url"].endswith("/v1/systemone")
     body = requests[0]["body"]
-    assert set(body) == {"state", "questions"}
+    assert set(body) == {"model", "state", "questions"}
     assert sorted(body["questions"]) == sorted(f"{r['tag']}_{kind}" for r in eligible
                                                for kind in ("call", "result"))
     assert all(q["type"] == "choice" and set(q["criteria"]) == {"keep", "drop"}

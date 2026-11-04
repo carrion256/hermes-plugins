@@ -30,8 +30,12 @@ config_schema:
     description: "Minimum reduction a single stage must produce on its own; below it the stage counts as 'not substantial enough' and the next one runs."
   endpoint:
     type: string
-    default: "http://192.168.50.71:8787"
+    default: "http://127.0.0.1:8102"
     description: "Classifier base URL (prune stage only). Never log or echo the key."
+  served_model:
+    type: string
+    default: "qwen3.8-flash-next"
+    description: "Model name sent as the top-level `model` field; the flare engine requires it."
   api_key_env:
     type: string
     default: "CLASSIFIER_API_KEY"
