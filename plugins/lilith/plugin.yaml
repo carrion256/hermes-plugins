@@ -1,0 +1,4 @@
+name: lilith
+kind: model-provider
+version: 0.1.0
+description: Lilith local SGLang provider with model-aware Qwen and DeepSeek V4 reasoning
