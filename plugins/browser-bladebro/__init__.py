@@ -1,10 +1,12 @@
 """bladebro browser backend over the native Hermes MCP client.
 
-Drop-in: the built-in ``browser_*`` tools (navigate, snapshot, click, type,
-scroll, back, press, get_images, vision, console) are replaced with the SAME
-names, schemas and result shapes, executed on the bladebro backend (needs
-``plugins.entries.browser-bladebro.allow_tool_override: true``; unloading the
-plugin restores the built-ins). Each Hermes task owns one backend tab.
+The ``browser_*`` tools (navigate, snapshot, click, type, scroll, back,
+press, get_images, vision, console) — the same names, schemas and result
+shapes the built-ins had before upstream Hermes removed them — are owned
+and provided by this plugin on the bladebro backend. Core ``browser_exec``
+(``tools/browser_use_cli.py``) is the separate CDP/browser-harness lane;
+these are the bladebro real-browser lane tools, with no behavioral coupling.
+Each Hermes task owns one backend tab.
 
 Calls go through the host's native MCP path (``ctx.call_mcp``), gated by the
 operator-granted ``plugins.entries.browser-bladebro.mcp_allowlist`` (default
@@ -45,6 +47,19 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
+
+# Live URL/SSRF policy comes from the current Hermes tree — the same module
+# core browser_exec enforces with (upstream deleted the built-in browser_*
+# tools and their policy helpers on 2026-11-03). Bound at module level so
+# tests can rebind these names; every call site below goes through them.
+from tools.browser_url_policy import (  # noqa: E402  (_url_policy_error: landing-check parity)
+    _url_policy_error,
+    evaluate_url_safety as _evaluate_url_safety,
+    eval_ssrf_guard_active as _eval_ssrf_guard_active,
+    expression_targets_private_url as _expression_targets_private_url,
+    url_blocked as _url_blocked,
+)
+from tools.url_safety import normalize_url_for_request as _normalize_url_for_request
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +446,484 @@ def _guard_js(url: str) -> str:
     return "location.href === " + json.dumps(url)
 
 
+# --------------------------------------------------------------------------
+# Plugin-owned model contract and the pure helpers ported from the built-in
+# browser tools (Hermes 8f68cf7; upstream removed them 2026-11-03, leaving
+# only an 11-line compat stub). URL/SSRF, secret-URL and website policy are
+# NOT ported — they route through tools.browser_url_policy above, the current
+# tree's own policy module (what browser_exec enforces with).
+# --------------------------------------------------------------------------
+
+DEFAULT_SNAPSHOT_THRESHOLD = 15000
+MIN_SNAPSHOT_THRESHOLD = 1000
+# Ceiling on the stored full-snapshot file (mirrors web_tools.MAX_STORED_TEXT_CHARS):
+# the stored copy exists for read_file paging and must not be unbounded.
+MAX_STORED_SNAPSHOT_CHARS = 2_000_000
+
+_EVAL_NAVIGATED_WHY = "This may have been caused by a JavaScript navigation via browser_console."
+
+_BROWSER_TOOL_EMOJI = {
+    "browser_navigate": "🌐", "browser_snapshot": "📸", "browser_click": "👆",
+    "browser_type": "⌨️", "browser_scroll": "📜", "browser_back": "◀️",
+    "browser_press": "⌨️", "browser_get_images": "🖼️", "browser_vision": "👁️",
+    "browser_console": "🖥️",
+}
+
+# Verbatim from tools/browser_tool.py @ 8f68cf7: the model-facing contract for
+# the browser_* lane (names, schemas, result shapes — prompts, skills, toolset
+# membership and display keep working unchanged).
+BROWSER_TOOL_SCHEMAS = [
+    {
+        "name": "browser_navigate",
+        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to navigate to (e.g., 'https://example.com')"
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "browser_snapshot",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "full": {
+                    "type": "boolean",
+                    "description": "If true, returns complete page content. If false (default), returns compact view with interactive elements only.",
+                    "default": False
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_click",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The element reference from the snapshot (e.g., '@e5', '@e12')"
+                }
+            },
+            "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_type",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The element reference from the snapshot (e.g., '@e3')"
+                },
+                "text": {
+                    "type": "string", "description": "The text to type into the field"
+                }
+            },
+            "required": ["ref", "text"]
+        }
+    },
+    {
+        "name": "browser_scroll",
+        "description": "Scroll the page in a direction. Use this to reveal more content that may be below or above the current viewport. Requires browser_navigate to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string", "enum": ["up", "down"], "description": "Direction to scroll"
+                }
+            },
+            "required": ["direction"]
+        }
+    },
+    {
+        "name": "browser_back",
+        "description": "Navigate back to the previous page in browser history. Requires browser_navigate to be called first.",
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+    },
+    {
+        "name": "browser_press",
+        "description": "Press a keyboard key. Useful for submitting forms (Enter), navigating (Tab), or keyboard shortcuts. Requires browser_navigate to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Key to press (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')"
+                }
+            },
+            "required": ["key"]
+        }
+    },
+    {
+        "name": "browser_get_images",
+        "description": "Get a list of all images on the current page with their URLs and alt text. Useful for finding images to analyze with the vision tool. Requires browser_navigate to be called first.",
+        "parameters": { "type": "object", "properties": {}, "required": [] }
+    },
+    {
+        "name": "browser_vision",
+        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "What you want to know about the page visually. Be specific about what you're looking for."
+                },
+                "annotate": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
+                }
+            },
+            "required": ["question"]
+        }
+    },
+    {
+        "name": "browser_console",
+        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "clear": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, clear the message buffers after reading"
+                },
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate in the page context. Runs in the browser like DevTools console — full access to DOM, window, document. Return values are serialized to JSON. Example: 'document.title' or 'document.querySelectorAll(\"a\").length'"
+                }
+            },
+            "required": []
+        }
+    },
+]
+
+
+def _redact_browser_output(value):
+    """Force-redact secrets in browser-originated data (snapshots, console, eval
+    results can carry page-rendered keys/cookies/tokens). Tool output is a model
+    boundary, so this applies even when global log redaction is disabled.
+    Ported verbatim from tools/browser_tool_snapshot.py @ 8f68cf7."""
+    from agent.redact import redact_sensitive_text
+
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, list):
+        return [_redact_browser_output(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_browser_output(item) for item in value)
+    if isinstance(value, dict):
+        return {_redact_browser_output(key): _redact_browser_output(item) for key, item in value.items()}
+    return value
+
+
+def _store_full_snapshot(snapshot_text: str):
+    """Write a full snapshot to cache/web and return its path (None on failure — best-effort).
+
+    Ported from tools/browser_tool_snapshot.py @ 8f68cf7: cache/web is mounted
+    read-only into remote backends, so read_file can page through the complete
+    tree on any backend. The stored copy is force-redacted (page-rendered
+    secrets must not hit disk unmasked) and named by content hash so identical
+    snapshots dedupe.
+    """
+    try:
+        from hermes_constants import get_hermes_dir
+        from agent.redact import redact_sensitive_text
+
+        content = redact_sensitive_text(snapshot_text, force=True)
+        if len(content) > MAX_STORED_SNAPSHOT_CHARS:
+            content = (
+                content[:MAX_STORED_SNAPSHOT_CHARS]
+                + f"\n\n[... stored copy truncated at {MAX_STORED_SNAPSHOT_CHARS:,} chars "
+                f"of {len(content):,} ...]"
+            )
+        from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+        cache_dir = get_hermes_dir("cache/web", "web_cache")
+        ensure_spill_dir(cache_dir, private=False)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:10]
+        path = cache_dir / f"browser-snapshot-{digest}.txt"
+        # Deterministic filename in a well-known dir: refuse symlinks (lstat-unlink +
+        # exclusive create); same-content re-snapshots legitimately overwrite. Not
+        # private: cache/web is bind-mounted into remote backends' container UID.
+        write_text_exclusive(path, content, private=False, overwrite=True)
+        return str(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to store full browser snapshot: %s", exc)
+        return None
+
+
+def _truncate_snapshot(snapshot_text: str, max_chars: int) -> str:
+    """Truncate a snapshot at line boundaries (never mid-element) to ``max_chars``.
+
+    Ported from tools/browser_tool_snapshot.py @ 8f68cf7. The full snapshot is
+    stored to cache/web and the appended note tells the agent how to page
+    through it with read_file — element refs beyond the cut are in the file,
+    not lost.
+    """
+    if len(snapshot_text) <= max_chars:
+        return snapshot_text
+
+    stored_path = _store_full_snapshot(snapshot_text)
+    if stored_path:
+        # Agent-visible path: read_file runs inside the active backend (#72389).
+        from tools.credential_files import to_agent_visible_cache_path
+        stored_path = to_agent_visible_cache_path(stored_path)
+
+    lines = snapshot_text.split('\n')
+    result: list[str] = []
+    chars = 0
+    # Reserve space for the truncation note (the stored-path variant is the
+    # longer of the two). Clamp so tiny max_chars values still keep content.
+    reserve = min(110 + len(stored_path or ""), max_chars // 2)
+    for line in lines:
+        if chars + len(line) + 1 > max_chars - reserve:
+            break
+        result.append(line)
+        chars += len(line) + 1
+    remaining = len(lines) - len(result)
+    if remaining > 0:
+        if stored_path:
+            next_line = len(result) + 1
+            result.append(
+                f'\n[... {remaining} more lines truncated — full snapshot: '
+                f'read_file path="{stored_path}" offset={next_line} limit=200]'
+            )
+        else:
+            result.append(f'\n[... {remaining} more lines truncated, use browser_snapshot for full content]')
+    return '\n'.join(result)
+
+
+def _redact_browser_typed_text_for_display(value, typed_text):
+    """Replace every occurrence of a secret-looking browser_type value with its redacted form.
+
+    Ported verbatim from agent/display.py @ 8f68cf7 (the display helper left
+    with the built-in tools). Backends echo the attempted input in error
+    strings/metadata, so it is swapped before reaching logs, callbacks, the
+    model, or chat history. Forced regardless of ``security.redact_secrets``:
+    a leaked typed credential is a security boundary.
+    """
+    from agent.redact import redact_sensitive_text
+
+    needle = "" if typed_text is None else str(typed_text)
+    redacted = redact_sensitive_text(needle, force=True) if needle else needle
+    if redacted == needle:
+        return value
+    if isinstance(value, str):
+        return value.replace(needle, redacted)
+    if isinstance(value, dict):
+        return {key: _redact_browser_typed_text_for_display(item, typed_text) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_browser_typed_text_for_display(item, typed_text) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_browser_typed_text_for_display(item, typed_text) for item in value)
+    return value
+
+
+# browser_console(expression=...) policy, ported from
+# tools/browser_tool_eval_policy.py @ 8f68cf7. ``browser.restrict_evaluate``
+# left core with the built-in tools; the check itself is kept exactly as it
+# was, opt-in on the same config keys (it gates on primitive *names*;
+# private-address egress is enforced separately by the SSRF checks).
+
+_RISKY_BROWSER_EVAL_PATTERNS = (
+    (re.compile(r"\bdocument\s*\.\s*cookie\b", re.I), "document.cookie"),
+    (re.compile(r"\b(?:localStorage|sessionStorage)\b", re.I), "web storage"),
+    (re.compile(r"\bindexedDB\b", re.I), "IndexedDB"),
+    (re.compile(r"\bcaches\s*\.\s*(?:open|match|keys)\b", re.I), "Cache Storage"),
+    (re.compile(r"\bnavigator\s*\.\s*(?:clipboard|credentials|serviceWorker)\b", re.I), "navigator sensitive API"),
+    (re.compile(r"\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(", re.I), "network request"),
+    (re.compile(r"\bnavigator\s*\.\s*sendBeacon\s*\(", re.I), "network beacon"),
+    (re.compile(r"\bdocument\s*\.\s*forms\b.*\bvalue\b", re.I | re.S), "form value extraction"),
+    (re.compile(r"\bquerySelector(?:All)?\s*\([^)]*(?:input|textarea|password)[^)]*\).*\bvalue\b", re.I | re.S), "form value extraction"),
+)
+
+_JS_STRING_LITERAL_RE = re.compile(r"""'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`""", re.S)
+
+_SENSITIVE_BROWSER_EVAL_TOKENS = (
+    ("cookie", "document.cookie"),
+    ("localStorage", "web storage"), ("sessionStorage", "web storage"),
+    ("indexedDB", "IndexedDB"), ("caches", "Cache Storage"),
+    ("clipboard", "navigator sensitive API"), ("credentials", "navigator sensitive API"),
+    ("serviceWorker", "navigator sensitive API"),
+    ("fetch", "network request"), ("XMLHttpRequest", "network request"),
+    ("WebSocket", "network request"), ("EventSource", "network request"),
+    ("sendBeacon", "network beacon"),
+)
+
+
+def _browser_eval_flag(key: str) -> bool:
+    """Boolean ``browser.<key>`` (default False) from the effective config."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        browser_cfg = load_user_config_effective().get("browser", {})
+        if isinstance(browser_cfg, dict) and key in browser_cfg:
+            return str(browser_cfg[key]).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return False
+
+
+def _decode_js_string_literal(literal: str) -> str:
+    """Best-effort decode of a JS string literal (not a parser): normalizes escapes like ``"co\\x6fkie"``."""
+    if len(literal) < 2:
+        return literal
+    try:
+        return bytes(literal[1:-1], "utf-8").decode("unicode_escape")
+    except Exception:
+        return literal[1:-1]
+
+
+def _decoded_js_string_literals(expression: str) -> list:
+    return [_decode_js_string_literal(match.group(0)) for match in _JS_STRING_LITERAL_RE.finditer(expression)]
+
+
+def _sensitive_browser_eval_token_reason(expression: str):
+    """Risk reason for direct or quoted sensitive primitives: direct spellings alone miss
+    ``document["cookie"]`` / ``globalThis["fetch"]``, so tokens are also matched inside the decoded,
+    concatenated string literals (catches ``document["coo" + "kie"]``)."""
+    literals = "".join(_decoded_js_string_literals(expression)).lower()
+    return next((reason for token, reason in _SENSITIVE_BROWSER_EVAL_TOKENS
+                 if re.search(rf"\b{re.escape(token)}\b", expression, re.I) or token.lower() in literals), None)
+
+
+def _risky_browser_eval_reason(expression: str):
+    """Return a human-readable reason if a JS expression uses risky primitives."""
+    if not expression:
+        return None
+    hit = next((reason for pattern, reason in _RISKY_BROWSER_EVAL_PATTERNS if pattern.search(expression)), None)
+    return hit or _sensitive_browser_eval_token_reason(expression)
+
+
+def _enforce_browser_eval_policy(expression: str):
+    """Block sensitive browser JS evaluation when the opt-in denylist is on (opt-in because it gates on
+    primitive *names*; private-address egress is enforced separately by the SSRF checks)."""
+    if not _browser_eval_flag("restrict_evaluate") or _browser_eval_flag("allow_unsafe_evaluate"):
+        return None
+    reason = _risky_browser_eval_reason(expression)
+    if not reason:
+        return None
+    return ("Blocked: browser_console(expression=...) tried to use sensitive browser "
+            f"JavaScript primitive ({reason}) while browser.restrict_evaluate is "
+            "enabled. Use browser_snapshot/browser_get_images/browser_console "
+            "without expression for normal inspection, or set "
+            "browser.restrict_evaluate: false in config.yaml to allow programmatic evaluation.")
+
+
+def _blocked_private_page_json(blocked_url: str, why: str) -> str:
+    """Refusal payload for a page whose URL targets a private/internal address.
+    Ported verbatim from tools/browser_tool.py @ 8f68cf7."""
+    return json.dumps({"success": False,
+                       "error": f"Blocked: page URL targets a private or internal address ({blocked_url}). {why}"})
+
+
+# browser_vision helpers, ported from tools/browser_tool_vision.py @ 8f68cf7
+# (the Lightpanda pre-route and cloud-provider branches were built-in-engine
+# plumbing with no analogue on this backend and are not carried over).
+
+def _get_vision_model():
+    """Model for browser_vision (screenshot analysis — multimodal)."""
+    return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+
+
+def _native_vision_result(screenshot_path, question: str, annotate: bool):
+    """Multimodal tool-result envelope: the main model inspects the pixels itself.
+
+    The embed is baked into history and re-sent every later turn, so apply the
+    same proactive resize as vision_analyze's native path (skipped when already
+    under both caps; without Pillow it fails open to the raw bytes).
+    """
+    from tools.vision_tools import (
+        _EMBED_MAX_DIMENSION,
+        _build_native_vision_tool_result,
+        _resize_image_for_vision,
+    )
+    from tools.vision_tools_history_budget import resolve_embed_target_bytes
+
+    data_url = _resize_image_for_vision(screenshot_path, mime_type="image/png",
+                                        max_base64_bytes=resolve_embed_target_bytes(),
+                                        max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
+    native_result = _build_native_vision_tool_result(image_url=str(screenshot_path), question=question,
+                                                     image_data_url=data_url,
+                                                     image_size_bytes=screenshot_path.stat().st_size)
+    meta = native_result.setdefault("meta", {})
+    meta["screenshot_path"] = str(screenshot_path)
+    native_result["text_summary"] = f"{native_result.get('text_summary', '')} Screenshot path: {screenshot_path}".strip()
+    return native_result
+
+
+def _analyze_screenshot_with_aux_llm(screenshot_path, question: str) -> str:
+    """One-shot aux vision-LLM analysis (not baked into history), secret-redacted.
+
+    Full resolution first; on a size-related provider rejection the image is
+    downscaled once and retried. ``auxiliary.vision.timeout/temperature`` — local
+    vision models can take well over 30s, so the default timeout is generous.
+    """
+    vision_prompt = (
+        f"You are analyzing a screenshot of a web browser.\n\n"
+        f"User's question: {question}\n\n"
+        f"Provide a detailed and helpful answer based on what you see in the screenshot. "
+        f"If there are interactive elements, describe them. If there are verification challenges "
+        f"or CAPTCHAs, describe what type they are and what action might be needed. "
+        f"Focus on answering the user's specific question."
+    )
+    _screenshot_bytes = screenshot_path.read_bytes()
+    _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
+    data_url = f"data:image/png;base64,{_screenshot_b64}"
+    vision_model = _get_vision_model()
+    logger.debug("browser_vision: analysing screenshot (%d bytes)", len(_screenshot_bytes))
+
+    vision_timeout = 120.0
+    vision_temperature = 0.1
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _vision_cfg = cfg_get(load_config(), "auxiliary", "vision", default={})
+        if _vision_cfg.get("timeout") is not None:
+            vision_timeout = float(_vision_cfg["timeout"])
+        if _vision_cfg.get("temperature") is not None:
+            vision_temperature = float(_vision_cfg["temperature"])
+    except Exception:
+        pass
+
+    from agent.auxiliary_client import call_llm  # lazy: heavy client, only needed on the vision path
+
+    call_kwargs = {
+        "task": "vision", "temperature": vision_temperature, "timeout": vision_timeout,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": vision_prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+    }
+    if vision_model:
+        call_kwargs["model"] = vision_model
+    try:
+        response = call_llm(**call_kwargs)
+    except Exception as _api_err:
+        from tools.vision_tools import _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES
+        if not (_is_image_size_error(_api_err) and len(data_url) > _RESIZE_TARGET_BYTES):
+            raise
+        logger.info("Vision API rejected screenshot (%.1f MB); auto-resizing to ~%.0f MB and retrying...",
+                    len(data_url) / (1024 * 1024), _RESIZE_TARGET_BYTES / (1024 * 1024))
+        data_url = _resize_image_for_vision(screenshot_path, mime_type="image/png")
+        call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
+        response = call_llm(**call_kwargs)
+
+    from agent.redact import redact_sensitive_text  # the LLM may have read secrets off the screenshot
+    return redact_sensitive_text((response.choices[0].message.content or "").strip())
+
+
 def register(ctx) -> None:
     server = str(ctx.get_config("server", "bladebro") or "bladebro")
     timeout = float(ctx.get_config("timeout", 60) or 60)
@@ -611,56 +1104,67 @@ def register(ctx) -> None:
         except Exception:
             return None
 
-    # ------------------------------------------------- drop-in built-in tools
-    # Same names, schemas and result shapes as tools/browser_tool.py, backed by
-    # the bladebro backend. Importing the built-in module first guarantees its
-    # entries exist, so the override below replaces them (unload restores them).
-    from tools import browser_tool as _bt
-    from tools import browser_tool_snapshot as _snap
-    from tools import browser_tool_vision as _vision
+    # ------------------------------------------------ browser lane tool impls
+    # Same names, schemas and result shapes the built-ins had (their modules
+    # are gone upstream; the contract is plugin-owned above), backed by the
+    # bladebro backend.
 
     def _json(payload) -> str:
         return json.dumps(payload, ensure_ascii=False)
 
+    def _snapshot_threshold() -> int:
+        """Compact snapshot character budget: ``settings.snapshot_threshold``
+        (the built-in ``browser.snapshot_threshold`` left core with the
+        built-in tools), floored so paging stays meaningful."""
+        try:
+            configured = int(ctx.get_config("snapshot_threshold",
+                                            DEFAULT_SNAPSHOT_THRESHOLD))
+        except (TypeError, ValueError):
+            configured = DEFAULT_SNAPSHOT_THRESHOLD
+        return max(configured, MIN_SNAPSHOT_THRESHOLD)
+
     def _page_text(body: str) -> str:
-        """Built-in snapshot handling: oversized text is truncated at line
-        boundaries with the full text stored for read_file paging, then redacted."""
-        threshold = _bt.get_browser_snapshot_threshold()
+        """Snapshot handling: oversized text is truncated at line boundaries
+        with the full text stored for read_file paging, then redacted."""
+        threshold = _snapshot_threshold()
         if len(body) > threshold:
-            body = _snap._truncate_snapshot(body, max_chars=threshold)
-        return _snap._redact_browser_output(body)
+            body = _truncate_snapshot(body, max_chars=threshold)
+        return _redact_browser_output(body)
 
     def _snapshot_fields(body: str) -> dict:
         count = ACTIONABLE_RE.search(body)
         return {"snapshot": _page_text(body), "element_count": int(count.group(1)) if count else 0}
 
     def _landing_blocked(tab_id: str, landed) -> str | None:
-        """Built-in post-redirect check on where the page actually landed
-        (metadata floor, private ranges, website policy); a blocked page is
-        moved to about:blank so later reads cannot expose it."""
+        """Post-redirect check on where the page actually landed (metadata
+        floor, private ranges, website policy — the current tree's
+        ``browser_url_policy``, same verdict browser_exec applies); a blocked
+        page is moved to about:blank so later reads cannot expose it."""
         if not isinstance(landed, str) or not landed.startswith(("http://", "https://")):
             return None
-        blocked = _bt._url_policy_error(landed)
+        blocked = _url_policy_error(landed)
         if blocked is None:
             return None
         _in_tab(tab_id, {"action": "navigate", "url": "about:blank"})
         return _err(f"Blocked: page landed on {landed}: {blocked['error']}")
 
     def _private_page_blocked(kw, why: str) -> str | None:
-        """Host SSRF-guard parity (``browser_tool._blocked_private_page``): when
-        the guard is active in this browser mode, a page that moved itself to a
-        private/internal address (JS ``location=``, meta refresh, an eval) yields
-        no content and takes no input. The URL probe is this plugin's own tab
-        run — the host probe reads the host browser session, which this plugin
-        never drives; the verdict itself is the host's ``_url_blocked``."""
-        if not _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]):
+        """Host SSRF-guard parity: when the guard is active in this browser
+        mode (the current tree's ``browser_url_policy.eval_ssrf_guard_active``,
+        the verdict browser_exec applies), a page that moved itself to a
+        private/internal address (JS ``location=``, meta refresh, an eval)
+        yields no content and takes no input. The URL probe is this plugin's
+        own tab run — the host probe reads the host browser session, which
+        this plugin never drives; the verdict itself is the host's
+        ``url_blocked``."""
+        if not _eval_ssrf_guard_active():
             return None
         out, _probe_err = _task_steps(kw, HREF_STEP)
         if out is None:
-            return None  # probe failed: fail open, like _current_page_private_url
+            return None  # probe failed: fail open, like the host probe
         landed = _eval_value(out.get(2, ""))
-        if isinstance(landed, str) and _bt._eval_policy._url_blocked(_bt, landed):
-            return _bt._blocked_private_page_json(landed, why)
+        if isinstance(landed, str) and _url_blocked(landed):
+            return _blocked_private_page_json(landed, why)
         return None
 
     def _input_blocked(kw, action: str) -> str | None:
@@ -677,8 +1181,12 @@ def register(ctx) -> None:
         return {"success": True, **fields, "result": _page_text(out.get(2, ""))}
 
     def browser_navigate(args: dict, **kw) -> str:
-        url, blocked = _bt._secret_url_error_normalized(str(args.get("url", "")))
-        blocked = blocked or _bt._url_policy_error(url)
+        # Secret-in-URL refusal + normalize + full URL policy (metadata floor,
+        # private ranges, website policy) — the current tree's
+        # ``browser_url_policy.evaluate_url_safety``, exactly what a core
+        # browser_open would enforce.
+        url = _normalize_url_for_request(str(args.get("url", "")))
+        blocked = _evaluate_url_safety(url)
         if blocked:
             return _json(blocked)
         steps = ({"action": "navigate", "url": url}, HREF_STEP)
@@ -707,13 +1215,13 @@ def register(ctx) -> None:
         full = bool(args.get("full"))
         out, err = _task_steps(kw, {
             "action": "see", "mode": "model", "content": full,
-            "budget": FULL_SNAPSHOT_BUDGET if full else _bt.get_browser_snapshot_threshold()})
+            "budget": FULL_SNAPSHOT_BUDGET if full else _snapshot_threshold()})
         if out is None:
             return _err(err)
         body = out.get(2, "")
         if body.startswith("see ("):  # drop the "see (N chars):" framing line
             body = body.split("\n", 1)[1] if "\n" in body else ""
-        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        blocked = _private_page_blocked(kw, _EVAL_NAVIGATED_WHY)
         if blocked is not None:
             return blocked
         return _json({"success": True, **_snapshot_fields(body)})
@@ -729,7 +1237,7 @@ def register(ctx) -> None:
                           f"Failed to click @{ref}"))
 
     def browser_type(args: dict, **kw) -> str:
-        from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
+        from agent.display import redact_tool_args_for_display
         ref, text = _native_ref(args.get("ref")), str(args.get("text", ""))
         if not ref:
             return _err("ref is required")
@@ -740,7 +1248,7 @@ def register(ctx) -> None:
             return blocked
         response = _act(kw, {"action": "type", "ref": ref, "text": text},
                         {"typed": shown, "element": f"@{ref}"}, f"Failed to type into @{ref}")
-        return _json(redact_browser_typed_text_for_display(response, text))
+        return _json(_redact_browser_typed_text_for_display(response, text))
 
     def browser_scroll(args: dict, **kw) -> str:
         direction = args.get("direction")
@@ -776,26 +1284,26 @@ def register(ctx) -> None:
         out, err = _task_steps(kw, {"action": "eval", "js": GET_IMAGES_JS})
         if out is None:
             return _err(err or "Failed to get images")
-        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        blocked = _private_page_blocked(kw, _EVAL_NAVIGATED_WHY)
         if blocked is not None:
             return blocked
         images = _eval_value(out.get(2, ""))
         if not isinstance(images, list):
             return _json({"success": True, "images": [], "count": 0,
                           "warning": "Could not parse image data"})
-        return _json({"success": True, "images": _snap._redact_browser_output(images),
+        return _json({"success": True, "images": _redact_browser_output(images),
                       "count": len(images)})
 
     def browser_console(args: dict, **kw) -> str:
         expression = args.get("expression")
         if expression is not None:
-            policy_error = _bt._eval_policy._enforce_browser_eval_policy(expression)
+            policy_error = _enforce_browser_eval_policy(expression)
             if policy_error:
                 return _err(policy_error)
-            # Built-in pre-scan: a fetch/XHR to an internal address never
-            # updates location.href, so the post-eval recheck cannot see it.
-            if _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]):
-                literal = _bt._eval_policy._expression_targets_private_url(str(expression))
+            # Pre-scan: a fetch/XHR to an internal address never updates
+            # location.href, so the post-eval recheck cannot see it.
+            if _eval_ssrf_guard_active():
+                literal = _expression_targets_private_url(str(expression))
                 if literal:
                     return _err("Blocked: JavaScript expression targets a private or "
                                 f"internal address ({literal}). Reading internal "
@@ -804,10 +1312,10 @@ def register(ctx) -> None:
             out, err = _task_steps(kw, {"action": "eval", "js": str(expression)})
             if out is None:
                 return _err(err)
-            blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+            blocked = _private_page_blocked(kw, _EVAL_NAVIGATED_WHY)
             if blocked is not None:
                 return blocked
-            value = _snap._redact_browser_output(_eval_value(out.get(2, "")))
+            value = _redact_browser_output(_eval_value(out.get(2, "")))
             return _json({"success": True, "result": value, "result_type": type(value).__name__})
         tab_id = _task_tab(kw)
         if not tab_id:
@@ -815,7 +1323,7 @@ def register(ctx) -> None:
         out, err = _in_tab(tab_id, {"action": "see", "logs": "console"})
         if out is None:
             return _err(err)
-        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        blocked = _private_page_blocked(kw, _EVAL_NAVIGATED_WHY)
         if blocked is not None:
             return blocked
         entries: list[list[str]] = []
@@ -838,7 +1346,7 @@ def register(ctx) -> None:
             if baseline[key]:
                 baseline[key] -= 1
             else:
-                fresh.append((level, _snap._redact_browser_output(text)))
+                fresh.append((level, _redact_browser_output(text)))
         if args.get("clear"):
             tab["console_seen"] = [f"{level}: {text}" for level, text in entries]
             state.set("tabs", {**_tabs(), tab_id: tab})
@@ -858,7 +1366,7 @@ def register(ctx) -> None:
         # the plugin lock. ponytail: serializes this process only; another
         # process driving the same backend can switch tabs in between. Upgrade
         # path: a backend vision step inside `run` (or a target_id on vision).
-        blocked = _private_page_blocked(kw, _bt._EVAL_NAVIGATED_WHY)
+        blocked = _private_page_blocked(kw, _EVAL_NAVIGATED_WHY)
         if blocked is not None:
             return blocked
         with _browser_lock:
@@ -877,9 +1385,9 @@ def register(ctx) -> None:
         path = Path(media.group(1))
         from tools.vision_tools import _should_use_native_vision_fast_path
         if _should_use_native_vision_fast_path():
-            return _vision._native_vision_result(path, question, annotate, {}, None)
+            return _native_vision_result(path, question, annotate)
         try:
-            analysis = _vision._analyze_screenshot_with_aux_llm(path, question)
+            analysis = _analyze_screenshot_with_aux_llm(path, question)
         except Exception as exc:
             logger.warning("browser_vision analysis failed: %s", exc, exc_info=True)
             return _json({"success": False, "error": f"Error during vision analysis: {exc}",
@@ -906,12 +1414,11 @@ def register(ctx) -> None:
         expected_url = _eval_value(here.get(2, ""))
         if not isinstance(expected_url, str) or not expected_url:
             return _err("could not read the task tab's current URL; batch refused")
-        # Built-in input-action guard parity: a batch can click/type/press, so a
-        # page sitting on an internal address must not receive it. The URL is the
+        # Input-action guard parity: a batch can click/type/press, so a page
+        # sitting on an internal address must not receive it. The URL is the
         # one already read for the approval binding — no extra probe.
-        if _bt._eval_policy._eval_ssrf_guard_active(_task_key(kw)[1]) \
-                and _bt._eval_policy._url_blocked(_bt, expected_url):
-            return _bt._blocked_private_page_json(
+        if _eval_ssrf_guard_active() and _url_blocked(expected_url):
+            return _blocked_private_page_json(
                 expected_url, "Refusing to run this batch on this page in this "
                               "browser mode.")
         if effects:
@@ -1510,31 +2017,26 @@ def register(ctx) -> None:
             description=desc,
             emoji="🌐",
         )
-    dropin = {
+    lane = {
         "browser_navigate": browser_navigate, "browser_snapshot": browser_snapshot,
         "browser_click": browser_click, "browser_type": browser_type,
         "browser_scroll": browser_scroll, "browser_back": browser_back,
         "browser_press": browser_press, "browser_get_images": browser_get_images,
         "browser_vision": browser_vision, "browser_console": browser_console,
     }
-    emojis = {row[0]: row[1] for row in _bt._BROWSER_TOOL_TABLE}
-    replaced = 0
-    for schema in _bt.BROWSER_TOOL_SCHEMAS:
-        handler = dropin[schema["name"]]  # KeyError = built-in grew a tool: fail loudly
-        try:
-            ctx.register_tool(
-                name=schema["name"], toolset="browser", schema=schema,
-                handler=lambda args, _h=handler, **kw: _h(args or {}, **kw),
-                check_fn=_allowlisted, description=schema["description"],
-                emoji=emojis.get(schema["name"], "🌐"), override=True,
-            )
-            replaced += 1
-        except PermissionError as exc:  # PluginToolOverrideError: operator has not opted in
-            logger.warning(
-                "browser-bladebro: built-in browser_* tools NOT replaced (%s). Set "
-                "plugins.entries.browser-bladebro.allow_tool_override: true to use "
-                "bladebro as the drop-in browser backend.", exc)
-            break
+    registered = 0
+    for schema in BROWSER_TOOL_SCHEMAS:
+        handler = lane[schema["name"]]  # KeyError = schema grew a tool: fail loudly
+        # Ordinary registration, not override: upstream removed the built-in
+        # browser_* tools, so these names are unclaimed and no
+        # allow_tool_override grant applies (or is needed).
+        ctx.register_tool(
+            name=schema["name"], toolset="browser", schema=schema,
+            handler=lambda args, _h=handler, **kw: _h(args or {}, **kw),
+            check_fn=_allowlisted, description=schema["description"],
+            emoji=_BROWSER_TOOL_EMOJI.get(schema["name"], "🌐"),
+        )
+        registered += 1
     logger.info(
-        "browser-bladebro: replaced %d built-in browser_* tools, registered %d "
-        "bladebro extras + 3 cleanup hooks (server=%s)", replaced, len(tools), server)
+        "browser-bladebro: registered %d browser_* real-browser lane tools + %d "
+        "bladebro extras + 3 cleanup hooks (server=%s)", registered, len(tools), server)

@@ -20,9 +20,6 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.plugins import PluginContext
-# Imported at collection so the built-in browser_* entries exist in every
-# test's registry snapshot (the plugin overrides them; unload restores them).
-from tools.browser_tool import BROWSER_TOOL_SCHEMAS
 
 
 TAB = "EA6FDE15266206A4CF5F7416103D5039"
@@ -587,27 +584,35 @@ def test_run_rejects_oversized_tree_before_dispatch(browser):
     assert calls == []
 
 
-# ------------------------------------------------------------ drop-in tests
+# --------------------------------------------------------- registration tests
 
-def test_dropin_replaces_builtins_and_unload_restores_them(browser):
+def test_lane_tools_register_as_own_and_unload_removes_them(browser):
+    # No built-ins exist to replace (upstream removed them 2026-11-03): the
+    # plugin registers the browser_* lane as ordinary tools and unload leaves
+    # the names unclaimed again.
     ctx, _, _, _ = browser
     from tools.registry import registry
-    for schema in BROWSER_TOOL_SCHEMAS:
+    for schema in ctx.module.BROWSER_TOOL_SCHEMAS:
         entry = registry.get_entry(schema["name"])
         assert entry.toolset == "browser" and entry.schema == schema
         assert entry.handler.__module__ == ctx.module.__name__
     ctx.manager.unload("browser-bladebro")
-    for schema in BROWSER_TOOL_SCHEMAS:
-        assert registry.get_entry(schema["name"]).handler.__module__ != ctx.module.__name__
+    for schema in ctx.module.BROWSER_TOOL_SCHEMAS:
+        assert registry.get_entry(schema["name"]) is None
 
 
-def test_without_override_grant_builtins_stay_and_extras_load(load_plugin, fake_mcp, monkeypatch):
+def test_all_lane_and_extra_tools_load_without_any_grant(load_plugin, fake_mcp, monkeypatch):
+    # The old allow_tool_override grant no longer applies: with no built-in
+    # names to override, registration needs no permission — even a host whose
+    # override grant denies everything must get the full 13-tool lane.
     from hermes_cli.plugins import PluginContext
     from tools.registry import registry
     monkeypatch.setattr(PluginContext, "_tool_override_allowed", lambda self, name: False)
     ctx = load_plugin("browser-bladebro")
-    assert registry.get_entry("browser_navigate").handler.__module__ != ctx.module.__name__
-    assert registry.get_entry("browser_run").handler.__module__ == ctx.module.__name__
+    for schema in ctx.module.BROWSER_TOOL_SCHEMAS:
+        assert registry.get_entry(schema["name"]).handler.__module__ == ctx.module.__name__
+    for name in ("browser_run", "browser_scenario", "browser_capture"):
+        assert registry.get_entry(name).handler.__module__ == ctx.module.__name__
 
 
 def test_each_task_gets_one_reused_tab(browser):
@@ -735,17 +740,16 @@ def test_vision_attaches_the_backend_screenshot_natively(browser, tmp_path, monk
 
 
 def test_guard_active_private_page_refuses_content_and_input(browser, monkeypatch):
-    # Built-in parity: with the SSRF guard active in this browser mode, a page
-    # that moved itself to an internal address (JS location=, meta refresh, an
-    # eval) yields no content and takes no input.
-    from tools import browser_tool as _bt
+    # Guard parity with core browser_exec: with the SSRF guard active in this
+    # browser mode, a page that moved itself to an internal address (JS
+    # location=, meta refresh, an eval) yields no content and takes no input.
     ctx, calls, router, _ = browser
     backend = fake_backend(router)
     assert _call(ctx, "browser_navigate", {"url": "http://x.test"})["success"]
-    monkeypatch.setattr(_bt._eval_policy, "_eval_ssrf_guard_active", lambda task_id: False)
+    monkeypatch.setattr(ctx.module, "_eval_ssrf_guard_active", lambda: False)
     assert _call(ctx, "browser_snapshot", {})["success"]  # control: guard inactive
 
-    monkeypatch.setattr(_bt._eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(ctx.module, "_eval_ssrf_guard_active", lambda: True)
     backend.url[TAB] = "http://169.254.169.254/latest/meta-data"
     calls.clear()
     paths = (
