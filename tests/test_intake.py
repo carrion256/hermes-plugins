@@ -1,5 +1,6 @@
 import json
 import urllib.error
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,10 @@ class FakeOpener:
     """Scripted model transport: records requests, opens no socket.
 
     ``content`` serves a chat-completions envelope; ``raw`` (bytes) is served
-    verbatim — that is how the /v1/systemone answers envelope is scripted."""
+    verbatim — that is how the /v1/systemone answers envelope is scripted.
+    A CALLABLE ``raw`` is invoked with the request and returns the bytes, so
+    per-item responses can depend on what was actually asked (the threaded
+    urgency fan-out must be answerable item by item)."""
 
     def __init__(self, content=None, status=200, error=None, raw=None):
         self.content = content
@@ -59,7 +63,8 @@ class FakeOpener:
         self.requests.append({"request": request, "timeout": timeout})
         if self.error is not None:
             raise self.error
-        body = self.raw if self.raw is not None else chat_body(self.content)
+        raw = self.raw(request) if callable(self.raw) else self.raw
+        body = raw if raw is not None else chat_body(self.content)
         return FakeReply(body, status=self.status)
 
 
@@ -142,7 +147,8 @@ def test_extract_posts_openai_wire_request():
     items, reason, opener = call_extract(body, endpoint="http://127.0.0.1:8102/",
                                          timeout=7.0)
     assert reason is None
-    assert items == [{"content": "Email Anna the draft", "quote": "send it to Anna"}]
+    assert items == [{"content": "Email Anna the draft", "quote": "send it to Anna",
+                      "due": None}]
     (record,) = opener.requests
     assert record["timeout"] == 7.0
     request = record["request"]
@@ -152,7 +158,46 @@ def test_extract_posts_openai_wire_request():
     assert payload["model"] == "qwen3.8-flash-next"  # the flare node requires it top-level
     assert payload["temperature"] == 0  # a re-run must extract the same wording
     assert [m["role"] for m in payload["messages"]] == ["system", "user"]
+    # no explicit today: the real date is resolved at call time so the model
+    # can turn "by Friday" into an absolute due date
+    assert payload["messages"][0]["content"] == (
+        core._SYSTEM_PROMPT + f" Today's date is {date.today().isoformat()}.")
     assert payload["messages"][1]["content"] == "material"
+
+
+def test_extract_states_the_given_today_for_relative_deadlines():
+    """A test-pinned date in the system prompt keeps relative-deadline
+    extraction reproducible instead of drifting with the calendar."""
+    items, reason, opener = call_extract('{"items": []}', today="2026-03-05")
+    assert (items, reason) == ([], None)
+    payload = json.loads(opener.requests[0]["request"].data)
+    assert payload["messages"][0]["content"] == (
+        core._SYSTEM_PROMPT + " Today's date is 2026-03-05.")
+
+
+def test_extract_canonicalizes_due_and_drops_unusable_deadlines():
+    """Only a real calendar date survives, canonicalized; anything the model
+    could not resolve becomes no deadline — never a dropped item. Pinning
+    what ``date.fromisoformat`` actually accepts: compact dates parse, the
+    single-digit month/day form does not."""
+    offered = {"items": [
+        {"content": "Task valid", "due": "2026-11-13"},
+        {"content": "Task compact", "due": "20261113"},
+        {"content": "Task unpadded", "due": "2026-11-4"},
+        {"content": "Task impossible", "due": "2026-13-45"},
+        {"content": "Task weekday", "due": "friday"},
+        {"content": "Task numeric", "due": 7},
+        {"content": "Task missing"}]}
+    items, reason, _ = call_extract(json.dumps(offered))
+    assert reason is None
+    assert items == [
+        {"content": "Task valid", "quote": None, "due": "2026-11-13"},
+        {"content": "Task compact", "quote": None, "due": "2026-11-13"},
+        {"content": "Task unpadded", "quote": None, "due": None},
+        {"content": "Task impossible", "quote": None, "due": None},
+        {"content": "Task weekday", "quote": None, "due": None},
+        {"content": "Task numeric", "quote": None, "due": None},
+        {"content": "Task missing", "quote": None, "due": None}]
 
 
 def test_extract_strips_code_fences():
@@ -282,7 +327,8 @@ def test_ingest_records_covey_argv(monkeypatch):
     key = core.item_key("Email Anna the draft")
     assert report["status"] == "ok" and report["reason"] is None
     assert report["submitted"] == [{"content": "Email Anna the draft", "key": key,
-                                    "urgency": None, "meta_task_id": "meta_1"}]
+                                    "urgency": None, "due": None,
+                                    "meta_task_id": "meta_1"}]
     assert report["existing"] == [] and report["failed"] == []
     assert covey.heads == [("meta", "list"), ("session", "active-for-principal"),
                            ("session", "register"), ("meta", "submit")]
@@ -306,7 +352,27 @@ def test_submit_failure_is_isolated_and_marks_partial():
     assert report["status"] == "partial"
     assert [s["content"] for s in report["submitted"]] == ["First task"]
     assert report["failed"] == [{"content": "Second task", "urgency": None,
-                                 "code": "permission_denied"}]
+                                 "due": None, "code": "permission_denied"}]
+
+
+def test_submit_conflict_is_existing_work_not_a_failure():
+    """ok:false code==conflict means a concurrent run already filed the key:
+    same work, one task — reported under existing, never as a failure, and
+    it does NOT make the run partial. Every other refusal stays a failure."""
+    covey = FakeCovey(submits=[{"ok": False, "code": "conflict",
+                                "message": "idempotency key already used"},
+                               {"ok": True, "data": {"meta_task_id": "meta_2"}}])
+    items = [{"content": "Concurrent one", "quote": None},
+             {"content": "Fresh one", "quote": None}]
+    report = _ingest(lambda text: (items, None), covey)
+    assert report["status"] == "ok"
+    assert report["failed"] == []
+    assert report["existing"] == [{"content": "Concurrent one",
+                                   "key": core.item_key("Concurrent one"),
+                                   "urgency": None, "due": None,
+                                   "matched_meta_task_id": None}]
+    assert [s["content"] for s in report["submitted"]] == ["Fresh one"]
+    assert len(covey.submits()) == 2  # the conflict came FROM the store
 
 
 def test_session_register_failure_blocks_all_submits():
@@ -374,7 +440,9 @@ def test_register_conflict_refalls_back_to_the_racer():
 
 def test_meta_list_skips_work_already_filed_and_skips_the_classifier():
     filed = "Email Anna the draft\n\nUrgency: high\n\nSource: earlier"
-    covey = FakeCovey(rows={"ok": True, "data": [{"prompt_text": filed}]})
+    covey = FakeCovey(rows={"ok": True,
+                            "data": [{"prompt_text": filed,
+                                      "meta_task_id": "meta_earlier"}]})
     labeled = []
 
     def classifier(item):
@@ -385,8 +453,11 @@ def test_meta_list_skips_work_already_filed_and_skips_the_classifier():
                                     {"content": "Book the dentist", "quote": None}], None),
                      covey, classifier=classifier)
     assert report["status"] == "ok"
+    # the matched row names the task already in the store
     assert report["existing"] == [{"content": "Email Anna the draft",
-                                   "key": core.item_key("Email Anna the draft")}]
+                                   "key": core.item_key("Email Anna the draft"),
+                                   "urgency": None, "due": None,
+                                   "matched_meta_task_id": "meta_earlier"}]
     # only the fresh item is submitted, and the classifier saw only the fresh item
     assert [s["content"] for s in report["submitted"]] == ["Book the dentist"]
     assert [p.splitlines()[0] for p in (a[a.index("--prompt-text") + 1]
@@ -417,10 +488,16 @@ def test_existing_contents_pages_the_store_to_exhaustion():
     assert listed == [
         ["meta", "list", "--limit", "500", "--offset", "0"],
         ["meta", "list", "--limit", "500", "--offset", "500"]]
-    # page-2 norms are visible to the dedupe: same work, never re-filed
+    # page-2 rows are visible to the dedupe: same work, never re-filed
     assert report["existing"] == [{"content": "Renew the domain",
-                                   "key": core.item_key("Renew the domain")}]
+                                   "key": core.item_key("Renew the domain"),
+                                   "urgency": None, "due": None,
+                                   "matched_meta_task_id": None}]
     assert report["status"] == "ok" and not covey.submits()
+    # the map values describe the filed task, not just its norm
+    assert core.existing_contents(covey)[core.normalize_item("Renew the domain")] == {
+        "first": "Renew the domain", "meta_task_id": None,
+        "state": None, "created": None}
 
 
 def test_mid_paging_failure_keeps_what_was_read():
@@ -430,10 +507,41 @@ def test_mid_paging_failure_keeps_what_was_read():
                             {"ok": False, "code": "db_locked", "message": "locked"}])
     report = _ingest(lambda text: ([{"content": "File the expense report",
                                      "quote": None}], None), covey)
-    # the second page died, but page 1's norms still dedupe: no crash, no re-file
+    # the second page died, but page 1's rows still dedupe: no crash, no re-file
     assert report["existing"] == [{"content": "File the expense report",
-                                   "key": core.item_key("File the expense report")}]
+                                   "key": core.item_key("File the expense report"),
+                                   "urgency": None, "due": None,
+                                   "matched_meta_task_id": None}]
     assert not covey.submits()
+
+
+def test_existing_contents_excludes_terminal_states():
+    """Terminal work does not suppress a re-filing; unknown and absent
+    states stay in the dedupe set — conservative against duplicates."""
+    assert set(core.TERMINAL_META_STATES) == {"cancelled", "done", "completed",
+                                              "failed", "abandoned"}
+    rows = [{"prompt_text": "Plan the audit", "state": "planning"},
+            {"prompt_text": "Stateless task"},
+            {"prompt_text": "Blank state task", "state": ""},
+            {"prompt_text": "Numeric state task", "state": 7},
+            {"prompt_text": "Cancelled task", "state": "cancelled"},
+            {"prompt_text": "Done task", "state": "done"},
+            {"prompt_text": "Completed task", "state": "completed"},
+            {"prompt_text": "Failed task", "state": "failed"},
+            {"prompt_text": "Abandoned task", "state": "abandoned"}]
+    covey = FakeCovey(rows={"ok": True, "data": rows})
+    mapping = core.existing_contents(covey)
+    assert set(mapping) == {core.normalize_item(t) for t in
+                            ("Plan the audit", "Stateless task",
+                             "Blank state task", "Numeric state task")}
+    assert mapping[core.normalize_item("Plan the audit")]["state"] == "planning"
+    assert mapping[core.normalize_item("Stateless task")]["state"] is None
+    # behaviourally: a cancelled follow-up is open again — it files normally
+    covey = FakeCovey(rows={"ok": True, "data": [rows[4]]})
+    report = _ingest(lambda text: ([{"content": "Cancelled task",
+                                     "quote": None}], None), covey)
+    assert [s["content"] for s in report["submitted"]] == ["Cancelled task"]
+    assert report["existing"] == []
 
 
 def test_extract_lists_filed_work_in_the_user_message():
@@ -475,6 +583,66 @@ def test_injected_extractor_never_receives_the_filed_list():
     assert len(covey.submits()) == 1
 
 
+ROWS_WITH_DATES = [
+    {"prompt_text": "Filed one", "created_at": 100, "meta_task_id": "meta_1"},
+    {"prompt_text": "Filed two", "created_at": 300, "meta_task_id": "meta_2"},
+    {"prompt_text": "Filed three", "created_at": 200, "meta_task_id": "meta_3"},
+    {"prompt_text": "Undated file"},
+]
+
+
+def test_grounding_lists_newest_first_and_undated_last(monkeypatch):
+    """The do-not-restate list is a prompt-budget VIEW: newest filed lines
+    first, undated rows last — the order the model is most likely to be
+    tempted to restate."""
+    seen = []
+
+    def capture(text, **kwargs):
+        seen.append(list(kwargs["existing"]))
+        return ([{"content": "Task for the record", "quote": None}], None)
+
+    monkeypatch.setattr(core, "extract", capture)
+    report = _ingest(None, FakeCovey(rows={"ok": True, "data": ROWS_WITH_DATES}))
+    assert report["status"] == "ok"
+    assert seen == [["Filed two", "Filed three", "Filed one", "Undated file"]]
+
+
+def test_grounding_cap_trims_the_view_but_never_blinds_the_dedupe(monkeypatch):
+    """grounding_max caps only what the model SEES; the dedupe set stays the
+    complete paged read, so a trimmed-away row still suppresses a re-file
+    (and reports its matched id). 0 sends no list at all."""
+    seen = []
+
+    def capture(text, **kwargs):
+        seen.append(list(kwargs["existing"]))
+        return ([{"content": "Task for the record", "quote": None}], None)
+
+    def capture_replay(text, **kwargs):
+        seen.append(list(kwargs["existing"]))
+        return ([{"content": "Filed one", "quote": None}], None)
+
+    monkeypatch.setattr(core, "extract", capture)
+    _ingest(None, FakeCovey(rows={"ok": True, "data": ROWS_WITH_DATES}),
+            grounding_max=2)
+    assert seen == [["Filed two", "Filed three"]]  # capped, still newest-first
+
+    monkeypatch.setattr(core, "extract", capture_replay)
+    covey = FakeCovey(rows={"ok": True, "data": ROWS_WITH_DATES})
+    report = _ingest(None, covey, grounding_max=2)
+    # the cap never reaches the model, but the store read still knows it
+    assert "Filed one" not in seen[-1]
+    assert report["existing"] == [{"content": "Filed one",
+                                   "key": core.item_key("Filed one"),
+                                   "urgency": None, "due": None,
+                                   "matched_meta_task_id": "meta_1"}]
+    assert not covey.submits()
+
+    monkeypatch.setattr(core, "extract", capture)
+    _ingest(None, FakeCovey(rows={"ok": True, "data": ROWS_WITH_DATES}),
+            grounding_max=0)
+    assert seen[-1] == []  # disabled listing; the extractor sees no list
+
+
 # ------------------------------------------------------------------- urgency
 
 def test_classify_urgency_posts_typed_choice_request():
@@ -497,6 +665,7 @@ def test_classify_urgency_posts_typed_choice_request():
     assert set(head["criteria"]) == set(core.URGENCY_LABELS)
     assert "Pay Bob the 50 he is owed" in payload["state"]
     assert "I owe Bob 50, settle this week" in payload["state"]  # quote grounds the label
+    assert "Due:" not in payload["state"]  # no deadline stated, no Due line
 
 
 def test_classify_urgency_returns_none_never_raises():
@@ -512,6 +681,89 @@ def test_classify_urgency_returns_none_never_raises():
     unconfigured = FakeOpener(raw=b"{}")
     assert core.classify_urgency(item, opener=unconfigured, **{**base, "api_key": ""}) is None
     assert unconfigured.requests == []  # missing config: zero requests
+
+
+def test_classify_urgency_state_appends_the_deadline_only_when_present():
+    """A stated deadline grounds the label alongside the quote; an absent or
+    null one adds nothing — the classifier must not invent urgency."""
+    def asked_state(item):
+        opener = FakeOpener(raw=json.dumps(
+            {"answers": {"urgency": {"choice": "high"}}}).encode())
+        core.classify_urgency(item, endpoint="http://127.0.0.1:8102", model="m",
+                              api_key="k", timeout=1.0, opener=opener)
+        return json.loads(opener.requests[0]["request"].data)["state"]
+
+    base = {"content": "Submit the return", "quote": None}
+    assert asked_state({**base, "due": "2026-11-13"}).endswith(
+        "Submit the return\n\nDue: 2026-11-13")
+    assert "Due:" not in asked_state({**base, "due": None})
+    assert "Due:" not in asked_state(base)
+    assert "Due:" not in asked_state({**base, "due": ""})
+
+
+def _answers_by_marker(label_by_marker):
+    """Build a raw() for FakeOpener: the label depends on the item actually
+    asked about, so the threaded fan-out can be checked item by item."""
+    def raw(request):
+        state = json.loads(request.data)["state"]
+        for marker, label in label_by_marker.items():
+            if marker in state:
+                if label == "explode":
+                    raise OSError("classifier died mid-call")
+                return json.dumps({"answers": {"urgency": {"choice": label}}}).encode()
+        raise AssertionError(f"unscripted state: {state!r}")
+    return raw
+
+
+def test_urgency_fans_out_per_item_and_maps_labels_back_by_index():
+    """/v1/systemone takes ONE shared state per request, so per-item urgency
+    cannot be batched — it fans out over a thread pool. Results must map
+    back BY INDEX (labels in item order) and a call that dies costs its
+    label, never the intake."""
+    opener = FakeOpener(raw=_answers_by_marker(
+        {"ALPHA": "high", "BRAVO": "medium", "CHARLIE": "low", "DELTA": "explode"}))
+    items = [{"content": f"{marker} the report", "quote": None, "due": None}
+             for marker in ("ALPHA", "BRAVO", "CHARLIE", "DELTA")]
+    core.annotate_urgency(items, classifier_endpoint="http://127.0.0.1:8102",
+                          model="m", api_key="k", timeout=1.0, opener=opener)
+    assert [item["urgency"] for item in items] == ["high", "medium", "low", None]
+    assert len(opener.requests) == 4  # one call per item, none skipped
+
+    calls = []
+
+    def flaky(item):  # the injected classifier stays SEQUENTIAL, order-kept
+        calls.append(item["content"])
+        if item["content"].startswith("BRAVO"):
+            raise RuntimeError("classifier exploded")
+        return "high"
+
+    injected = [{"content": f"{marker} the report", "quote": None}
+                for marker in ("ALPHA", "BRAVO", "CHARLIE")]
+    core.annotate_urgency(injected, classifier_endpoint="http://127.0.0.1:8102",
+                          model="m", api_key="k", timeout=1.0, classifier=flaky)
+    assert calls == ["ALPHA the report", "BRAVO the report", "CHARLIE the report"]
+    assert [item["urgency"] for item in injected] == ["high", None, "high"]
+
+
+def test_urgency_single_item_is_labelled_without_a_fan_out():
+    """One item is labelled directly — no pool, one request."""
+    opener = FakeOpener(raw=json.dumps(
+        {"answers": {"urgency": {"choice": "low"}}}).encode())
+    items = [{"content": "Water the plants", "quote": None, "due": None}]
+    core.annotate_urgency(items, classifier_endpoint="http://127.0.0.1:8102",
+                          model="m", api_key="k", timeout=1.0, opener=opener)
+    assert items[0]["urgency"] == "low"
+    assert len(opener.requests) == 1
+
+
+def test_urgency_dead_classifier_costs_labels_never_the_intake():
+    """Transport down for every call: all items carry urgency None — the
+    annotation itself never raises, whatever the node does."""
+    opener = FakeOpener(error=urllib.error.URLError("classifier down"))
+    items = [{"content": f"Task {letter}", "quote": None} for letter in "ABC"]
+    core.annotate_urgency(items, classifier_endpoint="http://127.0.0.1:8102",
+                          model="m", api_key="k", timeout=1.0, opener=opener)
+    assert [item["urgency"] for item in items] == [None, None, None]
 
 
 def test_submit_prompt_carries_urgency_between_item_and_source():
@@ -533,6 +785,31 @@ def test_submit_omits_urgency_line_when_label_unusable(label):
     assert submit[submit.index("--prompt-text") + 1] == "Water the plants\n\nSource: cli"
     # one truth: an unusable label is nothing — not in the prompt, not in the row
     assert report["submitted"][0]["urgency"] is None
+
+
+def test_submit_prompt_stamps_due_after_urgency():
+    """A stated deadline is structured prompt text between the Urgency line
+    and the Source footer, and travels in the reported row."""
+    covey = FakeCovey()
+    report = _ingest(lambda text: ([{"content": "Email Anna the draft",
+                                     "quote": None, "due": "2026-11-13"}], None),
+                     covey, classifier=lambda item: "high")
+    (submit,) = covey.submits()
+    assert submit[submit.index("--prompt-text") + 1] == (
+        "Email Anna the draft\n\nUrgency: high\n\nDue: 2026-11-13\n\nSource: cli")
+    assert report["submitted"][0]["due"] == "2026-11-13"
+
+
+@pytest.mark.parametrize("due", [None, "", 7])
+def test_submit_omits_due_line_when_deadline_unusable(due):
+    """Only a truthy string due earns a Due line — same discipline as the
+    Urgency line: decoration never half-appears."""
+    covey = FakeCovey()
+    report = _ingest(lambda text: ([{"content": "Water the plants", "quote": None,
+                                     "due": due}], None), covey)
+    (submit,) = covey.submits()
+    assert submit[submit.index("--prompt-text") + 1] == "Water the plants\n\nSource: cli"
+    assert report["submitted"][0]["due"] == due
 
 
 # ---------------------------------------------------------------------- tool
@@ -660,16 +937,146 @@ def test_tool_passes_explicit_db_to_the_bridge(load_plugin, monkeypatch, tmp_pat
         assert isinstance(kwargs["binary"], str) and kwargs["binary"]
 
 
+def _wire_filing_plugin(h, monkeypatch, submits=None):
+    """Model and bridge seams for filing tests: one item files ok unless the
+    submit envelopes are scripted otherwise."""
+    monkeypatch.setenv("INTAKE_TEST_KEY", "synthetic-key")
+    monkeypatch.setattr(h.module.core, "extract",
+                        lambda text, **kw: ([{"content": "Email Anna the draft",
+                                              "quote": None, "due": None}], None))
+    monkeypatch.setattr(h.module.core, "classify_urgency", lambda item, **kw: None)
+    scripted = list(submits) if submits is not None else [
+        {"ok": True, "data": {"meta_task_id": "meta_1"}}]
+
+    def fake_run(argv, **kwargs):
+        head = tuple(argv[:2])
+        if head == ("session", "active-for-principal"):
+            return {"ok": True, "data": {"session_token": "tok-1"}}
+        if head == ("meta", "list"):
+            return {"ok": True, "data": []}
+        if not scripted:
+            raise AssertionError("scripted submits exhausted")
+        return scripted.pop(0) if len(scripted) > 1 else scripted[0]
+
+    monkeypatch.setattr(h.module, "run_covey_command", fake_run)
+
+
+def test_decision_log_appends_one_line_per_filing_run(load_plugin, monkeypatch, tmp_path):
+    """The audit trail: one JSON line per ok/partial run that FILED, MATCHED
+    or LOST something — ts, source, status, submitted, existing, failed —
+    appended, never rewritten. Runs that decided nothing log nothing (the
+    volume meter is the store, not this log)."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db})
+    _wire_filing_plugin(h, monkeypatch, submits=[
+        {"ok": True, "data": {"meta_task_id": "meta_1"}},
+        {"ok": False, "code": "db_locked", "message": "locked"}])
+    sidecar = tmp_path / "covey.db.intake.jsonl"
+    first = json.loads(h.tool("intake", {"text": "material", "source": "cli"}))
+    assert first["status"] == "ok"
+    second = json.loads(h.tool("intake", {"text": "material", "source": "cli"}))
+    assert second["status"] == "partial"
+    lines = sidecar.read_text().splitlines()
+    assert len(lines) == 2  # append-only sidecar next to the store
+    a, b = (json.loads(line) for line in lines)
+    assert set(a) == {"ts", "source", "status", "submitted", "existing", "failed"}
+    assert a["status"] == "ok" and a["source"] == "cli" and a["ts"]
+    assert a["submitted"] == first["submitted"]
+    assert a["existing"] == [] and a["failed"] == []
+    assert b["status"] == "partial" and b["failed"] == second["failed"]
+
+
+def test_decision_log_custom_path_wins_and_unwritable_never_blocks(load_plugin, monkeypatch, tmp_path):
+    """decision_log overrides the sidecar default; logging never blocks
+    intake — an unwritable path is a debug note, the report comes back
+    unaltered."""
+    db = str(tmp_path / "covey.db")
+    custom = tmp_path / "audit" / "decisions.jsonl"
+    custom.parent.mkdir()
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db,
+                               "decision_log": str(custom)})
+    _wire_filing_plugin(h, monkeypatch)
+    assert json.loads(h.tool("intake", {"text": "material"}))["status"] == "ok"
+    assert len(custom.read_text().splitlines()) == 1
+    assert not (tmp_path / "covey.db.intake.jsonl").exists()  # sidecar unused
+
+    h2 = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db,
+                                "decision_log": str(tmp_path / "no-dir" / "d.jsonl")})
+    _wire_filing_plugin(h2, monkeypatch)
+    result = json.loads(h2.tool("intake", {"text": "material"}))
+    assert result["status"] == "ok"
+    assert result["submitted"][0]["meta_task_id"] == "meta_1"
+
+
+def test_decision_log_untouched_by_dry_run_and_store_unavailable(load_plugin, monkeypatch, tmp_path):
+    """Only real filings are logged: a preview and a store-less run never
+    create a decision log."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db})
+    monkeypatch.setenv("INTAKE_TEST_KEY", "synthetic-key")
+    monkeypatch.setattr(h.module.core, "extract",
+                        lambda text, **kw: ([{"content": "Email Anna the draft",
+                                              "quote": None}], None))
+    monkeypatch.setattr(h.module.core, "classify_urgency", lambda item, **kw: None)
+    monkeypatch.setattr(h.module, "run_covey_command",
+                        lambda argv, **kw: (_ for _ in ()).throw(
+                            AssertionError("dry_run must not touch the store")))
+    assert json.loads(h.tool("intake", {"text": "notes",
+                                        "dry_run": True}))["status"] == "ok"
+    assert not (tmp_path / "covey.db.intake.jsonl").exists()
+    h2 = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": ""})
+    assert json.loads(h2.tool("intake", {"text": "material"}))["status"] == \
+        "store_unavailable"
+    assert not (Path.cwd() / ".intake.jsonl").exists()  # the empty-db default too
+
+
+def test_decision_log_records_decisions_not_quiet_runs(load_plugin, monkeypatch, tmp_path):
+    """A run that extracted nothing decides nothing: status ok with every
+    list empty appends NO line — even after the sidecar already exists from
+    a real filing run. The log records decisions, not material volume."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db})
+    _wire_filing_plugin(h, monkeypatch)
+    sidecar = tmp_path / "covey.db.intake.jsonl"
+    # a real filing first, so "unchanged" is a meaningful claim
+    assert json.loads(h.tool("intake", {"text": "material"}))["status"] == "ok"
+    assert len(sidecar.read_text().splitlines()) == 1
+    monkeypatch.setattr(h.module.core, "extract", lambda text, **kw: ([], None))
+    quiet = json.loads(h.tool("intake", {"text": "plenty of text, no work"}))
+    assert quiet == {"status": "ok", "submitted": [], "existing": [],
+                     "failed": [], "reason": None}
+    assert len(sidecar.read_text().splitlines()) == 1  # no line for no decisions
+
+
+def test_decision_log_surrogate_source_never_escapes_the_writer(load_plugin, monkeypatch, tmp_path):
+    """A lone surrogate in source (argv bytes through the tool args) breaks
+    the utf-8 write mid-line — AFTER the store was already mutated. That
+    ValueError is caught like an OSError: the call still returns its report
+    intact, the half-line simply never lands."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db})
+    _wire_filing_plugin(h, monkeypatch)
+    sidecar = tmp_path / "covey.db.intake.jsonl"
+    result = json.loads(h.tool("intake", {"text": "material", "source": "x\udcff"}))
+    assert result["status"] == "ok"  # no raise, whatever the writer did
+    assert result["submitted"][0]["meta_task_id"] == "meta_1"
+    assert not sidecar.exists() or sidecar.read_text() == ""
+
+
 # ------------------------------------------------------------------- manifest
 
 def test_manifest_declares_intake_tool_and_full_config_schema():
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
     assert manifest["name"] == "intake" == PLUGIN_DIR.name
+    assert manifest["version"] == "0.2.0"
     assert manifest["provides_tools"] == ["intake"]
     assert manifest["manifest_version"] == 2 and manifest["api_version"] == 1
     schema = manifest["config_schema"]
     assert set(schema) == {"binary", "db_path", "endpoint", "served_model",
                            "api_key_env", "max_chars", "max_items", "timeout",
-                           "classifier_endpoint", "classifier_timeout"}
+                           "classifier_endpoint", "classifier_timeout",
+                           "grounding_max", "decision_log"}
+    assert schema["grounding_max"]["default"] == 100
+    assert schema["decision_log"]["default"] == ""
     for entry in schema.values():  # operator-facing law: every key is complete
         assert entry.get("type") and "default" in entry and entry.get("description")

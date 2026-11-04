@@ -19,6 +19,8 @@ the session token.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import datetime
 import hashlib
 import json
 import os
@@ -35,13 +37,17 @@ DEFAULT_MAX_ITEMS = 20
 _SYSTEM_PROMPT = (
     "You extract actionable follow-ups from the material the user provides. "
     'Return ONLY a JSON object of the shape {"items": [{"content": "...", '
-    '"quote": "..."}]}. Each item is ONE follow-up that the owner of the '
-    "material must do or explicitly committed to: self-contained (readable "
-    "without the source), phrased as an imperative command, at most 120 "
-    "characters. Never fabricate work that the material does not commit or "
-    "require; never merge several actions into one item. `quote` is a short "
-    "verbatim span from the material proving the commitment; omit it when no "
-    'span supports the item. When nothing qualifies return {"items": []}. '
+    '"quote": "...", "due": "..."}]}. Each item is ONE follow-up that the '
+    "owner of the material must do or explicitly committed to: "
+    "self-contained (readable without the source), phrased as an imperative "
+    "command, at most 120 characters. Never fabricate work that the material "
+    "does not commit or require; never merge several actions into one item. "
+    "`quote` is a short verbatim span from the material proving the "
+    "commitment; omit it when no span supports the item. An item MAY carry "
+    "\"due\": \"YYYY-MM-DD\" — the follow-up's deadline resolved against "
+    "today's date (a relative phrase like \"by Friday\" becomes an absolute "
+    "date); null or omitted when no deadline is stated. When nothing "
+    'qualifies return {"items": []}. '
     "No prose, no markdown, no code fences — JSON only."
 )
 
@@ -87,7 +93,11 @@ def _strip_fences(text):
 def _parse_items(content, max_items):
     """Strict extraction parsing: ONE object with an ``items`` list of objects
     carrying a non-empty string ``content``. Malformed entries are dropped;
-    a valid empty list is a quiet success; anything else is malformed."""
+    a valid empty list is a quiet success; anything else is malformed. Every
+    kept item carries ``due``: the entry's ISO date validated with
+    ``datetime.date.fromisoformat`` and canonicalized, None when absent or
+    not a real date — a deadline the model could not resolve is no
+    deadline."""
     try:
         parsed = json.loads(_strip_fences(content))
     except ValueError:
@@ -108,11 +118,19 @@ def _parse_items(content, max_items):
         quote = entry.get("quote")
         if quote is not None and not isinstance(quote, str):
             quote = None
+        due = entry.get("due")
+        if isinstance(due, str):
+            try:  # only a real calendar date survives; anything else is None
+                due = datetime.date.fromisoformat(due).isoformat()
+            except ValueError:
+                due = None
+        else:
+            due = None
         key = item_key(text)
         if key in seen:
             continue  # order-preserving in-run dedupe; the store still gates replays
         seen.add(key)
-        items.append({"content": text, "quote": quote})
+        items.append({"content": text, "quote": quote, "due": due})
         if len(items) >= max_items:
             break
     if not items:
@@ -121,13 +139,14 @@ def _parse_items(content, max_items):
 
 
 def extract(text, *, endpoint, model, api_key, timeout, opener=None,
-            max_items=DEFAULT_MAX_ITEMS, existing=None):
+            max_items=DEFAULT_MAX_ITEMS, existing=None, today=None):
     """(items, reason) from the chat model; never raises.
 
-    items are ``{"content": str, "quote": str|None}``, validated, ordered,
-    deduped by item_key, capped at max_items. reason is None on success and
-    one of ``not_configured`` (no key/model/endpoint — zero requests made),
-    ``transport`` (transport error or timeout), ``http_<code>`` (non-2xx),
+    items are ``{"content": str, "quote": str|None, "due": str|None}``,
+    validated, ordered, deduped by item_key, capped at max_items. reason is
+    None on success and one of ``not_configured`` (no key/model/endpoint —
+    zero requests made), ``transport`` (transport error or timeout),
+    ``http_<code>`` (non-2xx),
     ``malformed`` (unusable body or unparseable model output). The request
     always carries the top-level ``model`` field the flare node requires,
     ``temperature: 0`` (a re-run over the same material must extract the
@@ -136,12 +155,18 @@ def extract(text, *, endpoint, model, api_key, timeout, opener=None,
     ``choices[0].message.content`` is read, never ``reasoning_content``.
     ``existing`` lists follow-ups already filed for this store: the prompt
     tells the model not to restate any of them, which is the paraphrase
-    defense the string-level dedupe cannot provide on its own. ``opener``
+    defense the string-level dedupe cannot provide on its own. ``today``
+    (an ISO ``YYYY-MM-DD`` string, defaulting to the real date at call
+    time) is stated in the system prompt so the model can resolve relative
+    deadlines ("by Friday") into absolute per-item ``due`` dates; with no
+    deadline stated an item carries ``due`` as None. ``opener``
     (an object with ``.open(request, timeout=...)``) injects the transport;
     the default is urlopen.
     """
     if not (endpoint or "").strip() or not (model or "").strip() or not (api_key or "").strip():
         return [], "not_configured"
+    if today is None:
+        today = datetime.date.today().isoformat()
     user = text
     if existing:
         listed = "\n".join(f"- {line}" for line in existing)
@@ -151,7 +176,8 @@ def extract(text, *, endpoint, model, api_key, timeout, opener=None,
         body = json.dumps({
             "model": model,
             "temperature": 0,
-            "messages": [{"role": "system", "content": _SYSTEM_PROMPT},
+            "messages": [{"role": "system",
+                          "content": _SYSTEM_PROMPT + f" Today's date is {today}."},
                          {"role": "user", "content": user}],
         }, ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError):
@@ -256,8 +282,19 @@ def obtain_session(call_covey):
     return None, f"store_unavailable:{code if isinstance(code, str) and code else 'error'}"
 
 
+# Meta-task states that mean the work is finished. A follow-up whose only
+# match sits in one of these does NOT suppress re-filing — a cancelled or
+# done commitment mentioned again in fresh material is new work. The
+# completion-ish states are workflow-driven and were unobserved at writing;
+# add any seen in practice to this tuple.
+TERMINAL_META_STATES = ("cancelled", "done", "completed", "failed", "abandoned")
+
+
 def existing_contents(call_covey):
-    """``{normalized: first-line}`` of follow-ups already filed in the store.
+    """``{normalized: row}`` of follow-ups already filed in the store; row is
+    ``{"first": str, "meta_task_id": str|None, "state": str|None,
+    "created": int|None}`` describing the filed task (the last row seen for
+    a normalized line wins, mirroring the store's own order).
 
     Cross-run dedupe cannot ride on idempotency keys (they are
     session-scoped, verified), so the store itself is queried: a follow-up
@@ -269,7 +306,10 @@ def existing_contents(call_covey):
     this dedupe; the read therefore pages (500 at a time) to exhaustion.
     An unreadable store yields what was already read — the worst case
     degrades to a within-session replay, which the idempotency key still
-    collapses."""
+    collapses. Rows whose ``state`` is in TERMINAL_META_STATES are EXCLUDED
+    — terminal work does not suppress re-filing — while unknown and absent
+    states stay in, conservative against duplicates. Completion states
+    observed in practice should be added to that constant."""
     seen = {}
     offset = 0
     while True:
@@ -288,8 +328,21 @@ def existing_contents(call_covey):
             if isinstance(prompt, str) and prompt:
                 first = prompt.splitlines()[0]
                 norm = normalize_item(first)
-                if norm:
-                    seen[norm] = first
+                if not norm:
+                    continue
+                state = row.get("state")
+                state = state if isinstance(state, str) and state else None
+                if state in TERMINAL_META_STATES:
+                    continue  # finished work never suppresses a re-filing
+                meta_task_id = row.get("meta_task_id")
+                created = row.get("created_at")
+                seen[norm] = {
+                    "first": first,
+                    "meta_task_id": meta_task_id
+                    if isinstance(meta_task_id, str) and meta_task_id else None,
+                    "state": state,
+                    "created": created if isinstance(created, int) else None,
+                }
         if len(rows) < 500:
             return seen
         offset += 500
@@ -301,14 +354,18 @@ def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None):
     use. Never raises; returns None whenever the label cannot be had
     (unconfigured, transport, unusable body, off-vocabulary answer).
     Urgency DECORATES intake; a dead classifier costs the label, never the
-    intake. The quoted evidence rides in the state so the label is grounded
-    in what the material actually says."""
+    intake. The quoted evidence — and the item's stated deadline, when it
+    carries one — rides in the state so the label is grounded in what the
+    material actually says and stays aware of when the work is due."""
     if not (endpoint or "").strip() or not (model or "").strip() or not (api_key or "").strip():
         return None
     content = item["content"] if isinstance(item, dict) else str(item)
     quote = item.get("quote") if isinstance(item, dict) else None
     state = f"{content}\n\nQuote from the material: {quote}" \
         if isinstance(quote, str) and quote.strip() else content
+    due = item.get("due") if isinstance(item, dict) else None
+    if isinstance(due, str) and due:
+        state += f"\n\nDue: {due}"
     try:
         body = json.dumps({"model": model, "state": state,
                            "questions": {"urgency": {
@@ -340,21 +397,45 @@ def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None):
 def annotate_urgency(items, *, classifier_endpoint, model, api_key, timeout,
                      classifier=None, opener=None):
     """Attach ``urgency`` to each item dict in place (None when unavailable).
-    Per-item calls on the classifier node; ``classifier`` injects the labeler
-    for tests: item -> label|None."""
-    label = classifier if classifier is not None else (
-        lambda item: classify_urgency(
-            item, endpoint=classifier_endpoint, model=model,
-            api_key=api_key, timeout=timeout, opener=opener))
-    for item in items:
-        if isinstance(item, dict):
+
+    ``classifier`` injects the labeler for tests (item -> label|None) and
+    runs sequentially. Against the real node the per-item calls run
+    CONCURRENTLY: /v1/systemone takes ONE shared ``state`` per request, so
+    several question heads over identical criteria return identical
+    probabilities — per-item urgency cannot be batched into one request and
+    instead fans out over a ThreadPoolExecutor (min(8, len(items)) workers),
+    results mapped back by index so item order is preserved. A single item
+    is labelled directly, without an executor. Never raises either way: a
+    failed call costs its label, never the intake."""
+    targets = [item for item in items if isinstance(item, dict)]
+    if not targets:
+        return
+
+    def label(item):
+        try:
+            return classify_urgency(item, endpoint=classifier_endpoint,
+                                    model=model, api_key=api_key,
+                                    timeout=timeout, opener=opener)
+        except Exception:
+            return None
+
+    if classifier is not None:
+        got_list = []
+        for item in targets:
             try:
-                got = label(item)
+                got_list.append(classifier(item))
             except Exception:
-                got = None
-            # Normalize HERE so the item, the prompt line, and the reported
-            # row carry one truth: a valid label or nothing.
-            item["urgency"] = got if got in URGENCY_LABELS else None
+                got_list.append(None)
+    elif len(targets) == 1:
+        got_list = [label(targets[0])]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(targets))) as pool:
+            got_list = list(pool.map(label, targets))
+    for item, got in zip(targets, got_list):
+        # Normalize HERE so the item, the prompt line, and the reported
+        # row carry one truth: a valid label or nothing.
+        item["urgency"] = got if got in URGENCY_LABELS else None
 
 
 def submit_items(items, source, token, call_covey):
@@ -363,18 +444,26 @@ def submit_items(items, source, token, call_covey):
 
     The idempotency key is item_key(content) — content ONLY: the same work
     is the same task even if the wording drifts or a later run would label
-    it differently. ``meta submit`` has no priority field, so urgency is a
-    structured line inside the prompt text, between the item and the Source
-    provenance footer; a replay of a filed key keeps its original text —
-    urgency annotates first filing, it never rewrites a filed task."""
-    submitted, failed = [], []
+    it differently. ``meta submit`` has no priority field, so urgency and a
+    stated deadline are structured lines inside the prompt text — Urgency
+    then Due, each emitted only when it carries a valid value — between the
+    item and the Source provenance footer; a replay of a filed key keeps its
+    original text — urgency and due annotate first filing, they never
+    rewrite a filed task. A submit answered ``ok:false`` with
+    ``code == "conflict"`` is NOT a failure: the key is already filed (the
+    usual cause is a concurrent run), so the row is reported under
+    ``existing`` instead; every other refusal stays a failure."""
+    submitted, failed, existing = [], [], []
     for item in items:
         content = item["content"] if isinstance(item, dict) else item
         urgency = item.get("urgency") if isinstance(item, dict) else None
+        due = item.get("due") if isinstance(item, dict) else None
         key = item_key(content)
         lines = [content, ""]
         if isinstance(urgency, str) and urgency in URGENCY_LABELS:
             lines += [f"Urgency: {urgency}", ""]
+        if isinstance(due, str) and due:
+            lines += [f"Due: {due}", ""]
         lines += [f"Source: {source}"]
         argv = ["meta", "submit",
                 "--session-token", token,
@@ -389,17 +478,24 @@ def submit_items(items, source, token, call_covey):
             meta_task_id = data.get("meta_task_id") if isinstance(data, dict) else None
             if isinstance(meta_task_id, str) and meta_task_id:
                 submitted.append({"content": content, "key": key,
-                                  "urgency": urgency, "meta_task_id": meta_task_id})
+                                  "urgency": urgency, "due": due,
+                                  "meta_task_id": meta_task_id})
                 continue
         code = payload.get("code") if isinstance(payload, dict) else None
-        failed.append({"content": content, "urgency": urgency,
+        if code == "conflict":
+            # already filed under this key: the work exists in the store,
+            # a concurrent run won the race — never report it as failed
+            existing.append({"content": content, "key": key,
+                             "urgency": urgency, "due": due})
+            continue
+        failed.append({"content": content, "urgency": urgency, "due": due,
                        "code": code if isinstance(code, str) and code else "error"})
-    return {"submitted": submitted, "failed": failed}
+    return {"submitted": submitted, "failed": failed, "existing": existing}
 
 
 def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
            max_items, call_covey, extractor=None, classifier=None,
-           classifier_endpoint="", classifier_timeout=1.5):
+           classifier_endpoint="", classifier_timeout=1.5, grounding_max=100):
     """The composition: clip -> meta-list read -> extract (grounded against
     what is filed) -> obtain_session -> partition -> urgency (survivors
     only) -> submit.
@@ -409,22 +505,36 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
     is ok), ``not_configured``, ``model_unavailable`` (transport/http/
     malformed), ``store_unavailable`` (no session could be obtained),
     ``partial`` (at least one submit failed; the succeeded ones stay
-    submitted). ``existing`` lists items already filed (matched by
-    normalized first line) — same work, one task. Ordering is deliberate:
-    the store is read BEFORE extraction so the model can be told not to
-    restate filed work (paraphrase-proofing the dedupe), and urgency runs
-    ONLY on survivors, so a replay costs one grounded extraction call and
-    nothing else — no submits, no classifier calls. ``extractor`` and
-    ``classifier`` inject the model calls for tests."""
+    submitted). ``existing`` lists items already filed — matched by
+    normalized first line, or claimed at submit time through an
+    idempotency-key conflict (a concurrent run filed the same work) — same
+    work, one task; every row carries ``matched_meta_task_id`` from the
+    store read when the match is known, None when it is not. Ordering is
+    deliberate: the store is read BEFORE extraction so the model can be
+    told not to restate filed work (paraphrase-proofing the dedupe), and
+    urgency runs ONLY on survivors, so a replay costs one grounded
+    extraction call and nothing else — no submits, no classifier calls.
+    ``grounding_max`` caps only the do-not-restate list SHOWN to the
+    extractor (newest first by ``created``, undated rows last); 0 sends no
+    list at all — the dedupe set itself is always the full paged read.
+    ``extractor`` and ``classifier`` inject the model calls for tests."""
     clipped = clip(text, max_chars)
     existing = existing_contents(call_covey)
+    grounded = []
+    if grounding_max > 0 and existing:
+        # a prompt-budget view only: newest filed lines first, undated last;
+        # dedupe still consults the complete paged read
+        ordered = sorted(existing.values(),
+                         key=lambda row: (row.get("created") is not None,
+                                          row.get("created") or 0),
+                         reverse=True)
+        grounded = [row["first"] for row in ordered[:grounding_max]]
     if extractor is not None:
         items, reason = extractor(clipped)
     else:
         items, reason = extract(clipped, endpoint=endpoint,
                                 model=model, api_key=api_key, timeout=timeout,
-                                max_items=max_items,
-                                existing=sorted(existing.values()))
+                                max_items=max_items, existing=grounded)
     if reason == "not_configured":
         return {"status": "not_configured", "submitted": [], "existing": [],
                 "failed": [], "reason": reason}
@@ -441,14 +551,24 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
     fresh, dupes = [], []
     for item in items:
         content = item["content"] if isinstance(item, dict) else item
-        if normalize_item(content) in existing:
-            dupes.append({"content": content, "key": item_key(content)})
+        urgency = item.get("urgency") if isinstance(item, dict) else None
+        due = item.get("due") if isinstance(item, dict) else None
+        matched = existing.get(normalize_item(content))
+        if matched is not None:
+            dupes.append({"content": content, "key": item_key(content),
+                          "urgency": urgency, "due": due,
+                          "matched_meta_task_id": matched.get("meta_task_id")})
         else:
             fresh.append(item)
     annotate_urgency(fresh, classifier_endpoint=classifier_endpoint or endpoint,
                      model=model, api_key=api_key, timeout=classifier_timeout,
                      classifier=classifier)
     outcome = submit_items(fresh, source, token, call_covey)
+    # a store-side key conflict (a concurrent run filed the same work) is
+    # existing work, not a failure — same row shape as the first-line matches
+    dupes += [{"content": row["content"], "key": row["key"],
+               "urgency": row["urgency"], "due": row["due"],
+               "matched_meta_task_id": None} for row in outcome["existing"]]
     status = "partial" if outcome["failed"] else "ok"
     return {"status": status, "submitted": outcome["submitted"],
             "existing": dupes, "failed": outcome["failed"], "reason": None}

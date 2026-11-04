@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 from . import core
 
@@ -91,6 +92,8 @@ def register(ctx):
         timeout = _as_float(ctx.get_config("timeout", 30.0), 30.0)
         classifier_endpoint = str(ctx.get_config("classifier_endpoint", "") or "")
         classifier_timeout = _as_float(ctx.get_config("classifier_timeout", 1.5), 1.5)
+        grounding_max = max(0, _as_int(ctx.get_config("grounding_max", 100), 100))
+        decision_log = str(ctx.get_config("decision_log", "") or "")
         api_key = os.environ.get(api_key_env, "").strip()  # env at call time, never stored
 
         text = args.get("text")
@@ -149,11 +152,34 @@ def register(ctx):
                     "reason": "db_path must be the ABSOLUTE path of the profile's global covey DB "
                               "— set it to the same path the covey-tasks plugin uses"}
 
-        return core.ingest(text, source=source, endpoint=endpoint, model=model,
-                           api_key=api_key, timeout=timeout, max_chars=max_chars,
-                           max_items=max_items, call_covey=call_covey,
-                           classifier_endpoint=classifier_endpoint,
-                           classifier_timeout=classifier_timeout)
+        report = core.ingest(text, source=source, endpoint=endpoint, model=model,
+                             api_key=api_key, timeout=timeout, max_chars=max_chars,
+                             max_items=max_items, call_covey=call_covey,
+                             classifier_endpoint=classifier_endpoint,
+                             classifier_timeout=classifier_timeout,
+                             grounding_max=grounding_max)
+        if report.get("status") in ("ok", "partial") and (
+                report["submitted"] or report["existing"] or report["failed"]):
+            # Append-only decision log: one JSON line per run that filed,
+            # matched or lost something, so an operator can audit what a run
+            # decided. Quiet runs (nothing extracted) log nothing — the log
+            # records decisions, not material volume. Logging never blocks
+            # intake: OSError (unwritable) AND ValueError (an unencodable
+            # surrogate in source bytes from argv) are debug notes and the
+            # report is returned unaltered; dry_run never reaches here.
+            log_path = decision_log or db_path + ".intake.jsonl"
+            try:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(
+                        {"ts": datetime.now(timezone.utc).isoformat(),
+                         "source": source, "status": report["status"],
+                         "submitted": report["submitted"],
+                         "existing": report["existing"],
+                         "failed": report["failed"]},
+                        ensure_ascii=False) + "\n")
+            except (OSError, ValueError):
+                logger.debug("intake decision log unwritable at %s", log_path)
+        return report
 
     def intake(args, **_kw):
         if not isinstance(args, dict):
