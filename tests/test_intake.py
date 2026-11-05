@@ -136,7 +136,7 @@ def call_extract(content, *, error=None, status=200, **overrides):
               "api_key": "synthetic-key", "timeout": 5.0}
     kwargs.update(overrides)
     items, reason = core.extract("material", opener=opener, **kwargs)
-    return items, reason, opener
+    return items, reason, opener  # opener.requests[i]["timeout"] is the effective timeout
 
 
 # ------------------------------------------------------------------ the wire
@@ -340,6 +340,10 @@ def test_ingest_records_covey_argv(monkeypatch):
     assert submit[submit.index("--session-token") + 1] == "tok-1"
     assert submit[submit.index("--idempotency-key") + 1] == key
     assert submit[submit.index("--prompt-text") + 1] == "Email Anna the draft\n\nSource: cli"
+    # the report row carries no near-dupe keys: an empty store proves there
+    # was nothing to be near
+    assert "near_dupe_meta_task_id" not in report["submitted"][0]
+    assert "near_dupe_first" not in report["submitted"][0]
 
 
 def test_submit_failure_is_isolated_and_marks_partial():
@@ -766,6 +770,264 @@ def test_urgency_dead_classifier_costs_labels_never_the_intake():
     assert [item["urgency"] for item in items] == [None, None, None]
 
 
+# ------------------------------------------------------------------- run deadline
+
+def test_extract_past_the_run_deadline_makes_no_request():
+    """The whole-run bound is honoured BEFORE the wire: an already-past
+    deadline costs zero requests and reports run_cancelled."""
+    items, reason, opener = call_extract('{"items": []}',
+                                         deadline=core.time.monotonic() - 0.01)
+    assert (items, reason) == ([], "run_cancelled")
+    assert opener.requests == []
+
+
+def test_extract_never_lets_a_request_outlive_the_run_deadline():
+    """The per-request timeout is clamped to the remaining budget, and never
+    raised above the configured timeout."""
+    _, _, opener = call_extract('{"items": []}', timeout=5.0,
+                                deadline=core.time.monotonic() + 2.0)
+    assert 0 < opener.requests[0]["timeout"] <= 2.0
+    _, _, opener = call_extract('{"items": []}', timeout=0.5,
+                                deadline=core.time.monotonic() + 60.0)
+    assert opener.requests[0]["timeout"] == 0.5
+
+
+def test_classify_urgency_past_the_run_deadline_makes_no_request():
+    items = [{"content": "Task", "quote": None}]
+    opener = FakeOpener(raw=json.dumps(
+        {"answers": {"urgency": {"choice": "low"}}}).encode())
+    label = core.classify_urgency(items[0], endpoint="http://127.0.0.1:8102",
+                                  model="m", api_key="k", timeout=1.0,
+                                  opener=opener,
+                                  deadline=core.time.monotonic() - 0.01)
+    assert label is None
+    assert opener.requests == []
+
+
+def test_annotate_urgency_past_the_deadline_stops_labeling():
+    """Mid-run expiry costs the labels, never the intake: remaining items
+    simply carry no label, and the dead classifier is never reached."""
+    opener = FakeOpener(raw=json.dumps(
+        {"answers": {"urgency": {"choice": "high"}}}).encode())
+    items = [{"content": f"Task {n}", "quote": None} for n in range(3)]
+    core.annotate_urgency(items, classifier_endpoint="http://127.0.0.1:8102",
+                          model="m", api_key="k", timeout=1.0, opener=opener,
+                          deadline=core.time.monotonic() - 0.01)
+    assert [item["urgency"] for item in items] == [None, None, None]
+    assert opener.requests == []
+
+
+def test_existing_contents_stops_paging_at_the_deadline():
+    """A run with no budget left keeps whatever the first page already gave
+    and never pays for the second."""
+    rows = [{"prompt_text": f"Routine task {i}"} for i in range(500)]
+    covey = FakeCovey(rows={"ok": True, "data": rows})
+    mapping = core.existing_contents(covey, deadline=core.time.monotonic() - 0.01)
+    assert mapping == {}
+    assert covey.calls == []  # not even the first page was asked for
+
+
+def test_ingest_past_the_run_deadline_files_nothing():
+    """The bound covers the WHOLE run, not just the model: with the budget
+    already spent the store read, the model and every submit are skipped;
+    the report says so with model_unavailable/run_cancelled. The clock jumps
+    past the deadline between the guard's two readings, so the branch is
+    deterministic and exercises a budget spent while the run was starting."""
+    covey = FakeCovey()
+    real = core.time.monotonic
+    reads = [0]
+
+    def jumping_clock():  # budget expired the moment the run began
+        reads[0] += 1
+        return real() + (0.0 if reads[0] == 1 else 1000.0)
+
+    core.time.monotonic = jumping_clock
+    try:
+        report = _ingest(lambda text: ([{"content": "Email Anna the draft",
+                                         "quote": None}], None),
+                         covey, run_deadline=30.0)
+    finally:
+        core.time.monotonic = real
+    assert report == {"status": "model_unavailable", "submitted": [],
+                      "existing": [], "failed": [], "reason": "run_cancelled"}
+    assert covey.calls == []
+
+
+def test_ingest_without_deadline_is_unbounded():
+    """0 (and any non-positive bound) disables the wall-clock check: a normal
+    run files exactly as it did before the bound existed."""
+    covey = FakeCovey()
+    report = _ingest(lambda text: ([{"content": "Email Anna the draft",
+                                     "quote": None}], None),
+                     covey, run_deadline=0)
+    assert report["status"] == "ok" and len(covey.submits()) == 1
+
+
+def test_submit_items_stops_filing_at_the_deadline():
+    """Per-item, not all-or-nothing: items submitted before the deadline stay
+    filed; the rest report failed with code run_cancelled, so the run ends
+    partial with the boundary visible in the report."""
+    covey = FakeCovey()
+    items = [{"content": f"Task {n}", "quote": None} for n in range(3)]
+    outcome = core.submit_items(items, "cli", "tok-1", covey,
+                                deadline=core.time.monotonic() - 0.01)
+    assert outcome["submitted"] == []
+    assert [row["code"] for row in outcome["failed"]] == ["run_cancelled"] * 3
+    assert covey.submits() == []
+
+
+def test_ingest_generous_run_deadline_files_normally():
+    """A budget with room to spare is invisible: the normal path is unchanged
+    by the bound existing at all."""
+    covey = FakeCovey()
+    report = _ingest(lambda text: ([{"content": "Email Anna the draft",
+                                     "quote": None}], None),
+                     covey, run_deadline=300.0)
+    assert report["status"] == "ok" and len(covey.submits()) == 1
+
+
+def test_ingest_expired_between_extract_and_submit_is_partial():
+    """Deterministic mid-run expiry: the model call burns the whole budget,
+    so submits see a past deadline — every survivor reports run_cancelled
+    while the earlier stages keep their effect."""
+    import time as _time
+    covey = FakeCovey()
+    real_monotonic = _time.monotonic
+    state = {"spent": False}
+
+    def clock():
+        return real_monotonic() + (1000.0 if state["spent"] else 0.0)
+
+    def extractor(text):
+        state["spent"] = True  # the model call burned the whole budget
+        return ([{"content": "Email Anna the draft", "quote": None}], None)
+
+    core.time.monotonic = clock  # type: ignore[attr-defined]
+    try:
+        report = _ingest(extractor, covey, run_deadline=30.0)
+    finally:
+        core.time.monotonic = real_monotonic  # type: ignore[attr-defined]
+    assert report["status"] == "partial"
+    assert report["submitted"] == []
+    assert report["failed"] == [{"content": "Email Anna the draft",
+                                 "urgency": None, "due": None,
+                                 "code": "run_cancelled"}]
+    assert covey.submits() == []
+
+
+# ------------------------------------------------------------------ near-dupe flag
+
+def test_tokens_and_similarity_measure_rewordings():
+    a = core._tokens("Email Anna the draft")
+    # casing, padding and punctuation are not content: identical wording is 1.0
+    assert core._similarity(a, core._tokens(" email ANNA  the draft! ")) == 1.0
+    # unrelated imperatives share almost nothing, even with common function
+    # words: the measure separates rewordings from new work
+    assert core._similarity(core._tokens("Email Anna the draft"),
+                            core._tokens("Rotate the tires")) < 0.25
+    # a rewording keeps nearly every word; a substituted word leaves real
+    # content uncovered. The calibration is the separation, not a score.
+    reworded = core._similarity(
+        core._tokens("Renew the SSL certificate on frost before it expires"),
+        core._tokens("Renew the SSL certificate on frost before it expires next week"))
+    substituted = core._similarity(
+        core._tokens("Email Anna the quarterly draft"),
+        core._tokens("Email Bob the quarterly draft"))
+    unrelated = core._similarity(
+        core._tokens("Email Anna the draft"),
+        core._tokens("Rotate the tires"))
+    assert unrelated < substituted < reworded < 1.0
+    assert reworded > core.NEAR_DUPE_SIMILARITY  # what the flag must catch
+    assert substituted < core.NEAR_DUPE_SIMILARITY  # what it must not
+    assert core._similarity(frozenset(), frozenset()) == 0.0  # no rewording
+
+
+def test_closest_filed_finds_the_rewording_and_excludes_exact_match():
+    rows = {core.normalize_item("Renew the SSL certificate on frost before it expires"): {
+        "first": "Renew the SSL certificate on frost before it expires",
+        "meta_task_id": "meta_1", "state": None, "created": None}}
+    near = core._closest_filed("Renew the SSL certificate on frost before it expires next week",
+                               rows, core.NEAR_DUPE_SIMILARITY)
+    assert near is not None and near["meta_task_id"] == "meta_1"
+    # exact match is the strict dedupe's job: never a near-dupe
+    assert core._closest_filed("Renew the SSL certificate on frost before it expires",
+                               rows, core.NEAR_DUPE_SIMILARITY) is None
+    # a substituted word leaves real content uncovered: below the threshold
+    assert core._closest_filed("Email Bob the quarterly draft",
+                               {core.normalize_item("Email Anna the quarterly draft"): {
+                                   "first": "Email Anna the quarterly draft",
+                                   "meta_task_id": "meta_2", "state": None, "created": None}},
+                               core.NEAR_DUPE_SIMILARITY) is None
+    # unrelated work clears nothing
+    assert core._closest_filed("Rotate the tires", rows,
+                               core.NEAR_DUPE_SIMILARITY) is None
+
+
+def test_ingest_flags_reworded_filed_work_without_suppressing_it():
+    """The gap the exact first-line match cannot see: a rewording FILES (the
+    store's key only dedupes exact content) and its submitted row carries
+    near_dupe_meta_task_id/near_dupe_first so an operator can see what the
+    paraphrase defense missed."""
+    covey = FakeCovey(rows={"ok": True, "data": [
+        {"prompt_text": "Renew the SSL certificate on frost before it expires",
+         "meta_task_id": "meta_earlier"}]})
+    report = _ingest(lambda text: ([{"content": "Renew the SSL certificate on frost before it expires next week",
+                                     "quote": None}], None), covey)
+    assert report["status"] == "ok"
+    assert len(covey.submits()) == 1  # it still files — a flag, not a veto
+    row = report["submitted"][0]
+    assert row["near_dupe_meta_task_id"] == "meta_earlier"
+    assert row["near_dupe_first"] == "Renew the SSL certificate on frost before it expires"
+    assert report["existing"] == []  # it was NOT a strict match
+
+
+def test_ingest_unrelated_work_carries_no_near_dupe_flag():
+    covey = FakeCovey(rows={"ok": True, "data": [
+        {"prompt_text": "Renew the SSL certificate on frost before it expires",
+         "meta_task_id": "meta_earlier"}]})
+    report = _ingest(lambda text: ([{"content": "Rotate the tires",
+                                     "quote": None}], None), covey)
+    row = report["submitted"][0]
+    assert "near_dupe_meta_task_id" not in row
+    assert "near_dupe_first" not in row
+
+
+def test_near_dupe_flag_skipped_beyond_the_probe_cap():
+    """The flag is an observability aid, never a hot-path tax: past the
+    probe cap the comparison is skipped entirely and filing proceeds plain."""
+    rows = [{"prompt_text": f"Routine maintenance task number {i}"}
+            for i in range(core.NEAR_DUPE_PROBE_LIMIT + 1)]
+    covey = FakeCovey(rows={"ok": True, "data": rows})
+    report = _ingest(lambda text: ([{"content": "Rotate the tires",
+                                     "quote": None}], None), covey)
+    assert report["status"] == "ok"
+    row = report["submitted"][0]
+    assert "near_dupe_first" not in row
+
+
+def test_near_dupe_disabled_by_zero_similarity():
+    """0 disables the flag entirely: a rewording files plain."""
+    covey = FakeCovey(rows={"ok": True, "data": [
+        {"prompt_text": "Renew the SSL certificate on frost before it expires",
+         "meta_task_id": "meta_earlier"}]})
+    report = _ingest(lambda text: ([{"content": "Renew the SSL certificate on frost before it expires next week",
+                                     "quote": None}], None), covey,
+                     near_dupe_similarity=0)
+    assert "near_dupe_first" not in report["submitted"][0]
+
+
+def test_strict_match_wins_over_the_near_dupe_path():
+    """An exact normalized match is existing work and never also a near-dupe:
+    one truth, one row, in existing."""
+    covey = FakeCovey(rows={"ok": True, "data": [
+        {"prompt_text": "Email Anna the draft", "meta_task_id": "meta_earlier"}]})
+    report = _ingest(lambda text: ([{"content": " email ANNA the draft. ",
+                                     "quote": None}], None), covey)
+    assert [e["content"] for e in report["existing"]] == [" email ANNA the draft. "]
+    assert report["existing"][0]["matched_meta_task_id"] == "meta_earlier"
+    assert covey.submits() == []
+
+
 def test_submit_prompt_carries_urgency_between_item_and_source():
     covey = FakeCovey()
     report = _ingest(lambda text: ([{"content": "Email Anna the draft", "quote": None}], None),
@@ -862,6 +1124,21 @@ def test_tool_dry_run_works_without_any_store_config(load_plugin, monkeypatch):
         assert result["items"][0]["urgency"] == "high"
 
 
+def test_dry_run_never_lets_a_request_outlive_the_run_deadline(load_plugin, monkeypatch, tmp_path):
+    """The preview is bound exactly like a real run: the recorded request
+    timeout is the remaining budget, not the configured per-request timeout."""
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY",
+                               "run_deadline": 2.0})
+    monkeypatch.setenv("INTAKE_TEST_KEY", "synthetic-key")
+    opener = FakeOpener('{"items": []}')
+    monkeypatch.setattr(h.module.core.urllib.request, "urlopen", opener.open)
+    monkeypatch.setattr(h.module, "run_covey_command", lambda argv, **kw: (_ for _ in ()).throw(
+        AssertionError("dry_run must not touch the store")))
+    result = json.loads(h.tool("intake", {"text": "notes", "dry_run": True}))
+    assert result["status"] == "ok"
+    assert 0 < opener.requests[0]["timeout"] <= 2.0
+
+
 def test_tool_requires_exactly_one_of_text_or_path(load_plugin, tmp_path):
     h = load_plugin("intake", {"db_path": str(tmp_path / "covey.db")})
     assert json.loads(h.tool("intake", {}))["status"] == "error"
@@ -935,6 +1212,52 @@ def test_tool_passes_explicit_db_to_the_bridge(load_plugin, monkeypatch, tmp_pat
         assert kwargs["db_path"] == db
         assert kwargs["timeout"] == 10.0
         assert isinstance(kwargs["binary"], str) and kwargs["binary"]
+
+
+def test_tool_run_deadline_reaches_the_ingest_call(load_plugin, monkeypatch, tmp_path):
+    """The config key is real law: a configured bound threads through the
+    tool path into core.ingest, and the default is the manifest default."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db,
+                               "run_deadline": 7.5})
+    monkeypatch.setenv("INTAKE_TEST_KEY", "synthetic-key")
+    seen = {}
+    monkeypatch.setattr(h.module.core, "classify_urgency", lambda item, **kw: None)
+
+    def fake_ingest(text, **kwargs):
+        seen.update(kwargs)
+        return {"status": "ok", "submitted": [], "existing": [],
+                "failed": [], "reason": None}
+
+    monkeypatch.setattr(h.module.core, "ingest", fake_ingest)
+    monkeypatch.setattr(h.module, "run_covey_command", lambda argv, **kw: {
+        "ok": True, "data": []})
+    result = json.loads(h.tool("intake", {"text": "material"}))
+    assert result["status"] == "ok"
+    assert 0 < seen["run_deadline"] <= 7.5  # positive bound, never exceeded
+
+
+def test_run_deadline_zero_disables_the_bound_through_the_tool(load_plugin, monkeypatch, tmp_path):
+    """0 means unbounded: core.ingest receives run_deadline=0, so the wall
+    clock never runs."""
+    db = str(tmp_path / "covey.db")
+    h = load_plugin("intake", {"api_key_env": "INTAKE_TEST_KEY", "db_path": db,
+                               "run_deadline": 0})
+    monkeypatch.setenv("INTAKE_TEST_KEY", "synthetic-key")
+    seen = {}
+
+    def fake_ingest(text, **kwargs):
+        seen.update(kwargs)
+        return {"status": "ok", "submitted": [], "existing": [],
+                "failed": [], "reason": None}
+
+    monkeypatch.setattr(h.module.core, "ingest", fake_ingest)
+    monkeypatch.setattr(h.module.core, "classify_urgency", lambda item, **kw: None)
+    monkeypatch.setattr(h.module, "run_covey_command", lambda argv, **kw: {
+        "ok": True, "data": []})
+    result = json.loads(h.tool("intake", {"text": "material"}))
+    assert result["status"] == "ok"
+    assert seen["run_deadline"] == 0
 
 
 def _wire_filing_plugin(h, monkeypatch, submits=None):
@@ -1068,15 +1391,16 @@ def test_decision_log_surrogate_source_never_escapes_the_writer(load_plugin, mon
 def test_manifest_declares_intake_tool_and_full_config_schema():
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
     assert manifest["name"] == "intake" == PLUGIN_DIR.name
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.3.0"
     assert manifest["provides_tools"] == ["intake"]
     assert manifest["manifest_version"] == 2 and manifest["api_version"] == 1
     schema = manifest["config_schema"]
     assert set(schema) == {"binary", "db_path", "endpoint", "served_model",
                            "api_key_env", "max_chars", "max_items", "timeout",
                            "classifier_endpoint", "classifier_timeout",
-                           "grounding_max", "decision_log"}
+                           "run_deadline", "grounding_max", "decision_log"}
     assert schema["grounding_max"]["default"] == 100
     assert schema["decision_log"]["default"] == ""
+    assert schema["run_deadline"]["default"] == 120.0  # the bound is real by default
     for entry in schema.values():  # operator-facing law: every key is complete
         assert entry.get("type") and "default" in entry and entry.get("description")

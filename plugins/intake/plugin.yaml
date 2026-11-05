@@ -1,6 +1,6 @@
 name: intake
-version: 0.2.0
-description: "Reusable text intake: extracts actionable follow-ups from arbitrary text with the profile chat model — including due dates (a Due: ISO line, with today's date injected so relative deadlines resolve) — scores each with a deadline-aware urgency label (high/medium/low) via concurrent per-item classifier calls, dedupes state-aware against what is already filed (terminal tasks no longer suppress re-filing), and files survivors as Covey meta tasks in the profile's global worklist (the sink for transcript triage and digest pipelines); every filing run appends one JSON line to an append-only decision log."
+version: 0.3.0
+description: "Reusable text intake: extracts actionable follow-ups from arbitrary text with the profile chat model — including due dates (a Due: ISO line, with today's date injected so relative deadlines resolve) — scores each with a deadline-aware urgency label (high/medium/low) via concurrent per-item classifier calls, dedupes state-aware against what is already filed (terminal tasks no longer suppress re-filing; rewordings of filed work are flagged near_dupe on the report instead of silently filed), bounds the whole run with a wall-clock deadline (run_deadline) so a hung store or model call can never strand a piped CLI, and files survivors as Covey meta tasks in the profile's global worklist (the sink for transcript triage and digest pipelines); every filing run appends one JSON line to an append-only decision log."
 author: "hermes-plugins"
 manifest_version: 2
 api_version: 1
@@ -48,6 +48,10 @@ config_schema:
     type: float
     default: 1.5
     description: "Seconds per urgency classification. Short by design: urgency decorates intake and must never block it."
+  run_deadline:
+    type: float
+    default: 120.0
+    description: "Wall-clock seconds a whole intake run may take, measured from the moment input is handled. The per-stage timeouts never outlive it: a hung store read or model call cannot leave a piped CLI waiting forever. Past the deadline the run stops cleanly — unfiled items report failed with code run_cancelled, unearned labels are simply absent. 0 or negative disables the bound."
   grounding_max:
     type: int
     default: 100

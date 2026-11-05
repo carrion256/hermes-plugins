@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 from . import core
@@ -94,8 +95,12 @@ def register(ctx):
         classifier_timeout = _as_float(ctx.get_config("classifier_timeout", 1.5), 1.5)
         grounding_max = max(0, _as_int(ctx.get_config("grounding_max", 100), 100))
         decision_log = str(ctx.get_config("decision_log", "") or "")
+        run_deadline = _as_float(ctx.get_config("run_deadline",
+                                                core.DEFAULT_RUN_DEADLINE),
+                                 core.DEFAULT_RUN_DEADLINE)
         api_key = os.environ.get(api_key_env, "").strip()  # env at call time, never stored
 
+        started = time.monotonic()  # the run's clock starts with the input
         text = args.get("text")
         path = args.get("path")
         text = text if isinstance(text, str) else None
@@ -125,20 +130,31 @@ def register(ctx):
                                      binary=resolve_covey_binary(binary_cfg),
                                      timeout=COVEY_CALL_TIMEOUT)
 
+        deadline = (started + run_deadline
+                    if run_deadline and run_deadline > 0 else None)
+
+        def _remaining(value):
+            if deadline is None:
+                return value
+            return max(0.0, deadline - time.monotonic())
+
         if args.get("dry_run"):  # extraction preview only; the store is never touched,
             # so a preview needs NO store config — only the model does. The preview
             # shows what extraction yields (urgency annotation included); unlike a
             # real run it is NOT deduped against the store, so already-filed items
-            # appear here too.
+            # appear here too. The run deadline bounds it exactly like a real run.
             items, reason = core.extract(core.clip(text, max_chars), endpoint=endpoint,
-                                         model=model, api_key=api_key, timeout=timeout,
-                                         max_items=max_items)
+                                         model=model, api_key=api_key,
+                                         timeout=min(timeout, _remaining(timeout)),
+                                         max_items=max_items, deadline=deadline)
             if reason is not None:
                 status = "not_configured" if reason == "not_configured" else "model_unavailable"
                 return {"status": status, "items": [], "submitted": [], "existing": [],
                         "failed": [], "reason": reason}
             core.annotate_urgency(items, classifier_endpoint=classifier_endpoint or endpoint,
-                                  model=model, api_key=api_key, timeout=classifier_timeout)
+                                  model=model, api_key=api_key,
+                                  timeout=min(classifier_timeout, _remaining(classifier_timeout)),
+                                  deadline=deadline)
             return {"status": "ok", "items": items, "submitted": [], "existing": [],
                     "failed": [], "reason": None}
 
@@ -157,7 +173,8 @@ def register(ctx):
                              max_items=max_items, call_covey=call_covey,
                              classifier_endpoint=classifier_endpoint,
                              classifier_timeout=classifier_timeout,
-                             grounding_max=grounding_max)
+                             grounding_max=grounding_max,
+                             run_deadline=_remaining(run_deadline))
         if report.get("status") in ("ok", "partial") and (
                 report["submitted"] or report["existing"] or report["failed"]):
             # Append-only decision log: one JSON line per run that filed,

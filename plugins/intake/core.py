@@ -13,7 +13,11 @@ module keeps no local seen-set.
 
 Failure contract (repo discipline): no public function raises. A model outage,
 a dead store, a bad config is a ``status``/``reason`` string in the result,
-never an exception. The bearer key is supplied by the caller (read from the
+never an exception. The whole run is additionally bounded by a wall-clock
+deadline (``run_deadline``): every stage — store read, extraction, urgency
+annotation, submits — checks it, so a hung leg can never strand a piped CLI;
+past the deadline unfiled items report failed with code ``run_cancelled``.
+The bearer key is supplied by the caller (read from the
 environment at call time) and is never stored, logged, or echoed; neither is
 the session token.
 """
@@ -27,12 +31,16 @@ import os
 import re
 import secrets
 import string
+import time
 import urllib.error
 import urllib.request
 
 CLIP_MARKER = "[... clipped ...]"
 MAX_RESPONSE_BYTES = 1024 * 1024  # hard cap on a chat response read (1 MiB)
 DEFAULT_MAX_ITEMS = 20
+DEFAULT_RUN_DEADLINE = 120.0  # whole-run wall-clock cap, 0 disables
+NEAR_DUPE_SIMILARITY = 0.75  # Jaccard a rewording must exceed to be flagged
+NEAR_DUPE_PROBE_LIMIT = 1000  # cap on comparison probes when the store is large
 
 _SYSTEM_PROMPT = (
     "You extract actionable follow-ups from the material the user provides. "
@@ -80,6 +88,27 @@ def item_key(content):
     content maps to the same key so the store dedupes replays for us."""
     return "intake:" + hashlib.sha256(
         normalize_item(content).encode("utf-8")).hexdigest()[:16]
+
+
+def _tokens(content):
+    """Word set for similarity only: a pure function here, so the near-dupe
+    measure (normalization, stopwords, thresholds) has exactly one
+    definition. Every word counts, content or function: real rewordings
+    differ by one word of either kind, and a measure that ignores function
+    words cannot rank them against unrelated work."""
+    return frozenset(word for word in
+                     re.sub(r"[^\w]+", " ", content.lower()).split() if word)
+
+
+def _similarity(a, b):
+    """Jaccard similarity of two token sets; empty against empty is 0.0
+    (two contentless strings are not rewordings of each other). The near-dupe
+    measure: a rewording keeps nearly all words (high), a substituted word
+    leaves real content uncovered (low), unrelated imperatives share almost
+    nothing. One measure, one definition — the threshold is the whole
+    calibration, so anything that changes the scale changes the flag."""
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
 
 
 def _strip_fences(text):
@@ -139,7 +168,8 @@ def _parse_items(content, max_items):
 
 
 def extract(text, *, endpoint, model, api_key, timeout, opener=None,
-            max_items=DEFAULT_MAX_ITEMS, existing=None, today=None):
+            max_items=DEFAULT_MAX_ITEMS, existing=None, today=None,
+            deadline=None):
     """(items, reason) from the chat model; never raises.
 
     items are ``{"content": str, "quote": str|None, "due": str|None}``,
@@ -147,7 +177,10 @@ def extract(text, *, endpoint, model, api_key, timeout, opener=None,
     None on success and one of ``not_configured`` (no key/model/endpoint —
     zero requests made), ``transport`` (transport error or timeout),
     ``http_<code>`` (non-2xx),
-    ``malformed`` (unusable body or unparseable model output). The request
+    ``malformed`` (unusable body or unparseable model output),
+    ``run_cancelled`` (the whole-run ``deadline`` was already past —
+    zero requests made; mid-run expiry surfaces as ``transport`` from the
+    clamped per-request timeout). The request
     always carries the top-level ``model`` field the flare node requires,
     ``temperature: 0`` (a re-run over the same material must extract the
     same wording — the store's first-line dedupe can only recognize what
@@ -159,12 +192,16 @@ def extract(text, *, endpoint, model, api_key, timeout, opener=None,
     (an ISO ``YYYY-MM-DD`` string, defaulting to the real date at call
     time) is stated in the system prompt so the model can resolve relative
     deadlines ("by Friday") into absolute per-item ``due`` dates; with no
-    deadline stated an item carries ``due`` as None. ``opener``
+    deadline stated an item carries ``due`` as None. ``deadline`` is an
+    absolute ``time.monotonic()`` instant; the request timeout never
+    outlives it. ``opener``
     (an object with ``.open(request, timeout=...)``) injects the transport;
     the default is urlopen.
     """
     if not (endpoint or "").strip() or not (model or "").strip() or not (api_key or "").strip():
         return [], "not_configured"
+    if deadline is not None and time.monotonic() >= deadline:
+        return [], "run_cancelled"
     if today is None:
         today = datetime.date.today().isoformat()
     user = text
@@ -187,6 +224,8 @@ def extract(text, *, endpoint, model, api_key, timeout, opener=None,
         headers={"Content-Type": "application/json", "Accept": "application/json",
                  "Authorization": "Bearer " + api_key})
     open_request = opener.open if opener is not None else urllib.request.urlopen
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
     try:
         with open_request(request, timeout=timeout) as response:
             status = int(getattr(response, "status", 0))
@@ -290,7 +329,7 @@ def obtain_session(call_covey):
 TERMINAL_META_STATES = ("cancelled", "done", "completed", "failed", "abandoned")
 
 
-def existing_contents(call_covey):
+def existing_contents(call_covey, deadline=None):
     """``{normalized: row}`` of follow-ups already filed in the store; row is
     ``{"first": str, "meta_task_id": str|None, "state": str|None,
     "created": int|None}`` describing the filed task (the last row seen for
@@ -309,10 +348,15 @@ def existing_contents(call_covey):
     collapses. Rows whose ``state`` is in TERMINAL_META_STATES are EXCLUDED
     — terminal work does not suppress re-filing — while unknown and absent
     states stay in, conservative against duplicates. Completion states
-    observed in practice should be added to that constant."""
+    observed in practice should be added to that constant. ``deadline`` (an
+    absolute monotonic instant) stops the paging, keeping whatever was read;
+    the partial read degrades exactly like the mid-paging failure it shares
+    the budget with."""
     seen = {}
     offset = 0
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return seen
         try:
             payload = call_covey(["meta", "list", "--limit", "500",
                                   "--offset", str(offset)])
@@ -348,16 +392,37 @@ def existing_contents(call_covey):
         offset += 500
 
 
-def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None):
+def _closest_filed(content, rows, threshold):
+    """The nearest filed first line to ``content`` by `_similarity`, or None
+    when nothing clears ``threshold``. Exact matches (1.0) are the strict
+    dedupe's job and are excluded here; an unreachable threshold is None."""
+    if threshold is None or threshold >= 1.0:
+        return None
+    tokens = _tokens(content)
+    if not tokens:
+        return None
+    best, best_score = None, 0.0
+    for row in rows.values():
+        score = _similarity(tokens, _tokens(row["first"]))
+        if threshold < score < 1.0 and score > best_score:
+            best, best_score = row, score
+    return best
+
+
+def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None,
+                     deadline=None):
     """Urgency label for ONE item from the profile classifier — a typed
     choice head on /v1/systemone, the same node/wire the classifier plugins
     use. Never raises; returns None whenever the label cannot be had
-    (unconfigured, transport, unusable body, off-vocabulary answer).
+    (unconfigured, transport, unusable body, off-vocabulary answer, whole-run
+    ``deadline`` passed).
     Urgency DECORATES intake; a dead classifier costs the label, never the
     intake. The quoted evidence — and the item's stated deadline, when it
     carries one — rides in the state so the label is grounded in what the
     material actually says and stays aware of when the work is due."""
     if not (endpoint or "").strip() or not (model or "").strip() or not (api_key or "").strip():
+        return None
+    if deadline is not None and time.monotonic() >= deadline:
         return None
     content = item["content"] if isinstance(item, dict) else str(item)
     quote = item.get("quote") if isinstance(item, dict) else None
@@ -378,6 +443,8 @@ def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None):
         headers={"Content-Type": "application/json", "Accept": "application/json",
                  "Authorization": "Bearer " + api_key})
     open_request = opener.open if opener is not None else urllib.request.urlopen
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
     try:
         with open_request(request, timeout=timeout) as response:
             status = int(getattr(response, "status", 0))
@@ -395,7 +462,7 @@ def classify_urgency(item, *, endpoint, model, api_key, timeout, opener=None):
 
 
 def annotate_urgency(items, *, classifier_endpoint, model, api_key, timeout,
-                     classifier=None, opener=None):
+                     classifier=None, opener=None, deadline=None):
     """Attach ``urgency`` to each item dict in place (None when unavailable).
 
     ``classifier`` injects the labeler for tests (item -> label|None) and
@@ -405,7 +472,9 @@ def annotate_urgency(items, *, classifier_endpoint, model, api_key, timeout,
     probabilities — per-item urgency cannot be batched into one request and
     instead fans out over a ThreadPoolExecutor (min(8, len(items)) workers),
     results mapped back by index so item order is preserved. A single item
-    is labelled directly, without an executor. Never raises either way: a
+    is labelled directly, without an executor. ``deadline`` is an absolute
+    ``time.monotonic()`` instant: once past, labelling stops (remaining
+    items simply carry no label). Never raises either way: a
     failed call costs its label, never the intake."""
     targets = [item for item in items if isinstance(item, dict)]
     if not targets:
@@ -415,7 +484,8 @@ def annotate_urgency(items, *, classifier_endpoint, model, api_key, timeout,
         try:
             return classify_urgency(item, endpoint=classifier_endpoint,
                                     model=model, api_key=api_key,
-                                    timeout=timeout, opener=opener)
+                                    timeout=timeout, opener=opener,
+                                    deadline=deadline)
         except Exception:
             return None
 
@@ -438,7 +508,7 @@ def annotate_urgency(items, *, classifier_endpoint, model, api_key, timeout,
         item["urgency"] = got if got in URGENCY_LABELS else None
 
 
-def submit_items(items, source, token, call_covey):
+def submit_items(items, source, token, call_covey, deadline=None):
     """File every item as a meta task; never raises; one failure never stops
     the rest.
 
@@ -452,12 +522,19 @@ def submit_items(items, source, token, call_covey):
     rewrite a filed task. A submit answered ``ok:false`` with
     ``code == "conflict"`` is NOT a failure: the key is already filed (the
     usual cause is a concurrent run), so the row is reported under
-    ``existing`` instead; every other refusal stays a failure."""
+    ``existing`` instead; every other refusal stays a failure. ``deadline``
+    is an absolute ``time.monotonic()`` instant: once past, nothing further
+    is submitted and the remaining items are reported under ``failed`` with
+    code ``run_cancelled``."""
     submitted, failed, existing = [], [], []
     for item in items:
         content = item["content"] if isinstance(item, dict) else item
         urgency = item.get("urgency") if isinstance(item, dict) else None
         due = item.get("due") if isinstance(item, dict) else None
+        if deadline is not None and time.monotonic() >= deadline:
+            failed.append({"content": content, "urgency": urgency, "due": due,
+                           "code": "run_cancelled"})
+            continue
         key = item_key(content)
         lines = [content, ""]
         if isinstance(urgency, str) and urgency in URGENCY_LABELS:
@@ -477,9 +554,18 @@ def submit_items(items, source, token, call_covey):
             data = payload.get("data")
             meta_task_id = data.get("meta_task_id") if isinstance(data, dict) else None
             if isinstance(meta_task_id, str) and meta_task_id:
-                submitted.append({"content": content, "key": key,
-                                  "urgency": urgency, "due": due,
-                                  "meta_task_id": meta_task_id})
+                row = {"content": content, "key": key,
+                       "urgency": urgency, "due": due,
+                       "meta_task_id": meta_task_id}
+                # the near-dupe flag earned before filing rides out on the
+                # reported row: a filed rewording is exactly what an
+                # operator wants to see in the report
+                near = item.get("near_dupe_meta_task_id") if isinstance(item, dict) else None
+                near_first = item.get("near_dupe_first") if isinstance(item, dict) else None
+                if isinstance(near_first, str) and near_first:
+                    row["near_dupe_meta_task_id"] = near if isinstance(near, str) and near else None
+                    row["near_dupe_first"] = near_first
+                submitted.append(row)
                 continue
         code = payload.get("code") if isinstance(payload, dict) else None
         if code == "conflict":
@@ -495,7 +581,8 @@ def submit_items(items, source, token, call_covey):
 
 def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
            max_items, call_covey, extractor=None, classifier=None,
-           classifier_endpoint="", classifier_timeout=1.5, grounding_max=100):
+           classifier_endpoint="", classifier_timeout=1.5, grounding_max=100,
+           run_deadline=DEFAULT_RUN_DEADLINE, near_dupe_similarity=NEAR_DUPE_SIMILARITY):
     """The composition: clip -> meta-list read -> extract (grounded against
     what is filed) -> obtain_session -> partition -> urgency (survivors
     only) -> submit.
@@ -503,9 +590,9 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
     Returns ``{"status", "submitted", "existing", "failed", "reason"}`` and
     never raises. status: ``ok`` (nothing failed — an empty quiet extraction
     is ok), ``not_configured``, ``model_unavailable`` (transport/http/
-    malformed), ``store_unavailable`` (no session could be obtained),
-    ``partial`` (at least one submit failed; the succeeded ones stay
-    submitted). ``existing`` lists items already filed — matched by
+    malformed/run_cancelled), ``store_unavailable`` (no session could be
+    obtained), ``partial`` (at least one submit failed; the succeeded ones
+    stay submitted). ``existing`` lists items already filed — matched by
     normalized first line, or claimed at submit time through an
     idempotency-key conflict (a concurrent run filed the same work) — same
     work, one task; every row carries ``matched_meta_task_id`` from the
@@ -517,9 +604,40 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
     ``grounding_max`` caps only the do-not-restate list SHOWN to the
     extractor (newest first by ``created``, undated rows last); 0 sends no
     list at all — the dedupe set itself is always the full paged read.
-    ``extractor`` and ``classifier`` inject the model calls for tests."""
+    ``extractor`` and ``classifier`` inject the model calls for tests.
+
+    ``run_deadline`` bounds the WHOLE run in wall-clock seconds (0 or
+    negative disables it): it is converted to an absolute monotonic instant
+    at entry and threaded through the store read, extraction, urgency
+    annotation and submits, so one hung leg can never leave an operator's
+    piped CLI waiting forever. Past the deadline the run stops cleanly:
+    extraction reports ``model_unavailable``/``run_cancelled``, items not
+    yet filed report ``failed`` with code ``run_cancelled``, and labels not
+    yet earned are simply absent.
+
+    ``near_dupe_similarity`` (0 disables) flags rewordings the exact
+    first-line match cannot see: an item within (similarity, 1) token-set
+    similarity of a filed first line is still FILED — the store's key only
+    dedupes exact content — but its row carries
+    ``near_dupe_meta_task_id``/``near_dupe_first`` so an operator can see
+    what the paraphrase defense missed. When the comparison would probe
+    more than NEAR_DUPE_PROBE_LIMIT store rows it is skipped: the flag is
+    an observability aid, never a hot-path tax on a large shared worklist."""
+    started = time.monotonic()
+    deadline = started + run_deadline if run_deadline and run_deadline > 0 else None
+    if deadline is not None and time.monotonic() - started >= run_deadline:
+        # the budget was spent before the run began (a misconfigured bound):
+        # not one store call, not one model call — the run says so
+        return {"status": "model_unavailable", "submitted": [], "existing": [],
+                "failed": [], "reason": "run_cancelled"}
+
+    def _remaining(default):
+        if deadline is None:
+            return default
+        return max(0.0, deadline - time.monotonic())
+
     clipped = clip(text, max_chars)
-    existing = existing_contents(call_covey)
+    existing = existing_contents(call_covey, deadline=deadline)
     grounded = []
     if grounding_max > 0 and existing:
         # a prompt-budget view only: newest filed lines first, undated last;
@@ -533,8 +651,10 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
         items, reason = extractor(clipped)
     else:
         items, reason = extract(clipped, endpoint=endpoint,
-                                model=model, api_key=api_key, timeout=timeout,
-                                max_items=max_items, existing=grounded)
+                                model=model, api_key=api_key,
+                                timeout=min(timeout, _remaining(timeout)),
+                                max_items=max_items, existing=grounded,
+                                deadline=deadline)
     if reason == "not_configured":
         return {"status": "not_configured", "submitted": [], "existing": [],
                 "failed": [], "reason": reason}
@@ -549,6 +669,11 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
         return {"status": "store_unavailable", "submitted": [], "existing": [],
                 "failed": [], "reason": session_reason}
     fresh, dupes = [], []
+    # the near-dupe flag compares against the SAME paged read as the strict
+    # dedupe; beyond the probe cap it is skipped — an observability aid is
+    # never allowed to become a hot-path tax on a large shared worklist
+    probe = (existing if near_dupe_similarity and 0 < near_dupe_similarity < 1.0
+             and len(existing) <= NEAR_DUPE_PROBE_LIMIT else None)
     for item in items:
         content = item["content"] if isinstance(item, dict) else item
         urgency = item.get("urgency") if isinstance(item, dict) else None
@@ -559,11 +684,17 @@ def ingest(text, *, source, endpoint, model, api_key, timeout, max_chars,
                           "urgency": urgency, "due": due,
                           "matched_meta_task_id": matched.get("meta_task_id")})
         else:
+            if probe is not None:
+                near = _closest_filed(content, probe, near_dupe_similarity)
+                if near is not None:
+                    item["near_dupe_meta_task_id"] = near.get("meta_task_id")
+                    item["near_dupe_first"] = near["first"]
             fresh.append(item)
     annotate_urgency(fresh, classifier_endpoint=classifier_endpoint or endpoint,
-                     model=model, api_key=api_key, timeout=classifier_timeout,
-                     classifier=classifier)
-    outcome = submit_items(fresh, source, token, call_covey)
+                     model=model, api_key=api_key,
+                     timeout=min(classifier_timeout, _remaining(classifier_timeout)),
+                     classifier=classifier, deadline=deadline)
+    outcome = submit_items(fresh, source, token, call_covey, deadline=deadline)
     # a store-side key conflict (a concurrent run filed the same work) is
     # existing work, not a failure — same row shape as the first-line matches
     dupes += [{"content": row["content"], "key": row["key"],
