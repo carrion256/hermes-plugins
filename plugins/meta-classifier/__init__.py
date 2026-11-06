@@ -686,6 +686,9 @@ def register(ctx):
     tiers = schemas.RISK_SCALES.get(scale) or schemas.RISK_SCALES["jev"]
     scale = scale if scale in schemas.RISK_SCALES else "jev"
     approve_from = str(ctx.get_config("approve_from", "high") or "high").lower()
+    # "never": the top tier is still classified and recorded as a shadow verdict, but no
+    # approval is ever minted for it -- the risk gate becomes flag-and-record only.
+    ask_human = approve_from != "never"
     approve_index = tiers.index(approve_from) if approve_from in tiers else len(tiers) - 1
     risk_schema = schemas.risk_schema(scale)
     transcript_chars = int(ctx.get_config("transcript_chars", 4000) or 0)
@@ -932,6 +935,12 @@ def register(ctx):
         # records nothing -- an unpairable row would only dilute the evidence. When the shield
         # owns this approval (its warning rode along in the message) the key is still ours.
         shadow.verdict(RISK_DECISION, rule_key, _digest(state_text), tier, {"scale": scale})
+        if not ask_human:
+            # Nothing will answer, so there is nothing to track; the shield keeps its own say.
+            if shield_result and shield_result.get("action"):
+                return shield_result
+            return {"risk_review": {"status": "recorded", "reason": "approve_from_never",
+                                    "screened": True, "riskLevel": tier, "scale": scale}}
         shadow.track(rule_key, RISK_DECISION, rule_key)
         directive = {"action": "block" if policy() == "deny" else "approve", "message": message,
                      "rule_key": rule_key}
@@ -1158,5 +1167,6 @@ def register(ctx):
         help="Replay droid's captured classifier payloads or labelled cases (dry run, or --run against the service).",
         setup_fn=replay_setup, handler_fn=replay_handler)
     logger.info("meta-classifier: risk scale %s (approve from %s), shield %s, signals %s, addons %s",
-                scale, tiers[approve_index], bool(ctx.get_config("shield", True)), sorted(triggers()),
+                scale, tiers[approve_index] if ask_human else "never",
+                bool(ctx.get_config("shield", True)), sorted(triggers()),
                 sorted(enabled_addons))

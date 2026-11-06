@@ -623,6 +623,25 @@ def test_an_unrelated_approval_writes_nothing(load_plugin, classifier_stub, tmp_
     assert len(view.unpaired_verdicts) == 1 and view.pairs == () and view.unpaired_outcomes == ()
 
 
+def test_approve_from_never_records_the_verdict_but_mints_no_approval(load_plugin, classifier_stub,
+                                                                        tmp_path):
+    """Flag-and-record: the top tier is still a shadow row, but the call carries no
+    directive, so the host never prompts; a later approval answer has nothing to join."""
+    h = setup(load_plugin, classifier_stub, {"riskLevel": {"riskLevel": "high"}},
+              approve_from="never")
+    workspace_for("t-never", tmp_path)
+    result, = screen(h, "t-never", "terminal", {"command": "rm -rf build"})
+    assert "action" not in result and "rule_key" not in result
+    assert result["risk_review"] == {"status": "recorded", "reason": "approve_from_never",
+                                     "screened": True, "riskLevel": "high", "scale": "jev"}
+    (row,) = shadow_rows(load_plugin, h, RISK).unpaired_verdicts
+    assert row.verdict == "high" and row.key.startswith("meta-classifier:terminal:")
+    h.hook("post_approval_response", pattern_key=f"plugin_rule:{row.key}", command="rm -rf build",
+           choice="once", decided_by="user", surface="cli")
+    view = shadow_rows(load_plugin, h, RISK)
+    assert len(view.unpaired_verdicts) == 1 and view.pairs == () and view.unpaired_outcomes == ()
+
+
 def test_shield_verdict_is_recorded_for_a_blocked_and_a_clean_screen(load_plugin, classifier_stub,
                                                                      tmp_path):
     """Both halves of the screen are evidence: a blocked commit and a commit the shield

@@ -34,7 +34,7 @@ config_schema:
   approve_from:
     type: str
     default: "high"
-    description: "Lowest tier on the chosen scale that requires approval (or blocks under policy deny)."
+    description: "Lowest tier on the chosen scale that requires approval (or blocks under policy deny). 'never' = the top tier is still classified and recorded as a shadow verdict but no approval is ever requested (flag-and-record only; the shield keeps its own prompts)."
   transcript_chars:
     type: int
     default: 4000
