@@ -2,7 +2,7 @@
 
 subagent_start fires with parent_session_id/child_session_id/child_goal.
 We capture the child's goal and start classification (simple | complex)
-against the self-hosted classifier in a BOUNDED background worker — the
+against the shared classifier-core client in a BOUNDED background worker — the
 child launch critical path performs no classifier I/O and never waits.
 The plugin RECORDS only: the verdict, the suggested effort, and the
 child's actual runtime origin (reasoning_config/model/provider/api_mode)
@@ -43,18 +43,29 @@ Durable: verdicts/evidence persist as bounded rows in the plugin's own
 profile-scoped ctx.state so summaries survive gateway restarts; a row still
 pending after a restart is honestly marked unavailable/interrupted — its
 classifier died with the previous process.
+
+Evidence producer: every classified child and every observed outcome is also
+written to the shared shadow-gate ledger as the subagent_effort.difficulty
+decision (verdict row, then outcome row under the same key), which is what
+lets that plugin decide promotion. The plugin writes rows only; policy stays
+with shadow-gate, and a missing ledger is counted in the command note rather
+than raised into the child's path.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import logging
-import os
+import sys
 import threading
-import urllib.error
-import urllib.request
 import time
+from collections.abc import Callable, Mapping
 from contextvars import copy_context
+from pathlib import Path
+from types import ModuleType
+from typing import Final, Literal, Protocol, cast
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +79,214 @@ _BOOKKEEPING_INTERVAL = 30
 # unbounded thread/queue growth per child, and the child-launch hook path
 # NEVER blocks on classifier I/O. Overflow fails open (reason overloaded).
 _MAX_CLASSIFIERS = 4
+# The classifier's fixed wait: this plugin asks on a bounded daemon worker off the
+# child-launch path, so the request never races a user-facing deadline. classifier-core
+# computes the same payload-shaped budget for callers that have none; this one is explicit.
+_CLASSIFY_TIMEOUT: Final = 10.0
+_CLASSIFIER_MODULE_KEY: Final = "hermes_plugins_classifier_core"
+_CLASSIFIER_PLUGIN: Final = "classifier-core"
+_CLASSIFIER_CLIENT_PATH: Final = (
+    Path(__file__).resolve().parent.parent / "classifier-core" / "client.py")
+_CALLER: Final = "subagent-effort"
+
+# The shadow-gate decision this plugin produces. Producers only write rows; the
+# promotion policy for this name belongs to the shadow-gate plugin's own config.
+_SHADOW_MODULE_KEY: Final = "hermes_plugins_shadow_gate"
+_SHADOW_PLUGIN: Final = "shadow-gate"
+_SHADOW_LEDGER_PATH: Final = (
+    Path(__file__).resolve().parent.parent / "shadow-gate" / "ledger.py")
+_DECISION: Final = "subagent_effort.difficulty"
+# meta values are strings on the wire; a verification blob is bounded, never unbounded.
+_MAX_META_CHARS: Final = 2000
+
+RealizedOutcome = Literal["needed_high", "needed_low", "unknown"]
+# The lifecycle facts Hermes reports for a child, split the way the evaluator reads
+# them: an observed failure is evidence high effort was warranted, an observed success
+# with no rework signal is evidence it was not, and anything else is unproven.
+_SUCCESS_STATUSES: Final[frozenset[str]] = frozenset(
+    {"completed", "complete", "done", "ok", "success", "succeeded"})
+_FAILURE_STATUSES: Final[frozenset[str]] = frozenset(
+    {"aborted", "aborted_by_user", "canceled", "cancelled", "error", "errored",
+     "failure", "failed", "incomplete", "killed", "timeout", "timed_out"})
+_MAX_REPAIR_CYCLES: Final = 1
+
+
+class _Transport(Protocol):
+    """The one classifier-core call this plugin makes; injected, never built here."""
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object] | None: ...
+
+
+class _SettingsClass(Protocol):
+    """``ClassifierSettings`` as this consumer sees it: parsed once, at register."""
+
+    def from_config(self, get_config: Callable[[str, object], object]) -> object: ...
+
+
+class _ClientModule(Protocol):
+    """The surface of classifier-core's ``client.py`` this plugin depends on."""
+
+    ClassifierSettings: _SettingsClass
+
+    def shared_client(self, settings: object) -> _Transport: ...
+
+
+class _Ledger(Protocol):
+    """The two shadow-gate appends this plugin performs; rows only, never policy."""
+
+    def record_verdict(self, decision: str, key: str, input_digest: str, verdict: str, *,
+                       meta: Mapping[str, str] | None = None) -> object: ...
+
+    def record_outcome(self, decision: str, key: str, outcome: str, *,
+                       meta: Mapping[str, str] | None = None) -> object: ...
+
+
+class _LedgerModule(Protocol):
+    """The surface of shadow-gate's ``ledger.py`` this producer depends on."""
+
+    def shared_ledger(self, root: Path) -> _Ledger: ...
+
+
+def _path_load(module_key: str, path: Path, consumer: str) -> ModuleType | None:
+    """Load one sibling module by path, preferring the process-wide registration.
+
+    A second copy of either sibling would fork its shared state (a second breaker, a
+    second ledger row cache), so a module already registered under ``module_key`` --
+    which each sibling does itself at import -- is reused verbatim. ``sys.modules`` is
+    populated BEFORE execution because a frozen dataclass resolves its string
+    annotations through that entry. An absent or broken sibling is ``None`` and a
+    counted, logged degradation; it never crashes at register.
+    """
+    shared = sys.modules.get(module_key)
+    if isinstance(shared, ModuleType):
+        return shared
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(module_key, path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_key] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:  # narrow: degraded
+        sys.modules.pop(module_key, None)  # never share a half-built module
+        logger.warning("subagent-effort: %s failed to load (%s: %s)", consumer,
+                       type(exc).__name__, exc, exc_info=True)
+        return None
+    return module
+
+
+def _classifier_config() -> Callable[[str, object], object]:
+    """classifier-core's own settings reader; this plugin has no transport settings."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    config = load_config_readonly()
+
+    def reader(key: str, default: object) -> object:
+        return cfg_get(config, "plugins", "entries", _CLASSIFIER_PLUGIN, "settings",
+                       key, default=default)
+
+    return reader
+
+
+def _shared_client() -> _Transport | None:
+    """The shared classifier client, or ``None``: every child then stays honestly unavailable."""
+    module = _path_load(_CLASSIFIER_MODULE_KEY, _CLASSIFIER_CLIENT_PATH, _CLASSIFIER_PLUGIN)
+    if module is None:
+        logger.warning("subagent-effort: sibling plugin %s is unavailable (%s); every "
+                       "classification is recorded unavailable", _CLASSIFIER_PLUGIN,
+                       _CLASSIFIER_CLIENT_PATH)
+        return None
+    try:
+        client = cast(_ClientModule, module).shared_client(
+            cast(_ClientModule, module).ClassifierSettings.from_config(_classifier_config()))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:  # narrow
+        logger.warning("subagent-effort: classifier-core settings are unusable (%s: %s); "
+                       "every classification is recorded unavailable", type(exc).__name__,
+                       exc, exc_info=True)
+        return None
+    return client
+
+
+def _ledger_config() -> Path:
+    """shadow-gate's configured root, or the default that plugin itself documents."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+    from hermes_constants import get_hermes_home
+
+    configured = ""
+    try:
+        raw = cfg_get(load_config_readonly(), "plugins", "entries", _SHADOW_PLUGIN,
+                      "settings", "ledger_dir", default="")
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:  # narrow: use default
+        logger.warning("subagent-effort: shadow-gate ledger_dir unreadable (%s: %s); "
+                       "using the default root", type(exc).__name__, exc, exc_info=True)
+    else:
+        configured = raw.strip() if isinstance(raw, str) else ""
+    if configured:
+        return Path(configured).expanduser()
+    return Path(get_hermes_home()) / "plugin-data" / _SHADOW_PLUGIN
+
+
+def _shared_ledger() -> _Ledger | None:
+    """The shared shadow-gate ledger, or ``None``: writes then count as ledger_unavailable."""
+    module = _path_load(_SHADOW_MODULE_KEY, _SHADOW_LEDGER_PATH, _SHADOW_PLUGIN)
+    if module is None:
+        return None
+    try:
+        ledger = cast(_LedgerModule, module).shared_ledger(_ledger_config())
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:  # narrow: degraded
+        logger.warning("subagent-effort: shadow-gate ledger is unusable (%s: %s); rows "
+                       "will be counted as ledger_unavailable", type(exc).__name__, exc,
+                       exc_info=True)
+        return None
+    return ledger
+
+
+def realized_outcome(row: Mapping[str, object]) -> RealizedOutcome:
+    """Whether the child's realized work warranted the higher effort, as a ledger outcome.
+
+    Ported from the rule ``evaluation/evaluate_shadow.py::aggregate`` applies to decide
+    whether high effort paid off (that function's lines 159-201): a case counts toward
+    correctness only when ``correct is True`` (line 171), and its corrective cycles are
+    summed only over rows whose verification was observable (lines 173-177: "Zero rework
+    counts are meaningful only when verification was observable"). The evaluator
+    therefore treats an unobserved rework signal as no evidence of rework -- never as
+    proof against it -- which is the posture kept here.
+
+    The three signals, read from one shadow row: ``status`` (an observed failure means
+    high effort was warranted; an observed success with no other signal means it was
+    not); ``repair_cycles`` -- the count the evaluator sums as
+    ``verified_corrective_revisions`` (evaluate_shadow.py:177) when a producer can
+    observe it; this plugin cannot, because the native
+    ``agent.verification_evidence.verification_status`` report carries no revision
+    counts, so it passes none and a row without the key holds no repair evidence; and
+    ``repeated_mutation_targets``, this plugin's own rework proxy. A status that is
+    neither an observed failure nor an observed success is ``unknown``, never a guess.
+    """
+    status = row.get("status")
+    observed = status.strip().lower() if isinstance(status, str) else ""
+    targets = row.get("repeated_mutation_targets")
+    repeated = len(targets) if isinstance(targets, (list, tuple)) else 0
+    repairs = row.get("repair_cycles")
+    cycles = repairs if isinstance(repairs, int) and not isinstance(repairs, bool) else 0
+    if observed in _FAILURE_STATUSES or repeated > 0 or cycles > _MAX_REPAIR_CYCLES:
+        return "needed_high"
+    if observed in _SUCCESS_STATUSES:
+        return "needed_low"
+    return "unknown"
 
 
 def register(ctx) -> None:
-    endpoint = (ctx.get_config("endpoint", "http://127.0.0.1:8102") or "").rstrip("/")
-    model = str(ctx.get_config("served_model", "qwen3.8-flash-next") or "qwen3.8-flash-next")
-    api_key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
     low = ctx.get_config("low_effort", "low")
     high = ctx.get_config("high_effort", "high")
+    # Both shared modules are resolved once, here; either being absent is a counted,
+    # visible degradation (an unavailable classification, a ledger_unavailable note),
+    # never an exception and never a silent shadow.
+    client = _shared_client()
+    ledger = _shared_ledger()
+    ledger_counts = {"recorded": 0, "ledger_unavailable": 0}
 
     from hermes_constants import parse_reasoning_effort
 
@@ -154,25 +365,18 @@ def register(ctx) -> None:
     closed = False
 
     def classify(goal: str) -> str | None:
-        key = os.environ.get(api_key_env or "", "")
-        if config_error or not key or not endpoint or not goal:
+        """One difficulty question through the shared client; ``None`` abstains."""
+        if config_error or client is None or not goal:
             return None
-        body = json.dumps({"model": model, "state": goal[:100000],
-                           "questions": {"difficulty": {
-                               "type": "choice", "criteria": _DIFFICULTY_CRITERIA}}}).encode()
-        req = urllib.request.Request(
-            f"{endpoint}/v1/systemone", data=body,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            answers = data.get("answers") if isinstance(data, dict) else None
-            answer = answers.get("difficulty") if isinstance(answers, dict) else None
-            v = answer.get("choice") if isinstance(answer, dict) else None
-            return v if v in ("simple", "complex") else None
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
-            return None
+        questions: dict[str, object] = {
+            "difficulty": {"type": "choice", "criteria": _DIFFICULTY_CRITERIA},
+        }
+        data = client.ask(goal[:100000], questions, caller=_CALLER,
+                          timeout=_CLASSIFY_TIMEOUT)
+        answers = data.get("answers") if isinstance(data, dict) else None
+        answer = answers.get("difficulty") if isinstance(answers, dict) else None
+        choice = answer.get("choice") if isinstance(answer, dict) else None
+        return choice if choice in ("simple", "complex") else None
 
     def _supported_efforts(provider: str, model: str):
         """Native capability tri-state for the child's actual route (None = unknown)."""
@@ -192,7 +396,49 @@ def register(ctx) -> None:
         except Exception:
             return None
 
-    def _apply_verdict(rec: dict, value, reason) -> None:
+    def _meta(value: object) -> str:
+        """One meta value as the ledger requires it: a bounded string, never an object."""
+        if value is None:
+            return "unknown"
+        text = value if isinstance(value, str) else json.dumps(
+            value, sort_keys=True, ensure_ascii=False, default=str)
+        return text[:_MAX_META_CHARS]
+
+    def _record(kind: str, write: Callable[[_Ledger], object]) -> None:
+        # Boundary observer: a shadow-gate row is evidence, never a feature. A missing
+        # or failing ledger is logged and COUNTED (it surfaces in the subagent_effort
+        # command's note); it never raises into the child's own path.
+        if ledger is None:
+            ledger_counts["ledger_unavailable"] += 1
+            return
+        try:
+            write(ledger)
+        except Exception:  # boundary: an unusable ledger must not fail the child
+            logger.warning("subagent-effort: shadow-gate %s row could not be recorded",
+                           kind, exc_info=True)
+            ledger_counts["ledger_unavailable"] += 1
+            return
+        ledger_counts["recorded"] += 1
+
+    def _record_verdict_row(child_session_id: str, goal: str, verdict: str,
+                            rec: Mapping[str, object]) -> None:
+        """One completed classification as a verdict row for shadow-gate's promotion report."""
+        digest = hashlib.sha256(goal.encode("utf-8")).hexdigest()[:16]
+        _record("verdict", lambda active: active.record_verdict(
+            _DECISION, child_session_id, digest, verdict,
+            meta={"suggested_effort": _meta(rec.get("suggested_effort")),
+                  "clamped_effort": _meta(rec.get("clamped_effort"))}))
+
+    def _record_outcome_row(child_session_id: str, outcome: Mapping[str, object]) -> None:
+        """The realized outcome for a verdict key, joined later by shadow-gate."""
+        _record("outcome", lambda active: active.record_outcome(
+            _DECISION, child_session_id, realized_outcome(outcome),
+            meta={"status": _meta(outcome.get("status")),
+                  "repeated_mutation_targets": _meta(outcome.get("repeated_mutation_targets")),
+                  "verification": _meta(outcome.get("verification"))}))
+
+    def _apply_verdict(rec: dict, value, reason, child_session_id: str = "",
+                       goal: str = "") -> None:
         from agent.reasoning_effort import clamp_effort
         # caller holds _lock. Honest, bounded enrichment of a RETAINED row:
         # never resurrects live usage/session bookkeeping.
@@ -211,9 +457,14 @@ def register(ctx) -> None:
             clamped = (clamp_effort(rec["suggested_effort"], supported)
                        if supported != "unknown" else None)
             rec["clamped_effort"] = clamped if clamped is not None else "unknown"
+        if child_session_id and goal:
+            # The producer side of shadow-gate: one verdict row per COMPLETED
+            # classification, keyed by the child session, so the promotion report can
+            # join it with the outcome row subagent_stop writes.
+            _record_verdict_row(child_session_id, goal, value, rec)
 
     def _finish_classification(child_session_id: str, job: threading.Event,
-                               value, reason: str) -> None:
+                               value, reason: str, goal: str = "") -> None:
         # late completion guard: a settled result may only enrich the row
         # the classifier was started for while the plugin is loaded —
         # never after unload, for a re-registered attempt, or for an
@@ -228,7 +479,7 @@ def register(ctx) -> None:
             job.set()
             rec = verdicts.get(child_session_id)
             if rec is not None:
-                _apply_verdict(rec, value, reason)
+                _apply_verdict(rec, value, reason, child_session_id, goal)
                 persisted = True
         if persisted:
             _persist()
@@ -239,22 +490,24 @@ def register(ctx) -> None:
                            goal: str) -> None:
         # Bounded daemon worker: the child launch path already returned.
         # Scoped context (profile scoping, cwd contextvars) was copied at
-        # submit time; the API key is read here, at call time, and never
-        # stored in rows, logs or results.
+        # submit time; the bearer key is read by the shared client at call time
+        # and never stored in rows, logs or results.
         try:
-            if not endpoint or not goal:
-                value, reason = None, ("not_configured" if not endpoint else "empty_goal")
+            if not goal:
+                value, reason = None, "empty_goal"
+            elif client is None:
+                # No transport at all: the same honest unavailable row as a declined
+                # request, with the reason an operator can act on.
+                value, reason = None, "not_configured"
             else:
                 try:
                     value = classify(goal)
-                except Exception:
+                except Exception:  # boundary: a worker failure becomes a row, never a crash
                     logger.warning("subagent-effort: classifier worker for %s failed",
                                    child_session_id, exc_info=True)
-                    value, reason = None, "error"
+                    value = None
                 reason = None if value else "error"
-                if value is None and not os.environ.get(api_key_env or "", ""):
-                    reason = "not_configured"
-            _finish_classification(child_session_id, job, value, reason)
+            _finish_classification(child_session_id, job, value, reason, goal)
         finally:
             _slots.release()
 
@@ -477,9 +730,15 @@ def register(ctx) -> None:
                    "observed": True}
         if repeated:
             outcome["repeated_mutation_targets"] = repeated
+        held = False
         with _lock:
             if verdicts.get(child_session_id) is rec:
                 rec["outcome"] = outcome
+                held = True
+        if held:
+            # The outcome half of the shadow-gate pair, written only for a row that is
+            # still held: an outcome never outranks a verdict that was evicted.
+            _record_outcome_row(child_session_id, outcome)
         _persist()
 
     _MUTATING_TOOLS = frozenset({"patch", "write_file"})
@@ -579,7 +838,9 @@ def register(ctx) -> None:
                            "classification_state 'pending' means the "
                            "classifier may still enrich this row; "
                            "cost partial/estimated statuses are native "
-                           "accounting provenance, not actual billing"}
+                           "accounting provenance, not actual billing; "
+                           f"shadow-gate rows recorded={ledger_counts['recorded']} "
+                           f"ledger_unavailable={ledger_counts['ledger_unavailable']}"}
         if config_error:
             payload["config_error"] = config_error
         return json.dumps(payload, default=str)

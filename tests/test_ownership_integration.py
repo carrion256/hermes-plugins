@@ -15,29 +15,45 @@ def agent_for(session_id, platform="cli"):
     return agent
 
 
-def classifier(monkeypatch, module, verdict):
-    class Reply:
-        def __enter__(self):
-            return self
-        def __exit__(self, *_args):
-            return False
-        def read(self, size=-1):
-            return json.dumps(verdict).encode()
-    monkeypatch.setenv("AUDIT_CLASSIFIER_KEY", "synthetic-key")
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *_a, **_kw: Reply())
+class _RankingReply:
+    """Answers this plugin's single ranking request with the choice the test chose.
+
+    The shared client is resolved once, at registration, so a test that ranks more than
+    once moves ``choice`` rather than reinstalling the transport.
+    """
+
+    def __init__(self, choice="spaces"):
+        self.choice = choice
+
+    def ask(self, *_args, **_kwargs):
+        index = ["spaces", "tabs"].index(self.choice)
+        return {"answers": {
+            "pick": {"type": "choice", "choice": str(index), "confidence": 0.98,
+                     "probabilities": {str(index): 0.98, str(1 - index): 0.02}},
+            "sound_default": {"type": "noul", "noul": 0.99}}}
 
 
-def recommend_indentation(h, agent, tmp_path, monkeypatch, choice="spaces"):
+def install_ranking(classifier_stub, choice="spaces"):
+    """Install the ranking answer BEFORE the plugin loads; it resolves its client once.
+
+    The dispatch goes through ``control`` at call time on purpose: a test that needs to
+    change something while a request is in flight wraps ``control.ask``, not the client
+    the plugin already captured.
+    """
+    control = _RankingReply(choice)
+    classifier_stub.install(lambda *args, **kwargs: control.ask(*args, **kwargs))
+    return control
+
+
+def recommend_indentation(h, agent, tmp_path, control=None, choice="spaces"):
     from agent.subagent_lifecycle import bind_subagent_parent
     from tools.terminal_tool import record_session_cwd
     record_session_cwd("task", str(tmp_path))
     style = {"spaces": "space", "tabs": "tab"}[choice]
-    (tmp_path / ".editorconfig").write_text(f"root = true\n[*]\nindent_style = {style}\n")
-    index = ["spaces", "tabs"].index(choice)
-    classifier(monkeypatch, h.module, {"answers": {
-        "pick": {"type": "choice", "choice": str(index), "confidence": 0.98,
-                 "probabilities": {str(index): 0.98, str(1 - index): 0.02}},
-        "sound_default": {"type": "noul", "noul": 0.99}}})
+    (tmp_path / ".editorconfig").write_text(f"root = true\n[*]\nindent_style = {style}\n",
+                                            encoding="utf-8")
+    if control is not None:
+        control.choice = choice
     with bind_subagent_parent(agent):
         result = json.loads(h.tool("clarification_defaults", {
             "action": "recommend", "question": "Which indentation?",
@@ -47,15 +63,20 @@ def recommend_indentation(h, agent, tmp_path, monkeypatch, choice="spaces"):
 
 
 @pytest.mark.parametrize("platform", ["cli", "telegram", "subagent"])
-def test_partial_clarification_preserves_human_and_question_identity(load_plugin, monkeypatch, tmp_path, platform):
+def test_partial_clarification_preserves_human_and_question_identity(load_plugin, tmp_path, classifier_stub, platform):
+    from agent.inline_tool_executors import (
+        INLINE_TOOL_EXECUTORS,
+        InlineToolContext,
+        tool_hook_ids,
+    )
     from agent.subagent_lifecycle import bind_subagent_parent
-    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext, tool_hook_ids
     from hermes_cli.middleware import run_tool_execution_middleware
     from tools.clarify_tool import TIMEOUT_RESPONSE
 
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "AUDIT_CLASSIFIER_KEY"})
+    control = install_ranking(classifier_stub)  # installed before the client is resolved
+    h = load_plugin("auto-answer-classifier")
     agent = agent_for("child-or-parent", platform)
-    recommend_indentation(h, agent, tmp_path, monkeypatch)
+    recommend_indentation(h, agent, tmp_path, control)
     question = {"question": "Which indentation?", "choices": ["spaces", "tabs"]}
     # Evidence would select spaces on either row, but a human chose tabs on q0.
     questions = [question, dict(question)]
@@ -82,13 +103,14 @@ def test_partial_clarification_preserves_human_and_question_identity(load_plugin
 
 
 @pytest.mark.parametrize("case", ["foreign", "detached", "interrupted", "approval", "human"])
-def test_clarification_cannot_override_ownership_or_approval(load_plugin, monkeypatch, tmp_path, case):
+def test_clarification_cannot_override_ownership_or_approval(load_plugin, tmp_path, classifier_stub, case):
     from agent.subagent_lifecycle import bind_subagent_parent
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
 
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "AUDIT_CLASSIFIER_KEY"})
+    control = install_ranking(classifier_stub)
+    h = load_plugin("auto-answer-classifier")
     agent = agent_for("owner")
-    recommend_indentation(h, agent, tmp_path, monkeypatch)
+    recommend_indentation(h, agent, tmp_path, control)
     agent._persist_disabled = case == "detached"
     agent._interrupt_requested = case == "interrupted"
     question = "Approve production deployment?" if case == "approval" else "Which indentation?"
@@ -106,21 +128,23 @@ def test_clarification_cannot_override_ownership_or_approval(load_plugin, monkey
     ("session_id", "new-session"), ("_current_turn_id", "new-turn"),
 ])
 @pytest.mark.parametrize("stage", ["clarification", "classification"])
-def test_clarification_rechecks_owner_after_blocking_calls(load_plugin, monkeypatch, tmp_path, field, value, stage):
+def test_clarification_rechecks_owner_after_blocking_calls(load_plugin, monkeypatch, tmp_path, classifier_stub, field, value, stage):
     from agent.subagent_lifecycle import bind_subagent_parent
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
 
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "AUDIT_CLASSIFIER_KEY"})
+    control = install_ranking(classifier_stub)
+    h = load_plugin("auto-answer-classifier")
     owner = agent_for("owner")
     owner._current_turn_id = "original-turn"
-    recommend_indentation(h, owner, tmp_path, monkeypatch)
+    recommend_indentation(h, owner, tmp_path, control)
     args = {"question": "Which indentation?", "choices": ["spaces", "tabs"]}
     raw = clarify_tool(**args, callback=lambda *_a: TIMEOUT_RESPONSE)
-    urlopen = h.module.urllib.request.urlopen
+    asked = control.ask
 
     def classify_after_change(*a, **kw):
+        # the owner changes while the request is in flight, at the transport boundary
         setattr(owner, field, value)
-        return urlopen(*a, **kw)
+        return asked(*a, **kw)
 
     def clarify_after_change(_args):
         if stage == "clarification":
@@ -128,7 +152,7 @@ def test_clarification_rechecks_owner_after_blocking_calls(load_plugin, monkeypa
         return raw
 
     if stage == "classification":
-        monkeypatch.setattr(h.module.urllib.request, "urlopen", classify_after_change)
+        monkeypatch.setattr(control, "ask", classify_after_change)
         with bind_subagent_parent(owner):
             rejected = json.loads(h.tool("clarification_defaults", {
                 "action": "recommend", **args,
@@ -141,16 +165,17 @@ def test_clarification_rechecks_owner_after_blocking_calls(load_plugin, monkeypa
     assert getattr(owner, field) == value  # blocking boundary really ran
 
 
-def test_ranked_dry_run_defaults_never_replace_human_response(load_plugin, monkeypatch, tmp_path):
+def test_ranked_dry_run_defaults_never_replace_human_response(load_plugin, tmp_path, classifier_stub):
     from agent.subagent_lifecycle import bind_subagent_parent
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
 
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "AUDIT_CLASSIFIER_KEY", "dry_run": True})
+    control = install_ranking(classifier_stub)
+    h = load_plugin("auto-answer-classifier", {"dry_run": True})
     args = {"question": "Which indentation?", "choices": ["spaces", "tabs"]}
     raw = clarify_tool(**args, callback=lambda *_a: TIMEOUT_RESPONSE)
     agent = agent_for("owner")
     for choice in ("spaces", "tabs"):
-        recommend_indentation(h, agent, tmp_path, monkeypatch, choice)
+        recommend_indentation(h, agent, tmp_path, control, choice)
         with bind_subagent_parent(agent):
             output = json.loads(h.middleware("tool_execution", tool_name="clarify", args=args,
                                             session_id="owner", task_id="task",
@@ -160,13 +185,14 @@ def test_ranked_dry_run_defaults_never_replace_human_response(load_plugin, monke
         assert output["automatic_answers"][0]["applied"] is False
 
 
-def test_blank_human_skip_is_not_auto_selected(load_plugin, monkeypatch, tmp_path):
+def test_blank_human_skip_is_not_auto_selected(load_plugin, tmp_path, classifier_stub):
     from agent.subagent_lifecycle import bind_subagent_parent
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
 
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "AUDIT_CLASSIFIER_KEY"})
+    control = install_ranking(classifier_stub)
+    h = load_plugin("auto-answer-classifier")
     owner = agent_for("owner")
-    recommend_indentation(h, owner, tmp_path, monkeypatch)
+    recommend_indentation(h, owner, tmp_path, control)
     # Both rows have qualifying evidence: only native timeout provenance,
     # not lack of evidence for the skipped row, may allow the second default.
     question = {"question": "Which indentation?", "choices": ["spaces", "tabs"]}
@@ -193,8 +219,9 @@ def test_blank_human_skip_is_not_auto_selected(load_plugin, monkeypatch, tmp_pat
 
 def test_loop_blocks_own_call_and_never_interrupts_parent(load_plugin):
     import queue
-    from agent.subagent_lifecycle import bind_subagent_parent
+
     from agent.inline_tool_executors import emit_terminal_post_tool_call
+    from agent.subagent_lifecycle import bind_subagent_parent
     from hermes_cli.plugins import get_pre_tool_call_directive
 
     h = load_plugin("loop-guard", {"tool_call_streak": 2})
@@ -241,13 +268,13 @@ def test_progress_polling_final_answer_and_zero_cap_break_loop(load_plugin):
 
 
 @pytest.mark.parametrize("policy,expected", [("ask", "approve"), ("deny", "block")])
-def test_process_mutations_use_native_risk_directives(load_plugin, monkeypatch, policy, expected):
+def test_process_mutations_use_native_risk_directives(load_plugin, classifier_stub, policy, expected):
     from hermes_cli.plugins import get_pre_tool_call_directive
 
-    h = load_plugin("auto-review-classifier", {"policy": policy, "api_key_env": "AUDIT_CLASSIFIER_KEY"})
-    classifier(monkeypatch, h.module, {"answers": {"review": {
+    classifier_stub.install(lambda *_args, **_kwargs: {"answers": {"review": {
         "type": "choice", "choice": "risky", "confidence": 0.97,
         "probabilities": {"risky": 0.97, "safe": 0.03}}}})
+    load_plugin("auto-review-classifier", {"policy": policy})
     for action in ["submit", "write", "kill", "close"]:
         directive, message = get_pre_tool_call_directive("process_manage", {"action":action}, session_id="owner")
         assert directive == expected and "human review" in message

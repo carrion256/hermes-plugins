@@ -88,11 +88,16 @@ These capabilities already exist, so no plan repeats them:
 
 - Deferred tool catalog: native `tool_search`.
 - Explicit model and role routing: `model-routing`.
+- Explicit routing keywords: `keyword-steering`'s `/cheap`, `/deep`, `/local` pin a `model-routing` role for the turn (`source` `turn_pin`, expired with the turn). The explicit counterpart to 27: the user's keyword chooses, never a classifier.
+- Dry turn: `keyword-steering`'s `/dry` declaration plus `meta-classifier`'s `dry_turn` enforcement — deterministic refusal, listed in `steering_status`.
 - Planner-to-executor handoff: `prewalk`.
 - Evidence-bound completion: `continuation`.
+- Rule-file acceptance obligations: `rules` records a matched rule's declared checks; `continuation` holds completion until each ref is bound.
+- Shared classifier client and label store (01's stated dependency, now shipped code): `classifier-core` (one transport and breaker per endpoint, per-caller counters) and `shadow-gate` (append-only verdict/outcome ledgers, explicit promotion policies, NOT_QUALIFIED by default).
 - Tool-call loop detection: `loop-guard`.
 - Scoped rules: `rules`.
 - Browser backend: `browser-bladebro`.
 - Durable worklists: `covey-tasks`.
 - Effort shadowing: `subagent-effort`.
+- Plugin estate health check: `plugins-doctor` (links, settings vs schema, native seams, stale imports).
 - Hosted rooms, Bot Mode, cron, A2A and MCP OAuth: Hermes core.

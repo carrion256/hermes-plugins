@@ -10,25 +10,86 @@ delivered blocks and post_tool_call failures — never raw unredacted text.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
+from typing import Literal, Protocol, TypeAlias
 
 logger = logging.getLogger(__name__)
 
 CATEGORIES = ("tooling", "infra", "docs", "workflow", "model", "other")
 SEVERITIES = ("low", "medium", "high", "blocker")
-_MODES = ("report", "list", "ack", "resolve", "stats")
+_MODES = ("report", "list", "ack", "resolve", "stats", "friction", "drafts")
 AUTO_DAILY_CAP = 20
 PASSTHROUGH_TIMEOUT_SECONDS = 30
+DRAFT_RULE_DIR_DEFAULT = "~/.hermes/rules/drafts"
+DRAFT_RULE_AFTER_DEFAULT = 3
+# Refusals the auto-capture path can give, a subset of the friction module's
+# receipt reasons so a sink can forward them without translation.
+_FileOutcome: TypeAlias = Literal["filed", "quota", "disabled", "error"]
+
+
+class _FrictionEntry(Protocol):
+    """Structural view of ``friction.GateFriction`` (that module is path-loaded)."""
+
+    source: str
+    kind: str
+    identity: str
+    summary: str
+    detail: str
+    session_id: str
+
+
+class _FrictionReceiptLike(Protocol):
+    """Structural view of ``friction.FrictionReceipt``."""
+
+    filed: bool
+    reason: str
+
+
+def _load_sibling(module_name: str, filename: str) -> ModuleType | None:
+    """Load a module that lives beside this plugin, once per process.
+
+    ``sys.modules`` is consulted FIRST: the shared modules register themselves under
+    these names, so a second plugin path-loading the same file joins the SAME sink
+    slot and counters rather than getting a private copy (two sinks = one silently
+    unfilled). An absent or broken sibling is a documented degraded mode — the
+    feature is unavailable — and never a crash at register.
+    """
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parent / filename
+    if not path.is_file():
+        logger.warning("papercuts: %s is not installed; feature unavailable", filename)
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {filename}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module  # visible to nested imports before exec
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - foreign module import: any error is the
+        # documented degraded mode, never a crash at register
+        sys.modules.pop(module_name, None)
+        logger.warning("papercuts: %s unusable (%s)", filename, exc)
+        return None
+    return module
+
 
 
 def _passthrough(argv):
     try:
-        return subprocess.run(argv, timeout=PASSTHROUGH_TIMEOUT_SECONDS).returncode
+        return subprocess.run(argv, timeout=PASSTHROUGH_TIMEOUT_SECONDS,
+                              check=False).returncode  # exit code is the result here
     except subprocess.TimeoutExpired:
         return 124
     except OSError as exc:
@@ -51,7 +112,8 @@ def _supports(binary: str, mode: str, flag: str) -> bool:
     if text is None:
         try:
             proc = subprocess.run([binary, mode, "--help"], capture_output=True,
-                                  text=True, timeout=5)
+                                  text=True, timeout=5,
+                                  check=False)  # exit 2 on unknown flags is an answer, not an error
             text = f"{proc.stdout or ''}{proc.stderr or ''}"
         except (OSError, subprocess.SubprocessError):
             text = ""  # unprobeable: treat as unsupported rather than risk the record
@@ -102,7 +164,21 @@ def _normalize_signature(tool_name: str, rule_key: str | None, origin: str | Non
 def register(ctx) -> None:
     binary = str(ctx.get_config("binary", "/home/common/projects/papercuts/papercuts"))
     auto_capture = bool(ctx.get_config("auto_capture", False))
+    gate_friction = bool(ctx.get_config("gate_friction", False))
+    draft_rules = bool(ctx.get_config("draft_rules", False))
+    raw_threshold = ctx.get_config("draft_rule_after", DRAFT_RULE_AFTER_DEFAULT)
+    raw_draft_dir = str(ctx.get_config("draft_rule_dir", DRAFT_RULE_DIR_DEFAULT) or "").strip()
+    if not raw_draft_dir:
+        raise ValueError("papercuts: draft_rule_dir must be a non-empty path")
+    draft_rule_dir = Path(raw_draft_dir).expanduser()
     state = ctx.state
+    friction = _load_sibling("hermes_plugins_papercuts_friction", "friction.py")
+    drafts = _load_sibling("hermes_plugins_papercuts_drafts", "drafts.py")
+    # One parser lives in drafts.py so every entry point refuses a bad threshold the
+    # same way: a non-integer is a TypeError, an int below 1 a ValueError, both at
+    # register. With the sibling unusable the feature cannot run, so nothing reads it.
+    draft_rule_after = (drafts.parse_threshold(raw_threshold) if drafts is not None
+                        else DRAFT_RULE_AFTER_DEFAULT)
     # Native helper does not recognize bare credential labels ("token <hex>",
     # "secret <hex>"); register additive over-redaction patterns through the
     # sanctioned native API (can only widen masking, never weaken built-ins).
@@ -120,7 +196,8 @@ def register(ctx) -> None:
 
     def _run(argv: list[str], timeout: int = 30) -> dict:
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                                  check=False)  # we read returncode; a nonzero exit is data
         except subprocess.TimeoutExpired:
             return {"success": False, "error": "papercuts timed out"}
         except OSError as exc:
@@ -216,6 +293,14 @@ def register(ctx) -> None:
                 return _err(f"mode {mode} requires id")
             return _forward(mode, [binary, mode, str(pid)])
 
+        if mode == "friction":
+            if friction is None:
+                return _err("gate-friction module unavailable (friction.py unusable)")
+            return json.dumps({"success": True, "mode": mode, **friction.stats()})
+
+        if mode == "drafts":
+            return _drafts_json()
+
         # stats: native recurrence counts only; no invented cost estimates.
         return _forward(mode, [binary, "stats"])
 
@@ -224,6 +309,39 @@ def register(ctx) -> None:
         if result.get("success"):
             result = {**result, "mode": mode}
         return json.dumps(result)
+
+    def _collect_drafts() -> dict[str, object]:
+        """ONE native ``list --json`` call, then write inert rule drafts.
+
+        Returns a JSON-ready result — counts included, so "nothing written" is
+        always distinguishable from "could not run". Raises nothing: a bad payload
+        or an unwritable directory is a reported failure.
+        """
+        if drafts is None:
+            return {"success": False,
+                    "error": "drafts module unavailable (drafts.py unusable)"}
+        if not available():
+            return {"success": False, "error": f"papercuts binary unavailable: {binary}"}
+        if not _supports(binary, "list", "--json"):
+            return {"success": False,
+                    "error": "this papercuts build has no list --json; drafts unavailable"}
+        result = _run([binary, "list", "--json"])
+        if not result.get("success"):
+            return {"success": False,
+                    "error": str(result.get("error", "papercuts list failed"))}
+        try:
+            entries, skipped_rows = drafts.parse_list_rows(result.get("output", ""))
+            report = drafts.emit_drafts(entries, draft_rule_dir, draft_rule_after)
+        except (TypeError, ValueError, OSError) as exc:
+            return {"success": False, "error": f"drafts: {exc}"}
+        return {"success": True,
+                "written": [str(path) for path in report.written],
+                "skipped_existing": report.skipped_existing,
+                "below_threshold": report.below_threshold,
+                "skipped_rows": skipped_rows}
+
+    def _drafts_json() -> str:
+        return json.dumps({**_collect_drafts(), "mode": "drafts"})
 
 
     # ---------------------------------------------------------------- auto capture
@@ -238,6 +356,17 @@ def register(ctx) -> None:
         if not isinstance(counts, dict) or counts.get("day") != day:
             return True
         return int(counts.get("n", 0)) < AUTO_DAILY_CAP
+
+    def _quota_exhausted() -> bool:
+        """Advisory only: is today's auto-capture quota already at the cap?
+
+        It chooses a receipt REASON, never permission — the authoritative check
+        stays inside the transaction in ``_consume_on_filing``."""
+        day = time.strftime("%Y-%m-%d")
+        counts = state.get("auto_capture", {})
+        if not isinstance(counts, dict) or counts.get("day") != day:
+            return False
+        return int(counts.get("n", 0)) >= AUTO_DAILY_CAP
 
     def _consume_on_filing(argv) -> bool:
         """Quota check + native filing + increment run as ONE transaction across
@@ -269,23 +398,60 @@ def register(ctx) -> None:
             return bool(result.get("success"))
 
     def _file_failure(*, category: str, summary: str, signature: str,
-                      snippet: str, repo: str = "") -> None:
+                      snippet: str, repo: str = "") -> _FileOutcome:
+        """File one auto-captured failure, or say WHY it was refused.
+
+        The two observers ignore the result; the gate-friction sink forwards it as
+        the receipt reason, so a refusal is an reported outcome, not a silence.
+        ``"quota"`` is advisory (see ``_quota_exhausted``); permission is always
+        decided inside ``_consume_on_filing``'s transaction."""
         if not _auto_allowed():
-            return
+            return "quota" if _quota_exhausted() else "disabled"
         red_summary = _redact(summary)
         red_snippet = _redact(snippet)
         if red_summary is None or red_snippet is None:
             logger.debug("papercuts auto-capture refused: redaction unavailable")
-            return  # fail closed; never file raw
+            return "error"  # fail closed; never file raw
         argv = [binary, "report", "--category", category, "--severity", "low",
                 "--summary", red_summary, "--blame", signature,
                 "--snippet", red_snippet]
         if repo:
             red_repo = _redact(repo)
             if red_repo is None:
-                return
+                return "error"
             argv += ["--repo", red_repo]
-        _consume_on_filing(argv)
+        if _consume_on_filing(argv):
+            return "filed"
+        return "quota" if _quota_exhausted() else "error"
+
+    def _make_friction_sink(
+        receipt_cls: Callable[[bool, str], _FrictionReceiptLike],
+    ) -> Callable[[_FrictionEntry], _FrictionReceiptLike]:
+        """Build the gate-friction sink against the shared module's receipt type.
+
+        Filing a gate refusal means filing a workflow papercut through the SAME
+        redaction and cross-process quota transaction as auto-capture. The blame
+        signature is the caller's own identity, so a gate that fires a hundred
+        times stays one record with a recurrence count."""
+        def _sink(entry: _FrictionEntry) -> _FrictionReceiptLike:
+            outcome = _file_failure(
+                category="workflow",
+                summary=entry.summary,
+                signature=_normalize_signature(entry.source, entry.kind,
+                                               entry.identity[:64]),
+                snippet=f"{entry.detail}\nsession: {entry.session_id}"[:2000],
+            )
+            return receipt_cls(outcome == "filed", outcome)
+
+        return _sink
+
+    if friction is not None:
+        # Explicit config decides: disabled means no sink, so a reload cannot leave
+        # a stale closure filing after the operator turned the feature off.
+        if gate_friction:
+            friction.install_sink(_make_friction_sink(friction.FrictionReceipt))
+        else:
+            friction.uninstall_sink()
 
     def on_post_tool_directive(*, tool_name=None, tool_input=None, action=None,
                                delivered=None, directives=None, **_kw) -> None:
@@ -331,6 +497,20 @@ def register(ctx) -> None:
             snippet=text[:2000],
         )
 
+    def on_session_end(**_kw) -> None:
+        """Bounded draft refresh at the session boundary: ONE native ``list --json``
+        call, registered only when ``draft_rules`` is on. Never raises and never
+        prints; the outcome is recorded in plugin state, so a run that wrote
+        nothing is distinguishable from one that could not run."""
+        try:
+            outcome = _collect_drafts()
+        except Exception as exc:  # noqa: BLE001 - observer at a session boundary:
+            # nothing here may raise; the outcome is recorded instead of logged away
+            outcome = {"success": False,
+                       "error": f"drafts: {type(exc).__name__}: {exc}"}
+        state.set("drafts_last", {**outcome,
+                                  "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
     ctx.register_tool(
         name="papercuts",
         toolset="papercuts",
@@ -345,7 +525,11 @@ def register(ctx) -> None:
                 "by actual recurrence, not invented cost estimates. report accepts observed "
                 "time_lost_seconds; list --sort impact ranks by severity, recurrence and "
                 "reported time lost (unknown timing sorts last, never as zero). ack/resolve/stats "
-                "forward natively."
+                "forward natively. friction: counters for the gate-friction sink "
+                "(continuation/loop-guard/chain-compaction refusals) — per source, per "
+                "reason, and whether the sink is installed. drafts: write inert rule "
+                "drafts (enabled: false) for papercuts at or above the configured "
+                "recurrence threshold; never overwrites a draft a human may have edited."
             ),
             "parameters": {
                 "type": "object",
@@ -381,6 +565,9 @@ def register(ctx) -> None:
     )
     ctx.register_hook("post_tool_directive", on_post_tool_directive)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    if draft_rules:
+        # Nothing self-activates: the session-boundary draft run is opt-in config.
+        ctx.register_hook("on_session_end", on_session_end)
     ctx.register_cli_command(
         name="papercuts",
         help="File or triage tool grievances (papercuts).",
@@ -388,5 +575,7 @@ def register(ctx) -> None:
                                               help="native papercuts args, e.g. report --category tooling --severity low --summary x"),
         handler_fn=lambda args: _passthrough([binary, *(args.rest or ["list"])]),
     )
-    logger.info("papercuts: bridge registered -> %s (auto_capture=%s, daily cap %d)",
-                binary, auto_capture, AUTO_DAILY_CAP)
+    logger.info("papercuts: bridge registered -> %s (auto_capture=%s, daily cap %d, "
+                "gate_friction=%s, draft_rules=%s after=%d dir=%s)",
+                binary, auto_capture, AUTO_DAILY_CAP, gate_friction, draft_rules,
+                draft_rule_after, draft_rule_dir)

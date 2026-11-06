@@ -32,6 +32,14 @@ replan (default off) can return the session to the ORIGINAL model AND
 provider once, only with a concrete disconfirmed assumption/check —
 never automatic oscillation. Zero extra LLM calls.
 
+The validated handoff is additionally persisted in this plugin's durable state
+(``handoff:<session_id>``, versioned, with ``recorded_at``) because it is the one
+record a compaction summarises away: the ``post_compaction`` observer arms a single
+re-injection, and the next ``pre_llm_call`` for that session gets the brief back as one
+context block (counted as ``handoff_reinjections`` in prewalk_status, cleared by
+prewalk_reset / on_session_reset / on_session_finalize). A session with no stored brief
+injects nothing, so an unplanned session sees no extra prompt at all.
+
 Session identity follows the native active-agent binding: the turn facade
 binds ``bind_subagent_parent(self)`` around the whole conversation
 (agent/turn_facade.py:128), tool-worker submissions propagate the parent
@@ -46,10 +54,12 @@ map.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import weakref
-import logging
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final
 
 logger = logging.getLogger(__name__)
 NUDGE = (
@@ -64,6 +74,41 @@ NUDGE = (
 
 _HANDOFF_LISTS = ("files", "constraints", "non_goals", "rejected_approaches")
 _OPTIONAL_LISTS = ("falsification_checks", "replan_triggers", "acceptance_ids")
+
+# The compacted brief is exactly what a compaction summarises away, so prewalk keeps one
+# versioned record per session and re-injects it once after a compaction commits.
+HANDOFF_STATE_VERSION: Final = 1
+HANDOFF_CONTEXT_HEADER: Final = "[PREWALK HANDOFF — restored after compaction]\n"
+# Render order: the located evidence first, then the decisions the executor must honour.
+HANDOFF_BRIEF_FIELDS: Final[tuple[tuple[str, str], ...]] = (
+    ("files", "Located evidence"),
+    ("symbols", "Symbols"),
+    ("callers", "Callers"),
+    ("constraints", "Constraints"),
+    ("non_goals", "Non-goals"),
+    ("chosen_approach", "Chosen approach"),
+    ("acceptance_ids", "Acceptance IDs"),
+    ("rule_refs", "Rule references"),
+)
+
+
+def _render_brief(handoff: dict) -> str:
+    """The handoff as a short labelled brief, in ``HANDOFF_BRIEF_FIELDS`` order.
+
+    Pure: empty/missing fields render as nothing, so a brief with no content at all is an
+    empty string and the caller injects nothing rather than a bare header."""
+    lines: list[str] = []
+    for key, label in HANDOFF_BRIEF_FIELDS:
+        value = handoff.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                lines.append(f"{label}: {value.strip()}")
+            continue
+        if isinstance(value, (list, tuple)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            if items:
+                lines.append(f"{label}: {'; '.join(items)}")
+    return "\n".join(lines)
 
 
 def _validate_handoff(args: dict, session_id: str = "",
@@ -206,8 +251,9 @@ def register(ctx) -> None:
     # Operator opt-in only: bounded one-shot replan back to the ORIGINAL
     # model AND provider. Default stays OFF; the handoff itself never oscillates.
     replan_enabled = bool(ctx.get_config("replan_enabled", False))
-    # ponytail: per-process in-memory state; if handoff state ever must
-    # survive restarts, persist per-session rows in the session DB instead.
+    # ponytail: per-process in-memory state for the lane machinery; the validated
+    # handoff alone is durable (ctx.state, below), because it is the one record a
+    # compaction summarises away and the executor cannot reconstruct.
     armed: dict[str, dict] = {}      # session_id -> resolved target while planning
     handed_off: set[str] = set()      # completed the one-way handoff
     nudged: set[str] = set()          # plan nudge already injected (one-shot)
@@ -217,6 +263,65 @@ def register(ctx) -> None:
     session_targets: dict[str, dict] = {}    # session_id -> target used at handoff (status)
     replan_used: set[str] = set()          # bounded: one replan per session, ever
     child_lane: set[str] = set()      # sessions armed via the child (subagent_start) lane
+    reinject_after: set[str] = set()  # armed by post_compaction; consumed by one turn
+    reinjections: dict[str, int] = {}   # session_id -> briefs re-injected (status)
+
+    # -- durable handoff record ------------------------------------------------
+    # One versioned record per session under ``handoff:<session_id>``. Plugin state is a
+    # JSON key/value store with no delete, so clearing writes an explicit null, which
+    # _stored_handoff reads back as "no handoff". Every state fault is logged and
+    # degrades to the in-memory copy — never a silent loss of the brief.
+
+    def _handoff_key(session_id: str) -> str:
+        return f"handoff:{session_id}"
+
+    def _store_handoff(session_id: str, handoff: dict) -> None:
+        record = {"v": HANDOFF_STATE_VERSION,
+                  "recorded_at": datetime.now(UTC).isoformat(),
+                  **handoff}
+        try:
+            ctx.state.set(_handoff_key(session_id), record)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("prewalk: cannot persist the handoff for %s (%s: %s)",
+                           session_id, type(exc).__name__, exc)
+
+    def _stored_handoff(session_id: str) -> dict | None:
+        if not session_id:
+            return None
+        try:
+            record = ctx.state.get(_handoff_key(session_id))
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("prewalk: cannot read the handoff for %s (%s: %s)",
+                           session_id, type(exc).__name__, exc)
+            return None
+        if not isinstance(record, dict) or record.get("v") != HANDOFF_STATE_VERSION:
+            return None  # absent, cleared, or a foreign record version
+        return record
+
+    def _forget_handoff(session_id: str) -> None:
+        if not session_id:
+            return
+        try:
+            ctx.state.set(_handoff_key(session_id), None)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("prewalk: cannot clear the handoff for %s (%s: %s)",
+                           session_id, type(exc).__name__, exc)
+
+    def _move_handoff(origin: str, destination: str) -> None:
+        """Follow a compaction rotation: the transcript moved to ``destination``, so the
+        record the executor still needs must live under the new id."""
+        record = _stored_handoff(origin)
+        if record is None:
+            return
+        _store_handoff(destination, {k: v for k, v in record.items()
+                                     if k not in ("v", "recorded_at")})
+        _forget_handoff(origin)
+
+    def _handoff_for(session_id: str) -> dict | None:
+        """The session's brief: the durable record first, the in-memory copy as the
+        degraded fallback (state unreadable)."""
+        return _stored_handoff(session_id) or ready_handoffs.get(session_id) or None
+
 
     # Live agent object -> session id last seen for it. Compaction rotation
     # (agent/conversation_compression.py) reassigns agent.session_id on the
@@ -291,9 +396,14 @@ def register(ctx) -> None:
             if origin in s:
                 s.discard(origin)
                 s.add(session_id)
-        for d in (ready_handoffs, original_models, original_providers, session_targets):
+        for d in (ready_handoffs, original_models, original_providers, session_targets,
+                  reinjections):
             if origin in d:
                 d[session_id] = d.pop(origin)
+        if origin in reinject_after:
+            reinject_after.discard(origin)
+            reinject_after.add(session_id)
+        _move_handoff(origin, session_id)
         logger.info("prewalk: session %s -> %s (agent rotation); state carried forward",
                     origin, session_id)
 
@@ -307,6 +417,9 @@ def register(ctx) -> None:
         session_targets.pop(session_id, None)
         replan_used.discard(session_id)
         child_lane.discard(session_id)
+        reinject_after.discard(session_id)
+        reinjections.pop(session_id, None)
+        _forget_handoff(session_id)
 
     def prewalk_arm(session_id: str = "", **_kw) -> str:
         _migrate(session_id)
@@ -354,12 +467,17 @@ def register(ctx) -> None:
             state = "inactive"
         target = (armed.get(session_id) or session_targets.get(session_id)
                   or _resolve_target(_bound_agent()))
+        # The brief itself, not a boolean: an operator (and the executor after a
+        # compaction) needs to see what survives. False = no handoff for this session.
+        handoff = _handoff_for(session_id) or False
         return json.dumps({"success": True, "session_id": session_id, "state": state,
                            "target": target["model"] if target else target_model,
                            "target_model": target["model"] if target else target_model,
                            "target_provider": target["provider"] if target else "",
                            "target_source": target["source"] if target else "",
-                           "handoff": bool(ready_handoffs.get(session_id)),
+                           "handoff": handoff,
+                           "handoff_reinjections": reinjections.get(session_id, 0),
+                           "handoff_pending": session_id in reinject_after,
                            "original_model": original_models.get(session_id),
                            "original_provider": original_providers.get(session_id),
                            "replan_available": (bool(replan_enabled)
@@ -490,6 +608,51 @@ def register(ctx) -> None:
             return None
 
         ctx.register_hook("pre_llm_call", nudge)
+
+    # -- the brief survives a compaction --------------------------------------
+    def after_compaction(session_id: str = "", old_session_id: str = "", **_kw):
+        """Observer. The kwargs are the host's own: agent/compaction_events.py
+        ``fire_post_compaction`` passes session_id, old_session_id, kind, reason,
+        before_tokens, after_tokens, messages_removed. A committed compaction has just
+        summarised away the transcript the executor was working from, so arm exactly one
+        re-injection of the stored brief. A rotation moves the transcript to a NEW
+        session id, so the record follows it and only the session that holds the
+        transcript now is armed."""
+        target = session_id or old_session_id
+        if not target:
+            return
+        if old_session_id and old_session_id != target:
+            _move_handoff(old_session_id, target)
+        if _handoff_for(target) is not None:
+            reinject_after.add(target)
+            logger.info("prewalk: armed the handoff re-injection for %s after compaction",
+                        target)
+
+    ctx.register_hook("post_compaction", after_compaction)
+
+    def reinject(session_id: str = "", **_kw):
+        """Re-inject the brief once, on the next turn of the session that was compacted.
+
+        The flag is cleared before anything else can happen, so one compaction buys one
+        injection; a session that was never armed, or whose brief is gone or renders as
+        nothing, injects nothing (fail-open, counted in prewalk_status)."""
+        _migrate(session_id)
+        if session_id not in reinject_after:
+            return None
+        reinject_after.discard(session_id)
+        handoff = _handoff_for(session_id)
+        if handoff is None:
+            return None
+        brief = _render_brief(handoff)
+        if not brief:
+            return None
+        reinjections[session_id] = reinjections.get(session_id, 0) + 1
+        logger.info("prewalk: re-injected the plan handoff for %s after compaction",
+                    session_id)
+        return {"context": HANDOFF_CONTEXT_HEADER + brief}
+
+    ctx.register_hook("pre_llm_call", reinject)
+
     def _switch(session_id: str, reason: str, model: str = "",
                 provider: str = "") -> tuple[bool, str]:
         target = model or target_model
@@ -580,6 +743,9 @@ def register(ctx) -> None:
                                         f"session stays armed"})
         session_targets[session_id] = dict(target)
         ready_handoffs[session_id] = handoff
+        # Durable copy: a compaction can commit between two of the executor's turns and
+        # take the brief with it; after_compaction re-injects it once when it does.
+        _store_handoff(session_id, handoff)
         return json.dumps({"success": True, "handed_off": True,
                            "target": target.get("model") or target_model,
                            "target_provider": target.get("provider", ""),

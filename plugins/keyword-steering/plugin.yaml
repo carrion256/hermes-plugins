@@ -1,6 +1,6 @@
 name: keyword-steering
 version: 0.5.0
-description: "Explicit steering modes plus OMP-compatible built-in magic keywords: ultrathink, orchestrate, workflow — enabled by default, configurable via magic_keywords, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded). Config-defined modes reference skill/rule paths or identifiers as consult pointers (their text is never copied); declared conflicts surface and withhold both sides; everything is inspectable via steering_status. ultrathink requests maximum host reasoning effort via PluginContext.set_turn_reasoning('ultra') when the host provides it, degrading to guidance-only (recorded) otherwise. Common-word keywords orchestrate and workflow need a / or # sigil unless bare: true. Negated and common-word hits are declined deterministically or, with the optional classifier tie-break enabled, judged directive, mention or negated by the self-hosted classifier with native redaction, failing open to decline. Mode refs are resolved at registration; unresolved ones are warned and surfaced. Guidance-only apart from that seam: no messages or tool args are ever rewritten."
+description: "Explicit steering modes plus OMP-compatible built-in magic keywords: ultrathink, orchestrate, workflow, cheap, deep, local, dry — enabled by default, configurable via magic_keywords, activated per user turn on prose triggers (code, quotes, identifier/path contexts excluded). Config-defined modes reference skill/rule paths or identifiers as consult pointers (their text is never copied); declared conflicts surface and withhold both sides; everything is inspectable via steering_status. ultrathink requests maximum host reasoning effort via PluginContext.set_turn_reasoning('ultra') when the host provides it, degrading to guidance-only (recorded) otherwise. Common-word keywords orchestrate, workflow, cheap, deep, local and dry need a / or # sigil unless bare: true. cheap, deep and local each request one model role for the turn through model-routing's pin_turn_role (mapped by routing_keywords); two of them in one turn contradict, so both are withheld; an unconfigured role or an absent model-routing degrades to guidance-only with the reason recorded in steering_status.magic_effects and said in the guidance. dry declares a read-only turn; this plugin only states it, and the guidance says who enforces it — meta-classifier withholds the mutating calls when its dry_turn setting is on, and those calls appear in steering_status.withheld_tool_calls. The turn's activations are held in one process-wide store (turnstate.py, shared with meta-classifier by its sys.modules key) and dropped with the turn. Negated and common-word hits are declined deterministically or, with the optional classifier tie-break enabled, judged directive, mention or negated through the shared classifier-core transport with native redaction, failing open to decline: the service, its key and its outage breaker are classifier-core's, never this plugin's. Mode refs are resolved at registration; unresolved ones are warned and surfaced. Guidance-only apart from the reasoning-effort seam and the model-routing pin request: no messages or tool args are ever rewritten."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -11,6 +11,8 @@ provides_hooks:
   - on_session_reset
   - on_session_finalize
   - agent_loop_stopped
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings and outage breaker; without it the optional tie-break declines every ambiguous hit"
 config_schema:
   modes:
     type: dict
@@ -20,17 +22,20 @@ config_schema:
     type: dict
     default:
       enabled: true
-    description: "Built-in OMP-compatible magic keywords {ultrathink, orchestrate, workflow}, all enabled by default. Mapping of keyword -> boolean or {enabled: bool, bare: bool}, plus optional top-level 'enabled' (default true) applied to every keyword not named explicitly. bare defaults to true for ultrathink and to false for orchestrate and workflow, where a bare match needs a leading / or # sigil (/workflow, #workflow); bare: true restores OMP's bare matching. ultrathink requests maximum reasoning for the turn through the host PluginContext.set_turn_reasoning('ultra') seam and degrades to guidance-only (surfaced in the reminder and steering_status) when the host lacks it; orchestrate steers toward delegation and parallel subagents with batched independent requests; workflow steers toward an explicit plan, then verification, then a closing review. Unknown keyword names, unknown dict keys or non-boolean values fail registration loudly."
+    description: "Built-in OMP-compatible magic keywords {ultrathink, orchestrate, workflow, cheap, deep, local, dry}, all enabled by default. Mapping of keyword -> boolean or {enabled: bool, bare: bool}, plus optional top-level 'enabled' (default true) applied to every keyword not named explicitly. bare defaults to true for ultrathink and to false for orchestrate, workflow, cheap, deep, local and dry, where a bare match needs a leading / or # sigil (/workflow, #cheap, /dry); bare: true restores OMP's bare matching. ultrathink requests maximum reasoning for the turn through the host PluginContext.set_turn_reasoning('ultra') seam and degrades to guidance-only (surfaced in the reminder and steering_status) when the host lacks it; orchestrate steers toward delegation and parallel subagents with batched independent requests; workflow steers toward an explicit plan, then verification, then a closing review. cheap/deep/local each request one model role for the turn through model-routing's turn pin (see 'routing_keywords'); two of them in one turn are contradictory, so both are withheld and the conflict is surfaced. dry declares a read-only turn: this plugin only states it, meta-classifier withholds the mutating calls when its own dry_turn setting is on, and the withheld calls appear in steering_status. Unknown keyword names, unknown dict keys or non-boolean values fail registration loudly."
+  routing_keywords:
+    type: dict
+    default:
+      cheap: cheap
+      deep: deep
+      local: local
+    description: "Where the routing magic keywords send the turn: mapping of keyword (a subset of {cheap, deep, local}) -> model-routing role name. Each entry must name a role matching [a-z][a-z0-9_-]*; a keyword left out keeps its same-name default. When one is active this turn the plugin asks model-routing to pin that role for the session's turn (the explicit user keyword outranks the implicit route; a consumer's own explicit target_model still wins, and the pin expires with the turn). The result is recorded per keyword in steering_status.magic_effects — applied with the model, or declined with reason role_not_configured, or model_routing_unavailable when model-routing is not installed. An unknown keyword, a malformed role name, or a non-mapping value fails registration loudly. Pinning itself is model-routing runtime state and has no settings of its own."
   classifier:
     type: dict
     default:
       enabled: false
-      endpoint: "http://127.0.0.1:8102"
-      served_model: "qwen3.8-flash-next"
-      api_key_env: "CLASSIFIER_API_KEY"
       timeout: 1.5
-      cooldown: 45.0
-    description: "Optional semantic tie-break for ambiguous keyword hits only (a common-word bare hit, or a negation within 3 words). When enabled, the message is redacted with native egress redaction before HTTP POST to endpoint/v1/systemone (the top-level model field carries served_model; the flare engine requires it), and the classifier returns one head steering: directive, mention or negated. The key is read from the environment variable named by api_key_env at call time and never stored. An unavailable classifier declines the ambiguous hit. Deterministic hits never consult it."
+    description: "Optional semantic tie-break for ambiguous keyword hits only (a common-word bare hit, or a negation within 3 words). When enabled, the message is redacted with native egress redaction and only the redacted text is handed to the shared classifier-core transport, which answers one head 'steering': directive, mention or negated. The service itself — endpoint, served model, key environment variable, and the breaker that keeps a dead endpoint from being re-probed — is configured on the classifier-core entry and never duplicated here; timeout is this seam's own wait budget in seconds. An unavailable classifier, a declined request or an answer outside those three labels declines the ambiguous hit. Deterministic hits never consult it."
   ref_roots:
     type: list
     default:

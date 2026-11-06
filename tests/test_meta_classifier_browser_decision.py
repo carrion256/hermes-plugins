@@ -121,37 +121,16 @@ def test_input_validation():
 
 # ---------------------------------------------------- plugin level: one round trip, egress-safe
 
-class Reply:
-    def __init__(self, body):
-        self.body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-    def read(self, size=-1):
-        return json.dumps(self.body).encode()
-
-
-def test_tool_one_round_trip_per_observation(load_plugin, monkeypatch):
-    requests = []
-
-    def fake_urlopen(request, *_a, **_kw):
-        raw = json.loads(request.data)
-        requests.append(raw)
-        if len(requests) == 1:
-            assert "click_target" in raw["questions"] and "type_target" in raw["questions"], \
+def test_tool_one_round_trip_per_observation(load_plugin, classifier_stub):
+    def answer(text, schema, **_kw):
+        if len(stub.calls) == 1:
+            assert "click_target" in schema and "type_target" in schema, \
                 "operation+targets must share ONE request"
-        assert "sk-secret" not in raw["state"]  # egress redaction ran on the table
-        return Reply({"model": "fake", "usage": {}, "answers": {
-            "operation": {"type": "choice", "choice": "click"},
-            "click_target": {"type": "choice", "choice": "1"}}})
+        assert "sk-secret" not in text  # egress redaction ran on the table
+        return {"operation": "click", "click_target": "1"}
 
-    monkeypatch.setenv("META_TEST_KEY", "synthetic-key")
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    h = load_plugin("meta-classifier", {"api_key_env": "META_TEST_KEY"})
+    stub = classifier_stub.install(labels=answer)
+    h = load_plugin("meta-classifier", {})
     elements = [dict(e) for e in ELEMENTS]
     elements[0]["name"] += " sk-ant-ABCDEF0123456789"
     out = json.loads(h.tool("browser_decision", {"goal": "switch to one-way", "elements": elements}))
@@ -162,14 +141,17 @@ def test_tool_one_round_trip_per_observation(load_plugin, monkeypatch):
     off_menu = json.loads(h.tool("browser_decision", {"goal": "switch to one-way",
                                                       "elements": [ELEMENTS[0]]}))
     assert off_menu["success"] is True  # click+1 was valid for THAT table; second request made
-    assert len(requests) == 2
+    assert len(stub.calls) == 2
 
 
-def test_tool_unavailable_is_honest(load_plugin, monkeypatch):
-    from urllib.error import URLError
-    monkeypatch.setenv("META_TEST_KEY", "synthetic-key")
-    monkeypatch.setattr("urllib.request.urlopen",
-                        lambda *a, **k: (_ for _ in ()).throw(URLError("down")))
-    h = load_plugin("meta-classifier", {"api_key_env": "META_TEST_KEY"})
+def test_tool_unavailable_is_honest(load_plugin, classifier_stub):
+    """A transport that answers nothing is reported as what it is: no decision, not a guess.
+
+    The shared client expresses every failure -- no key, a tripped breaker, an unreachable
+    host -- the same way, so one declined request covers all of them here; which reasons it
+    distinguishes internally is classifier-core's own suite to prove.
+    """
+    classifier_stub.install()
+    h = load_plugin("meta-classifier", {})
     out = json.loads(h.tool("browser_decision", {"goal": "g", "elements": ELEMENTS}))
     assert out["success"] is False and out["error"] == "classifier_unavailable"

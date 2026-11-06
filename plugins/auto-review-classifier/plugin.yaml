@@ -6,19 +6,9 @@ manifest_version: 2
 api_version: 1
 provides_hooks:
   - pre_tool_call
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings; without it every call fails open"
 config_schema:
-  endpoint:
-    type: str
-    default: "http://127.0.0.1:8102"
-    description: "Classifier service base URL (GET /health, POST /v1/systemone)."
-  served_model:
-    type: str
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: str
-    default: "CLASSIFIER_API_KEY"
-    description: "Env var holding the Bearer key. Name only — value read at call time, never stored."
   policy:
     type: str
     default: "ask"

@@ -10,6 +10,8 @@ provides_hooks:
   - post_tool_call
 provides_middleware:
   - tool_execution
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings; without it every recommendation abstains"
 config_schema:
   enabled:
     type: bool
@@ -19,18 +21,6 @@ config_schema:
     type: bool
     default: false
     description: "Recommend defaults without applying them or claiming a human answer."
-  endpoint:
-    type: str
-    default: "http://127.0.0.1:8102"
-    description: "Classifier service base URL."
-  served_model:
-    type: str
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: str
-    default: "CLASSIFIER_API_KEY"
-    description: "Bearer-key environment variable name; never a credential value."
   min_sound_default:
     type: float
     default: 0.8

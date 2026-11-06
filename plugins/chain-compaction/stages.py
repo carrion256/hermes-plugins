@@ -14,14 +14,13 @@ Contract the engine enforces around this module:
 """
 from __future__ import annotations
 
+from typing import Final
+
 DEFAULTS = {
     "enabled": True,
-    "pipeline": "prune,clip,drop_stale",
+    "pipeline": "drop_reasoning,prune,clip,drop_stale",
     "target_reduction": 0.25,
     "stage_min_reduction": 0.05,
-    "endpoint": "http://127.0.0.1:8102",
-    "served_model": "qwen3.8-flash-next",
-    "api_key_env": "CLASSIFIER_API_KEY",
     "request_timeout": 20.0,
     "preserve_recent_messages": 6,
     "clip_head_chars": 1200,
@@ -31,6 +30,10 @@ DEFAULTS = {
     # (the service's own choice); higher demands stronger evidence before context goes.
     "drop_confidence": 0.5,
     "prune_defaults": {},
+    # Tool names whose call/result pairs no stage may clip or drop. prewalk_ready carries
+    # the validated plan handoff. Kept in sync with plugin.yaml; the pure stages treat an
+    # absent/empty value as no extra pins, i.e. byte-identical to the previous behaviour.
+    "pinned_tools": ("prewalk_ready",),
     # Proactive mid-session eviction (host turn_preflight seam), same contract as
     # fast-compaction: off / fifo (positional, no classifier call) / classifier
     # (keep/drop pass first, degrades to fifo per-turn).
@@ -73,7 +76,26 @@ def _replace_content(message, text):
     return copy_
 
 
-def _tool_pairs(messages, preserve_recent):
+def _call_name(tool_call: dict) -> str:
+    """Tool name of a call, tolerant of both the OpenAI and the flat shape."""
+    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    return str(fn.get("name") or tool_call.get("name") or "")
+
+
+def pinned_names(cfg) -> frozenset[str]:
+    """Configured tool names no stage may clip or drop.
+
+    An absent/empty value is the empty set, so every stage behaves byte-identically to
+    the version without pins. Names come from a list/tuple/set of strings in config; the
+    engine parses them once at register (pruner.parse_pinned_tools).
+    """
+    raw = (cfg or {}).get("pinned_tools") or ()
+    if isinstance(raw, str):
+        raw = (raw,)
+    return frozenset(name for name in (str(item).strip() for item in raw) if name)
+
+
+def _tool_pairs(messages, preserve_recent, pinned_tools: frozenset[str] = frozenset()):
     """Call-id pairing shared by drop_stale (and mirrors the pruner's contract)."""
     results = {}
     for index, message in enumerate(messages):
@@ -94,7 +116,10 @@ def _tool_pairs(messages, preserve_recent):
                               # (same contract as fast-compaction's pruner)
                               "recent": (index >= recent_start
                                          or (result_index is not None
-                                             and result_index >= recent_start))})
+                                             and result_index >= recent_start)),
+                              # configured tool pin: the pair is the task record, so
+                              # neither clip nor drop_stale may touch it
+                              "pinned": _call_name(tc) in pinned_tools})
     return pairs
 
 
@@ -104,9 +129,16 @@ def stage_clip(messages, cfg, tokens):
     head, trigger = int(cfg["clip_head_chars"]), int(cfg["clip_trigger_chars"])
     if head <= 0 or trigger <= 0:
         raise StageError("clip_disabled")
+    # Configured tool pins survive clip verbatim: an empty pin set protects nothing,
+    # which is exactly the behaviour before the setting existed.
+    protected = {pair["result_index"]
+                 for pair in _tool_pairs(messages, cfg["preserve_recent_messages"],
+                                         pinned_names(cfg))
+                 if pair["pinned"] and pair["result_index"] is not None}
     out, touched, saved_chars = [], 0, 0
-    for message in messages:
-        if isinstance(message, dict) and message.get("role") == "tool":
+    for index, message in enumerate(messages):
+        if (index not in protected and isinstance(message, dict)
+                and message.get("role") == "tool"):
             text = message_text(message.get("content"))
             if len(text) > trigger:
                 note = (f"\n[chain-compaction clip: {len(text) - 2 * head} of "
@@ -126,8 +158,9 @@ def stage_drop_stale(messages, cfg, tokens):
     """Positional fallback when the classifier is down: remove every tool pair older
     than the keep window. Blunter than prune, which is exactly why it is last."""
     keep = max(1, int(cfg["drop_stale_keep_pairs"]))
-    pairs = [p for p in _tool_pairs(messages, cfg["preserve_recent_messages"])
-             if p["result_index"] is not None and not p["recent"]]
+    pairs = [p for p in _tool_pairs(messages, cfg["preserve_recent_messages"],
+                                    pinned_names(cfg))
+             if p["result_index"] is not None and not p["recent"] and not p["pinned"]]
     stale = {p["id"] for p in pairs[:-keep]} if len(pairs) > keep else set()
     if not stale:
         raise StageError("drop_stale_nothing_beyond_window")
@@ -155,6 +188,95 @@ def stage_drop_stale(messages, cfg, tokens):
                  "removed_call_msgs": truncated}
 
 
+# Assistant-side chain-of-thought carriers, read off the host's own replay law:
+#   agent/context_compressor.py:1266,1272 -- _REPLAY_BUDGET_KEYS /
+#       _NEWEST_TURN_ONLY_BUDGET_KEYS = "reasoning", "reasoning_content"; the wire ships
+#       generic thinking keys for the NEWEST turn only, so an older turn's copy is dead
+#       budget that never leaves the process.
+#   agent/message_sanitization.py:662 -- RC, R, RD = "reasoning_content", "reasoning",
+#       "reasoning_details" (REASONING_CARRIERS); these three are the carriers.
+#   agent/agent_runtime_helpers.py:826 and agent/anthropic_message_convert.py:18 --
+#       ordered content blocks of type "thinking" / "reasoning" / "redacted_thinking".
+# Deliberately NOT pruned: "codex_reasoning_items" / "codex_message_items". The host's
+# own _prune_stale_reasoning_replay (agent/context_compressor.py, called from
+# _commit below) keeps per-turn codex items precisely because "a later switch to a route
+# that reads earlier-turn reasoning needs them"; this stage must not undo that.
+# Removing a stale reasoning_content is also safe on the must-echo providers
+# (DeepSeek/Kimi): the request builder re-pads a tool-call turn with " " at build time
+# (agent/chat_completion_helpers.py:1679-1687), so deletion cannot cause an HTTP 400.
+REASONING_FIELDS: Final[tuple[str, ...]] = ("reasoning", "reasoning_content", "reasoning_details")
+THINKING_BLOCK_TYPES: Final[frozenset[str]] = frozenset(("thinking", "reasoning", "redacted_thinking"))
+
+
+def _payload_chars(value) -> int:
+    """Characters of readable text in a reasoning payload (opaque blobs count as their own
+    chars; nothing here is charged for structure)."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_payload_chars(key) + _payload_chars(item)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return sum(_payload_chars(item) for item in value)
+    return 0
+
+
+def _strip_reasoning(message: dict) -> tuple[dict, int] | None:
+    """Copy ``message`` without its reasoning payloads, plus the characters removed.
+
+    Returns ``None`` when the message carried none, so the caller keeps the original
+    object. Visible text (a string ``content``, or non-thinking text blocks) and
+    ``tool_calls`` are never rewritten."""
+    copy_ = dict(message)
+    changed = False
+    removed = 0
+    for field in REASONING_FIELDS:
+        if field in copy_:
+            removed += _payload_chars(copy_.pop(field))
+            changed = True
+    content = copy_.get("content")
+    if isinstance(content, list):
+        def _is_thinking(block) -> bool:
+            return (isinstance(block, dict)
+                    and str(block.get("type") or "").strip().lower() in THINKING_BLOCK_TYPES)
+        kept = [block for block in content if not _is_thinking(block)]
+        if len(kept) != len(content):
+            removed += sum(_payload_chars(block) for block in content if _is_thinking(block))
+            copy_["content"] = kept
+            changed = True
+    if not changed:
+        return None
+    copy_.pop("api_content", None)  # a sidecar would replay the pre-strip bytes
+    return copy_, removed
+
+
+def stage_drop_reasoning(messages, cfg, tokens):
+    """Delete chain-of-thought from assistant turns older than the protected window.
+
+    Pure deletion, the one reduction no other stage can make: reasoning is the largest
+    per-turn payload a reasoning model produces and the only one whose loss cannot change
+    an answer, because the visible text and the tool calls stay byte-identical. Only
+    assistant messages outside the newest ``preserve_recent_messages`` are touched, so the
+    turn the model is still reasoning through survives; user and tool messages are never
+    rewritten."""
+    window_start = len(messages) - max(1, int(cfg["preserve_recent_messages"]))
+    out, touched, saved_chars = [], 0, 0
+    for index, message in enumerate(messages):
+        copy_ = None
+        if index < window_start and isinstance(message, dict) and message.get("role") == "assistant":
+            copy_ = _strip_reasoning(message)
+        if copy_ is None:
+            out.append(message)
+            continue
+        stripped, removed = copy_
+        touched += 1
+        saved_chars += removed
+        out.append(stripped)
+    if not touched:
+        raise StageError("no_reasoning")
+    return out, {"stage": "drop_reasoning", "touched": touched, "chars_saved": saved_chars}
+
+
 def run_stage(name, messages, cfg, tokens):
     """Returns (messages, stats); raises StageError (never any other exception the
     engine cannot treat as a miss) when the stage cannot contribute."""
@@ -164,6 +286,7 @@ def run_stage(name, messages, cfg, tokens):
 
 
 STAGES = {
+    "drop_reasoning": stage_drop_reasoning,
     "clip": stage_clip,
     "drop_stale": stage_drop_stale,
     # "prune" is injected by the engine (needs the classifier client); kept out of

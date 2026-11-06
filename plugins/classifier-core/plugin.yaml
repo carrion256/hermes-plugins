@@ -1,0 +1,53 @@
+name: classifier-core
+version: 0.1.0
+description: "Shared classifier transport for every plugin that asks the /v1/systemone service: one process-wide client per endpoint, so a dead service is discovered once (breaker open -> one half-open probe -> closed) instead of once per plugin. Failures never raise: the caller gets None and the decline reason is counted per caller, visible through the classifier_status tool and the classifier-status command. Registers no hooks and makes no network call at register time."
+author: "hermes-plugins"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - classifier_status
+config_schema:
+  endpoint:
+    type: str
+    default: "http://127.0.0.1:8102"
+    description: "Classifier service base URL (GET /health, POST /v1/systemone). The shared client is keyed by this value."
+  served_model:
+    type: str
+    default: "qwen3.8-flash-next"
+    description: "Model name sent as the top-level `model` field; the flare engine requires it."
+  api_key_env:
+    type: str
+    default: "CLASSIFIER_API_KEY"
+    description: "Env var holding the Bearer key. Name only — the value is read at call time, never stored or logged."
+  timeout_floor:
+    type: float
+    default: 2.5
+    description: "Minimum wait for a small request; the per-character budget below can raise it, never lower it."
+  max_timeout:
+    type: float
+    default: 30.0
+    description: "Ceiling for any computed wait; must not be below timeout_floor."
+  char_seconds:
+    type: float
+    default: 0.00025
+    description: "Seconds of wait budget per character of state (worst measured engine cost plus queueing tail)."
+  cooldown:
+    type: float
+    default: 45.0
+    description: "Declared for consumers that keep their own blackout; the breaker uses breaker_reset."
+  breaker_failures:
+    type: int
+    default: 3
+    description: "Consecutive service errors that open the breaker for every consumer of this endpoint."
+  breaker_reset:
+    type: float
+    default: 60.0
+    description: "Seconds the breaker stays open before exactly one half-open probe is admitted."
+  max_text:
+    type: int
+    default: 100000
+    description: "Service limit on the state field; longer requests are declined as text_limits, never clipped."
+  read_cap:
+    type: int
+    default: 262144
+    description: "Bytes read from a response body before parsing."

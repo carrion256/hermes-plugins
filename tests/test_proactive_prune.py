@@ -36,53 +36,7 @@ chain_mod = _load(PLUGINS / "chain-compaction", "pp_chain", pkg=True)
 
 import sys
 sys.path.insert(0, str(TESTS))
-from test_fast_compaction import (call, msg_assistant, msg_tool, msg_user,  # noqa: E402
-                                  transcript)
-
-
-def _patch_client(monkeypatch, responses):
-    """urlopen stand-in: consumes responses per /v1/systemone call (exceptions raise)."""
-    requests = []
-    it = iter(responses)
-
-    class _Reply:
-        def __init__(self, payload):
-            self._payload = json.dumps(payload).encode()
-
-        def read(self, _n):
-            return self._payload
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def fake_urlopen(request, *_a, **_kw):
-        requests.append(json.loads(request.data.decode()))
-        item = next(it)
-        if isinstance(item, Exception):
-            raise item
-        return _Reply(item)
-
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic-key")
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    return requests
-
-
-def _verdicts(eligible, keep=None, keep_result=None):
-    """Build the /v1/systemone answers envelope for one keep/drop pass
-    (keep/keep_result map call_id -> bool; probabilities agree with the choice)."""
-    keep, keep_result = keep or {}, keep_result or {}
-    out = {}
-    for record in eligible:
-        cid = record["call_id"]
-        for kind, table in (("call", keep), ("result", keep_result)):
-            label = "keep" if table.get(cid) else "drop"
-            out[f"{record['tag']}_{kind}"] = {
-                "type": "choice", "choice": label,
-                "probabilities": {label: 0.9, "drop" if label == "keep" else "keep": 0.1}}
-    return {"model": "fake-classifier", "answers": out}
+from test_fast_compaction import _scripted, _verdicts, transcript  # noqa: E402
 
 
 def _prepare(engine):
@@ -96,8 +50,17 @@ def _prepare(engine):
 # ------------------------------------------------------------ fast-compaction
 
 @pytest.fixture
-def fc_engine(load_plugin, monkeypatch):
-    def make(**over):
+def fc_engine(load_plugin, classifier_stub):
+    """Load the overlay over the shared classifier stub.
+
+    ``make(responses=[...])`` scripts one answer per request; with no script every
+    request is declined, which is the fail-open path the degraded tests need. The
+    recorded transport calls are reachable as ``fc_engine.stub.calls``.
+    """
+    def make(responses=(), **over):
+        stub = (classifier_stub.install(_scripted(responses)) if responses
+                else classifier_stub.install())
+        make.stub = stub
         settings = {"proactive_trigger_tokens": 1000, **over}
         h = load_plugin("fast-compaction", settings)
         from agent.context_engine import ContextEngine
@@ -105,6 +68,7 @@ def fc_engine(load_plugin, monkeypatch):
         engine = get_plugin_context_engine()
         assert isinstance(engine, ContextEngine) and engine.name == "fast-compaction"
         return h, _prepare(engine)
+    make.stub = None
     return make
 
 
@@ -112,28 +76,26 @@ def _status(h):
     return json.loads(h.tool("fast_compaction_status", {}))
 
 
-def test_off_mode_keeps_host_behaviour(fc_engine, monkeypatch):
+def test_off_mode_keeps_host_behaviour(fc_engine):
     # host proactive_prune_tokens is 0 in tests: base returns (messages, 0),
     # no classifier traffic
     h, engine = fc_engine()  # default proactive_prune_mode: off
-    requests = _patch_client(monkeypatch, [])
     msgs = transcript(n_calls=6, result_size=40_000)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
-    assert out is msgs and n == 0 and requests == []
+    assert out is msgs and n == 0 and fc_engine.stub.calls == []
     assert _status(h)["proactive_mode"] == "off"
 
 
-def test_unknown_mode_falls_back_to_off(fc_engine, monkeypatch):
+def test_unknown_mode_falls_back_to_off(fc_engine):
     h, engine = fc_engine(proactive_prune_mode="sideways")
     msgs = transcript(n_calls=6, result_size=40_000)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
-    assert out is msgs and n == 0
+    assert out is msgs and n == 0 and fc_engine.stub.calls == []
     assert _status(h)["proactive_mode"] == "off"
 
 
-def test_fifo_drops_oldest_pairs_with_zero_network(fc_engine, monkeypatch):
+def test_fifo_drops_oldest_pairs_with_zero_network(fc_engine):
     h, engine = fc_engine(proactive_prune_mode="fifo", proactive_target_tokens=25_000)
-    requests = _patch_client(monkeypatch, [])
     msgs = transcript(n_calls=6, result_size=40_000)
     calls = pruner.collect_tool_calls(msgs, 6)
     eligible = sorted(pruner.eligible_calls(calls), key=lambda r: r["assistant_index"])
@@ -141,7 +103,7 @@ def test_fifo_drops_oldest_pairs_with_zero_network(fc_engine, monkeypatch):
 
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert out is not msgs and n == len(eligible)
-    assert requests == []  # the whole point: no classifier traffic
+    assert fc_engine.stub.calls == []  # the whole point: no classifier traffic
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
     for record in eligible:
         assert record["call_id"] not in ids
@@ -153,55 +115,57 @@ def test_fifo_drops_oldest_pairs_with_zero_network(fc_engine, monkeypatch):
     assert after["fifo"] == before["fifo"] + 1 and after["classifier"] == before["classifier"]
 
 
-def test_fifo_stops_at_target_budget(fc_engine, monkeypatch):
+def test_fifo_stops_at_target_budget(fc_engine):
     h, engine = fc_engine(proactive_prune_mode="fifo", proactive_target_tokens=5_000)
-    _patch_client(monkeypatch, [])
     msgs = transcript(n_calls=6, result_size=40_000)  # ~10k tokens per result
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert n == 1  # greedy stops once the estimated reclaim clears the target
     assert len([m for m in out if m.get("role") == "tool"]) == 5
+    assert fc_engine.stub.calls == []
 
 
-def test_reclaim_floor_gates_commit(fc_engine, monkeypatch):
+def test_reclaim_floor_gates_commit(fc_engine):
     # default host floor 4096; a tiny transcript cannot clear it: no-op, input object
     h, engine = fc_engine(proactive_prune_mode="fifo", proactive_target_tokens=10_000)
-    _patch_client(monkeypatch, [])
     engine.proactive_prune_min_reclaim_tokens = 10_000  # raise the floor above what we drop
     msgs = transcript(n_calls=6, result_size=1_000)  # ~250 tokens per pair
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert out is msgs and n == 0
+    assert fc_engine.stub.calls == []
 
 
-def test_rearm_hysteresis_second_call_noops(fc_engine, monkeypatch):
+def test_rearm_hysteresis_second_call_noops(fc_engine):
     h, engine = fc_engine(proactive_prune_mode="fifo", proactive_target_tokens=25_000)
-    _patch_client(monkeypatch, [])
     msgs = transcript(n_calls=6, result_size=40_000)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert n > 0
     # same transcript again, unbilled reading: the regrowth runway must suppress it
     out2, n2 = engine.prune_tool_results_only(out, current_tokens=None)
     assert out2 is out and n2 == 0
+    assert fc_engine.stub.calls == []
 
 
-def test_below_trigger_noops(fc_engine, monkeypatch):
+def test_below_trigger_noops(fc_engine):
     h, engine = fc_engine(proactive_prune_mode="fifo")
-    _patch_client(monkeypatch, [])
     msgs = transcript(n_calls=6, result_size=40_000)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=500)  # < trigger 1000
     assert out is msgs and n == 0
+    assert fc_engine.stub.calls == []
 
 
-def test_classifier_mode_uses_verdicts(fc_engine, monkeypatch):
-    h, engine = fc_engine(proactive_prune_mode="classifier", proactive_target_tokens=25_000)
+def test_classifier_mode_uses_verdicts(fc_engine):
     msgs = transcript(n_calls=6, result_size=40_000)
-    calls = pruner.collect_tool_calls(msgs, 6)
-    eligible = pruner.eligible_calls(calls)
+    eligible = pruner.eligible_calls(pruner.collect_tool_calls(msgs, 6))
     keep_id = eligible[0]["call_id"]
-    requests = _patch_client(monkeypatch, [_verdicts(eligible, {keep_id: True}, {keep_id: True})])
+    verdicts = _verdicts(eligible, {keep_id: True}, {keep_id: True})
+    h, engine = fc_engine(responses=[verdicts],
+                          proactive_prune_mode="classifier", proactive_target_tokens=25_000)
     before = _status(h)["proactive"]
 
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
-    assert len(requests) == 1  # one bounded keep/drop pass
+    assert len(fc_engine.stub.calls) == 1  # one bounded keep/drop pass
+    assert [c["caller"] for c in fc_engine.stub.calls] == ["fast-compaction"]
+    assert [c["method"] for c in fc_engine.stub.calls] == ["ask"]  # never classify()
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
     assert keep_id in ids  # classifier kept it against FIFO's positional order
     for record in eligible[1:]:
@@ -211,17 +175,17 @@ def test_classifier_mode_uses_verdicts(fc_engine, monkeypatch):
     assert after["classifier"] == before["classifier"] + 1
 
 
-def test_classifier_fault_degrades_to_fifo_same_turn(fc_engine, monkeypatch):
-    from urllib.error import URLError
-    h, engine = fc_engine(proactive_prune_mode="classifier", proactive_target_tokens=25_000)
-    _patch_client(monkeypatch, [URLError("connection refused")])
+def test_classifier_fault_degrades_to_fifo_same_turn(fc_engine):
+    # No scripted answer: every request is declined, which is what a dead service looks
+    # like through the shared client. The positional floor still has to clear the turn.
     msgs = transcript(n_calls=6, result_size=40_000)
-    calls = pruner.collect_tool_calls(msgs, 6)
-    eligible = pruner.eligible_calls(calls)
+    eligible = pruner.eligible_calls(pruner.collect_tool_calls(msgs, 6))
+    h, engine = fc_engine(proactive_prune_mode="classifier", proactive_target_tokens=25_000)
     before = _status(h)["proactive"]
 
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert n == len(eligible)  # positional floor still cleared the stale pairs
+    assert len(fc_engine.stub.calls) == 1  # one attempt, then straight to FIFO
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
     assert not any(r["call_id"] in ids for r in eligible)
     after = _status(h)["proactive"]
@@ -231,30 +195,34 @@ def test_classifier_fault_degrades_to_fifo_same_turn(fc_engine, monkeypatch):
 
 # ------------------------------------------------------------ chain-compaction
 
-class _FakePost:
-    """Chain-style client: post_questions(endpoint, api_key_env, text, questions, timeout)."""
+class _FakeAsk:
+    """Stand-in for the shared classifier client, injected straight into the engine.
 
-    def __init__(self, payload_fn):
-        self.payload_fn = payload_fn
-        self.calls = 0
+    Records what the prune stage asked, so a test can pin attribution and the explicit
+    budget without any transport.
+    """
 
-    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
-        self.calls += 1
-        return self.payload_fn(text, questions)
+    def __init__(self, answer_fn):
+        self._answer_fn = answer_fn
+        self.calls: list[dict[str, object]] = []
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object] | None:
+        self.calls.append({"state": state, "questions": questions,
+                           "caller": caller, "timeout": timeout})
+        return self._answer_fn(state, questions)
 
 
-def _chain_engine(monkeypatch, **over):
+def _chain_engine(**over):
     settings = dict(chain_mod.stages.DEFAULTS)
     settings.update({"proactive_trigger_tokens": 1000, **over})
-    fp, cm = chain_mod._load_fast_compaction()
+    fp = chain_mod._load_fast_compaction()
     return chain_mod._engine_class()(settings, fp, None), fp
 
 
-def test_chain_fifo_drops_oldest_with_zero_posts(monkeypatch):
-    engine, fp = _chain_engine(monkeypatch, proactive_prune_mode="fifo",
-                               proactive_target_tokens=25_000)
+def test_chain_fifo_drops_oldest_with_zero_posts():
+    engine, fp = _chain_engine(proactive_prune_mode="fifo", proactive_target_tokens=25_000)
     _prepare(engine)
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic-key")
     msgs = transcript(n_calls=6, result_size=40_000)
     eligible = sorted(fp.eligible_calls(fp.collect_tool_calls(msgs, 6)),
                       key=lambda r: r["assistant_index"])
@@ -265,42 +233,41 @@ def test_chain_fifo_drops_oldest_with_zero_posts(monkeypatch):
     assert engine._cc_client is None  # FIFO must not need the client at all
 
 
-def test_chain_classifier_mode_uses_prune_stage(monkeypatch):
-    engine, fp = _chain_engine(monkeypatch, proactive_prune_mode="classifier",
-                               proactive_target_tokens=25_000)
+def test_chain_classifier_mode_uses_prune_stage():
+    engine, fp = _chain_engine(proactive_prune_mode="classifier", proactive_target_tokens=25_000)
     _prepare(engine)
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic-key")
     msgs = transcript(n_calls=6, result_size=40_000)
     eligible = fp.eligible_calls(fp.collect_tool_calls(msgs, 6))
     keep_id = eligible[0]["call_id"]
     verdicts = _verdicts(eligible, {keep_id: True}, {keep_id: True})
 
-    engine._cc_client = _FakePost(lambda text, questions: verdicts)
+    client = _FakeAsk(lambda state, questions: verdicts)
+    engine._cc_client = client
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
-    assert engine._cc_client.calls == 1
+    assert len(client.calls) == 1
+    assert [c["caller"] for c in client.calls] == ["chain-compaction"]
+    assert all(isinstance(c["timeout"], float) for c in client.calls)  # its own budget
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
     assert keep_id in ids and n == len(eligible) - 1
 
 
-def test_chain_classifier_down_degrades_to_fifo(monkeypatch):
-    engine, fp = _chain_engine(monkeypatch, proactive_prune_mode="classifier",
-                               proactive_target_tokens=25_000)
+def test_chain_classifier_down_degrades_to_fifo():
+    engine, fp = _chain_engine(proactive_prune_mode="classifier", proactive_target_tokens=25_000)
     _prepare(engine)
     msgs = transcript(n_calls=6, result_size=40_000)
     eligible = fp.eligible_calls(fp.collect_tool_calls(msgs, 6))
 
-    def boom(text, questions):
-        return None  # post_questions() returning None == classifier unavailable
-
-    engine._cc_client = _FakePost(boom)
+    client = _FakeAsk(lambda state, questions: None)  # None == service declined the request
+    engine._cc_client = client
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)
     assert n == len(eligible)
+    assert len(client.calls) == 1  # one attempt, no retry loop
     ids = {m.get("tool_call_id") for m in out if m.get("role") == "tool"}
     assert not any(r["call_id"] in ids for r in eligible)
 
 
-def test_chain_off_mode_delegates_to_host(monkeypatch):
-    engine, _ = _chain_engine(monkeypatch)  # default proactive_prune_mode: off
+def test_chain_off_mode_delegates_to_host():
+    engine, _ = _chain_engine()  # default proactive_prune_mode: off
     _prepare(engine)
     msgs = transcript(n_calls=6, result_size=40_000)
     out, n = engine.prune_tool_results_only(msgs, current_tokens=50_000)

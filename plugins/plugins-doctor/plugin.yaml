@@ -1,0 +1,13 @@
+name: plugins-doctor
+version: 0.1.0
+description: "Read-only doctor for the plugin estate: resolves every entry under $HERMES_HOME/plugins (and the active profile's plugins dir) to a plugin.yaml, validates each enabled plugin's settings against its manifest config_schema through the host validator, proves the host seams the README's native-prerequisites list promises, and reports stale imports by comparing live processes' recorded source digests against the bytes on disk. Every verdict is a row (check, plugin, severity, detail) and nothing is repaired, enabled, or rewritten implicitly: the operator decides. Exit status is 1 only when a row is a fail."
+author: "hermes-plugins"
+manifest_version: 2
+api_version: 1
+provides_tools: []
+provides_hooks: []
+config_schema:
+  stale_records_keep:
+    type: int
+    default: 16
+    description: "How many process load-records to keep under plugin-data/plugins-doctor/state.json (newest last, one row per pid; a reload re-snapshots its own pid's row). Each record is written by register(), so every process that loads plugins — the CLI, the gateway, a kanban worker — leaves the sha256 of every plugin entry's *.py and plugin.yaml at import time, which is what lets a later run prove a still-live process holds modules imported before the source changed (nothing hot-reloads). A value that is not a positive integer falls back to 16 with one warning: a doctor that refuses to register reports nothing at all."

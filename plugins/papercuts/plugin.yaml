@@ -1,6 +1,6 @@
 name: papercuts
-version: 0.3.0
-description: "Typed, redacted papercuts reporting: native binary owns dedup/recurrence/status; opt-in auto-capture; typed observed time_lost_seconds and list --sort impact."
+version: 0.4.0
+description: "Typed, redacted papercuts reporting: native binary owns dedup/recurrence/status; opt-in auto-capture; typed observed time_lost_seconds and list --sort impact; opt-in gate-friction sink for other plugins' gate refusals; opt-in inert rule drafts for recurring papercuts."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -9,6 +9,7 @@ provides_tools:
 provides_hooks:
   - post_tool_directive
   - post_tool_call
+  - on_session_end
 external_dependencies:
   - "papercuts binary (default: /home/common/projects/papercuts/papercuts)"
 config_schema:
@@ -20,3 +21,19 @@ config_schema:
     type: bool
     default: false
     description: "Opt-in automatic filing of loop-guard blocks and tool errors (natively deduped, max 20/day)."
+  gate_friction:
+    type: bool
+    default: false
+    description: "Opt-in: install the gate-friction sink so continuation, loop-guard and chain-compaction refusals (reported through plugins/papercuts/friction.py by any plugin, with or without this one enabled) file as workflow papercuts. Filing shares auto_capture's redaction path and its cross-process daily quota, so leave auto_capture on as well; with auto_capture off the sink reports each refusal as 'disabled' in papercuts mode=friction instead of filing it. With this off nothing files and reports are counted as 'no_sink'."
+  draft_rules:
+    type: bool
+    default: false
+    description: "Opt-in: at each session end (on_session_end), make one native 'list --json' call and write inert rule drafts for papercuts at or above draft_rule_after recurrences. The 'drafts' tool mode runs the same step explicitly. Drafts carry enabled: false, so nothing self-activates."
+  draft_rule_after:
+    type: int
+    default: 3
+    description: "Minimum native recurrence count before a papercut becomes a rule draft. Must be an integer >= 1: a non-integer refuses to load the plugin (TypeError), an integer below 1 is refused (ValueError). Never silently replaced by the default."
+  draft_rule_dir:
+    type: str
+    default: "~/.hermes/rules/drafts"
+    description: "Directory for rule drafts; created if missing, never overwritten. It is NOT read as a rule source: the rules plugin scans only the direct *.md files of each configured rule dir (os.listdir, never descending), so a drafts/ subdirectory is inert even if it sits inside a scanned dir. Adopt a draft by moving it into a scanned rules directory, setting enabled: true and adding globs/tools scope."

@@ -1,7 +1,7 @@
 """Browser decision heads ported from browser-use/jev-ultrafast.
 
-One /v1/systemone request carries the operation head plus speculative target heads
-(each containing only compatible elements), exactly like jev-ultrafast's
+One request to the shared classifier endpoint carries the operation head plus speculative
+target heads (each containing only compatible elements), exactly like jev-ultrafast's
 TypeSafe fan-out: two decisions, one round trip. The model never produces
 selectors, coordinates or JavaScript — it picks an observed index or nothing;
 the caller executes through bladebro and verifies the delta itself.

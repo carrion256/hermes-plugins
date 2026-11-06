@@ -2,21 +2,37 @@
 stop, unload/late-result inertness, bounded fail-open overload.
 
 Deterministic throughout: threading.Event park/gate signals, no sleeps, no
-timing thresholds. The classifier HTTP boundary is the fake urlopen
-(socket.connect is blocked repo-wide by conftest); the fake parks INSIDE
-the response-body read, and the test waits until the worker is provably
-parked (Event set) BEFORE releasing it, so 'pending' is observed with
-certainty and 'settled' with equal certainty. Multi-worker tests install
-one per-worker fake, so a parked worker holds its classifier slot while
-the test observes it."""
+timing thresholds. The classifier boundary is the shared client from
+classifier-core, stood in for by conftest's ``classifier_stub`` (no plugin in
+these tests ever reaches a socket). The stand-in parks INSIDE ``ask`` — the
+point where the shared client would be waiting on the service — and the test
+waits until the worker is provably parked (Event set) BEFORE releasing it, so
+'pending' is observed with certainty and 'settled' with equal certainty.
+Multi-worker tests hand out one park per child, so a parked worker holds its
+classifier slot while the test observes it."""
 
+import hashlib
+import importlib.util
 import json
+import sys
 import threading
 from inspect import getclosurevars
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+import yaml
 from agent.subagent_lifecycle import bind_subagent_parent
+
+_LEDGER_PLUGIN = "shadow-gate"
+_LEDGER_FILE = "subagent_effort.difficulty.jsonl"
+_ROW_KEYS = sorted(("child_session_id", "verdict", "suggested_effort", "supported_efforts",
+                    "clamped_effort", "classification_state", "classification_reason",
+                    "child_reasoning_config", "child_model", "child_provider",
+                    "outcome_status", "latency_ms", "repeated_mutation_targets", "usage",
+                    "verification", "outcome_observed"))
+_RAW_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "requests",
+                   "cost_usd", "cost_status", "cost_source")
 
 
 def _internals(h):
@@ -53,34 +69,49 @@ def _rows(h):
             for row in json.loads(h.command("subagent_effort"))["children"]}
 
 
-def _stalled_reply(parked, gate, verdict="complex"):
-    """Fake urlopen result: the response-body read is the stall point —
-    parked.set() proves the worker reached the boundary (and is holding
-    its classifier slot), gate.wait() parks it until the test releases."""
-    class StalledReply:
-        def __enter__(self):
-            return self
+class _StalledClassifier:
+    """The shared client, parked at the point where it would wait on the service.
 
-        def __exit__(self, *exc):
-            return False
+    Each started child takes the next park: ``ask`` sets ``parked`` to prove the worker
+    reached the classifier boundary and is holding its slot, then waits on ``gate``
+    until the test releases it. Parks are handed out in call order, which is the order
+    the test starts children in; a call beyond the parks the test planned for answers
+    at once rather than hanging the suite. ``callers``/``timeouts`` record what the
+    plugin asked with, which is the part of the contract this plugin owns.
+    """
 
-        def read(self):
+    def __init__(self, verdict="complex"):
+        self.verdict = verdict
+        self.callers: list[str] = []
+        self.timeouts: list[float | None] = []
+        self._parks: list[tuple[threading.Event, threading.Event]] = []
+        self._calls = 0
+
+    def park(self):
+        """Reserve the next park; call it before starting the child that will take it."""
+        parked, gate = threading.Event(), threading.Event()
+        self._parks.append((parked, gate))
+        return parked, gate
+
+    def ask(self, state, questions, *, caller, timeout=None):
+        self.callers.append(caller)
+        self.timeouts.append(timeout)
+        if self._calls < len(self._parks):
+            parked, gate = self._parks[self._calls]
+            self._calls += 1
             parked.set()
             gate.wait()
-            return json.dumps({"model": "fake", "usage": {},
-                               "answers": {"difficulty": {"type": "choice",
-                                                          "choice": verdict}}}).encode()
-    return StalledReply()
+        return {"answers": {"difficulty": {"type": "choice", "choice": self.verdict}}}
 
 
-def _install_stalled_fake(monkeypatch):
-    """Install one per-worker stall fake; returns (parked, gate)."""
-    parked, gate = threading.Event(), threading.Event()
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda req, timeout=None: _stalled_reply(parked, gate))
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "test-key")
-    return parked, gate
+def _stalled_classifier(classifier_stub, verdict="complex"):
+    """Install the parking client BEFORE the plugin loads: it resolves its client once.
+
+    Returns the controller; a test takes one ``park()`` per child it starts.
+    """
+    control = _StalledClassifier(verdict)
+    classifier_stub.install(control.ask)
+    return control
 
 
 def _settle(h, timeout=10):
@@ -93,12 +124,13 @@ def _settle(h, timeout=10):
         assert job.wait(timeout), "classifier worker did not settle"
 
 
-def test_stalled_classifier_does_not_block_child_launch(load_plugin, monkeypatch):
+def test_stalled_classifier_does_not_block_child_launch(load_plugin, classifier_stub):
     """The launch path (native invoke_hook) returns before any classifier
-    I/O, and classification stays pending while the classifier is parked
-    inside the response read; releasing it settles the row."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    verdict lands, and classification stays pending while the classifier is
+    parked at the shared client boundary; releasing it settles the row."""
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
+    parked, gate = control.park()
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
            child_goal="complex-marker do work")
     assert parked.wait(timeout=10)  # worker reached the boundary, parked
@@ -112,13 +144,14 @@ def test_stalled_classifier_does_not_block_child_launch(load_plugin, monkeypatch
     assert row["verdict"] == "complex"
 
 
-def test_no_classification_leaves_no_live_bookkeeping(load_plugin, monkeypatch):
+def test_no_classification_leaves_no_live_bookkeeping(load_plugin, classifier_stub):
     """The original bug shape: with the classifier unreachable the stop
     hook used to return early, leaking child_sessions/usage_totals forever.
     Stop must ALWAYS clear them even with the classification never landing."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     internals = _internals(h)
+    parked, gate = control.park()
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
            child_goal="complex-marker do work")
     assert parked.wait(timeout=10)
@@ -135,13 +168,14 @@ def test_no_classification_leaves_no_live_bookkeeping(load_plugin, monkeypatch):
     _settle(h)
 
 
-def test_stop_before_classification_retains_observed_evidence(load_plugin, monkeypatch):
+def test_stop_before_classification_retains_observed_evidence(load_plugin, classifier_stub):
     """Stop wins over the stalled classifier: origin/outcome/cost stay on
     the row, classification stays honestly pending; the late verdict
     enriches the SAME retained row without resurrecting live tracking."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     internals = _internals(h)
+    parked, gate = control.park()
     agent = SimpleNamespace(
         session_id="child-x", reasoning_config=None, model="m", provider="openai",
         session_estimated_cost_usd=0.25, session_cost_status="estimated")
@@ -168,12 +202,13 @@ def test_stop_before_classification_retains_observed_evidence(load_plugin, monke
     assert internals["usage_totals"] == {}
 
 
-def test_unload_and_late_results_cannot_resurrect_state(load_plugin, monkeypatch):
+def test_unload_and_late_results_cannot_resurrect_state(load_plugin, classifier_stub):
     """Native disposal (manager.unload -> ctx.on_unload callback) releases
     live bookkeeping; the parked worker's late completion is inert."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     internals = _internals(h)
+    parked, gate = control.park()
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
            child_goal="complex-marker do work")
     assert parked.wait(timeout=10)
@@ -196,20 +231,21 @@ def test_unload_and_late_results_cannot_resurrect_state(load_plugin, monkeypatch
     assert "child-y" not in internals["verdicts"]
 
 
-def test_evicted_row_cannot_be_resurrected(load_plugin, monkeypatch):
+def test_evicted_row_cannot_be_resurrected(load_plugin, classifier_stub, monkeypatch):
     """The row cap evicts; a late verdict for the evicted child lands
     nowhere, and the live row keeps its own result."""
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     internals = _internals(h)
     monkeypatch.setattr(h.module, "_MAX_ROWS", 1)  # force eviction headroom
 
-    parked_x, gate_x = _install_stalled_fake(monkeypatch)
+    parked_x, gate_x = control.park()
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
            child_goal="complex-marker x")
     assert parked_x.wait(timeout=10)  # worker x parked
     assert len(internals["jobs"]) == 1
-    # a second child (per-worker fake so both park independently)...
-    parked_y, gate_y = _install_stalled_fake(monkeypatch)
+    # a second child, parked independently of the first...
+    parked_y, gate_y = control.park()
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-y",
            child_goal="complex-marker y")
     assert parked_y.wait(timeout=10)
@@ -223,17 +259,18 @@ def test_evicted_row_cannot_be_resurrected(load_plugin, monkeypatch):
     assert internals["verdicts"]["child-y"]["verdict"] == "complex"
 
 
-def test_overload_is_bounded_and_fails_open(load_plugin, monkeypatch):
+def test_overload_is_bounded_and_fails_open(load_plugin, classifier_stub):
     """4 concurrent classifier slots, held open; the next 2 children fail
     open to an honest 'overloaded' unavailable row with no backlog."""
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     internals = _internals(h)
     held = []
     for i in range(4):
-        # a fresh per-worker fake per child: the worker parks inside the
-        # response read (parked.set proves it) and HOLDS its slot on
-        # gate.wait() while the test observes
-        parked, gate = _install_stalled_fake(monkeypatch)
+        # one park per child: the worker parks at the classifier boundary
+        # (parked.set proves it) and HOLDS its slot on gate.wait() while
+        # the test observes
+        parked, gate = control.park()
         held.append(gate)
         h.hook("subagent_start", parent_session_id="p", child_session_id=f"c{i}",
                child_goal=f"complex-marker {i}")
@@ -256,12 +293,13 @@ def test_overload_is_bounded_and_fails_open(load_plugin, monkeypatch):
     assert len(internals["verdicts"]) == 6
 
 
-def test_explicit_effort_untouched_and_origin_captured_stalled(load_plugin, monkeypatch):
+def test_explicit_effort_untouched_and_origin_captured_stalled(load_plugin, classifier_stub):
     """While the classifier is parked, the child's explicit reasoning
     config is observed untouched, origin is recorded, and the late verdict
     records the raw suggestion WITHOUT clamping to an invented level."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
+    parked, gate = control.park()
     agent = MagicMock()
     agent.session_id = "child-x"
     agent.reasoning_config = {"enabled": True, "effort": "medium"}
@@ -298,11 +336,11 @@ class _FakeClock:
         return self.now
 
 
-def test_pure_bookkeeping_persistence_is_throttled(load_plugin, monkeypatch):
+def test_pure_bookkeeping_persistence_is_throttled(load_plugin, classifier_stub, monkeypatch):
     """Pending-row bookkeeping is rate-limited; the suppressed row still
     reaches the durable store on the next snapshot write (coalesced, not
     lost), and verdict/worker writes below remain durable anyway."""
-    parked, gate = _install_stalled_fake(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
     h = load_plugin("subagent-effort")
     monkeypatch.setattr(h.module, "time", _FakeClock())
     writes = []
@@ -310,7 +348,10 @@ def test_pure_bookkeeping_persistence_is_throttled(load_plugin, monkeypatch):
     real_set = PluginState.set
     monkeypatch.setattr(PluginState, "set",
                         lambda self, key, value: writes.append(key) or real_set(self, key, value))
+    gates = []
     for child in ("child-a", "child-b"):
+        _parked, gate = control.park()  # each child holds its classifier slot
+        gates.append(gate)
         h.hook("subagent_start", parent_session_id="p", child_session_id=child,
                child_goal="complex-marker do work")
     assert writes == ["shadow"]  # child-b's bookkeeping write coalesced away
@@ -318,10 +359,158 @@ def test_pure_bookkeeping_persistence_is_throttled(load_plugin, monkeypatch):
     assert set(_rows(h)) == {"child-a", "child-b"}
     clock = h.module.time
     clock.now += h.module._BOOKKEEPING_INTERVAL + 1
+    _parked, gate = control.park()
+    gates.append(gate)
     h.hook("subagent_start", parent_session_id="p", child_session_id="child-c",
            child_goal="complex-marker do work")
     assert writes == ["shadow", "shadow"]
     # the coalesced write carried child-b's row after all: coalesced, not lost
     assert "child-b" in h.context.state.get("shadow")
-    gate.set()  # cleanup: settle the parked workers
+    for gate in gates:
+        gate.set()  # cleanup: settle the parked workers
     _settle(h)
+
+
+def _point_ledger_at(isolated_hermes, root):
+    """Configure the shared ledger through shadow-gate's own setting, before any load.
+
+    This is the test's own isolated Hermes home under ``tmp_path`` (never the live
+    profile, which the host CLI owns), and the YAML goes through the parser, not
+    string surgery: the plugin must resolve the operator-facing setting, not a patch.
+    """
+    isolated_hermes.config.setdefault("plugins", {}).setdefault("entries", {})[
+        _LEDGER_PLUGIN] = {"enabled": True, "settings": {"ledger_dir": str(root)}}
+    (isolated_hermes.home / "config.yaml").write_text(
+        yaml.safe_dump(isolated_hermes.config), encoding="utf-8")
+
+
+def _ledger_rows(root):
+    """Every row shadow-gate appended for this decision, oldest first."""
+    path = root / _LEDGER_FILE
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _without_shadow_ledger(monkeypatch):
+    """Make the shadow-gate sibling unreadable, exactly as an absent install would.
+
+    The module key is dropped first because a path-loaded sibling stays registered for
+    the life of the process; everything else still resolves by path.
+    """
+    monkeypatch.delitem(sys.modules, "hermes_plugins_shadow_gate", raising=False)
+    real_spec = importlib.util.spec_from_file_location
+
+    def no_ledger_spec(name, location, *_args, **_kwargs):
+        if str(location).replace("\\", "/").endswith("shadow-gate/ledger.py"):
+            return None
+        return real_spec(name, location)
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", no_ledger_spec)
+
+
+def test_one_classification_writes_a_verdict_row_and_its_outcome_row(
+        load_plugin, classifier_stub, isolated_hermes, tmp_path):
+    """The shadow's evidence: the verdict when it lands, the realized result when it stops.
+
+    Both rows carry the same key (the child session) and the verdict row carries the
+    digest of the goal that produced it, which is what lets shadow-gate join a verdict
+    to the outcome it predicted. The outcome here is an observed clean completion, so
+    the higher effort was not needed — the ledger says so in the producer's words.
+    """
+    root = tmp_path / "ledger"
+    _point_ledger_at(isolated_hermes, root)
+    control = _stalled_classifier(classifier_stub)
+    h = load_plugin("subagent-effort")
+    parked, gate = control.park()
+    h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
+           child_goal="complex-marker do work")
+    assert parked.wait(timeout=10)
+    assert control.callers == ["subagent-effort"]  # declines attribute to this plugin
+    assert control.timeouts == [10.0]  # the bounded wait this plugin asked for, explicitly
+    gate.set()
+    _settle(h)
+    h.hook("subagent_stop", parent_session_id="p", child_session_id="child-x",
+           child_status="completed", duration_ms=40, tool_call_history=[])
+    rows = _ledger_rows(root)
+    verdicts = [row for row in rows if row["kind"] == "verdict"]
+    outcomes = [row for row in rows if row["kind"] == "outcome"]
+    assert [(row["decision"], row["key"], row["verdict"]) for row in verdicts] == [
+        ("subagent_effort.difficulty", "child-x", "complex")]
+    assert verdicts[0]["input_digest"] == hashlib.sha256(
+        b"complex-marker do work").hexdigest()[:16]
+    assert set(verdicts[0]["meta"]) == {"suggested_effort", "clamped_effort"}
+    assert verdicts[0]["meta"]["suggested_effort"] == "high"
+    assert [(row["key"], row["outcome"]) for row in outcomes] == [("child-x", "needed_low")]
+    assert set(outcomes[0]["meta"]) == {"status", "repeated_mutation_targets", "verification"}
+    note = json.loads(h.command("subagent_effort"))["note"]
+    assert "shadow-gate rows recorded=2 ledger_unavailable=0" in note
+
+
+@pytest.mark.parametrize("row,expected", [
+    ({"status": "failed"}, "needed_high"),  # an observed failure proves the harder effort
+    ({"status": "completed", "repeated_mutation_targets": ["a.py", "a.py"]}, "needed_high"),
+    ({"status": "completed", "repair_cycles": 2}, "needed_high"),
+    ({"status": "completed"}, "needed_low"),
+    ({"status": "completed", "repair_cycles": 1}, "needed_low"),  # one repair is ordinary
+    ({"status": "unknown"}, "unknown"),
+    ({}, "unknown"),
+    ({"status": "completed", "repair_cycles": "2"}, "needed_low"),  # untyped: no evidence
+])
+def test_realized_outcome_follows_the_evaluators_rule(load_plugin, classifier_stub,
+                                                      row, expected):
+    """The outcome is read exactly as the paired evaluator reads it: no invented evidence.
+
+    A missing signal is never read as agreement — an unobserved rework count means
+    "no evidence of rework", not "no rework" — and a status that is neither an
+    observed failure nor an observed success stays unknown.
+    """
+    classifier_stub.install()
+    h = load_plugin("subagent-effort")
+    assert h.module.realized_outcome(row) == expected
+
+
+def test_missing_shadow_gate_sibling_counts_rows_as_unavailable(load_plugin, classifier_stub,
+                                                               monkeypatch):
+    """Without the ledger plugin the shadow still runs; the gap is counted, never silent.
+
+    Classification, origin and outcome stay recorded; every row that could not be
+    written is reported in the command note, because thin evidence has to be visible
+    to an operator rather than quietly absent.
+    """
+    _without_shadow_ledger(monkeypatch)
+    control = _stalled_classifier(classifier_stub)
+    h = load_plugin("subagent-effort")
+    parked, gate = control.park()
+    h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
+           child_goal="complex-marker do work")
+    assert parked.wait(timeout=10)
+    gate.set()
+    _settle(h)
+    h.hook("subagent_stop", parent_session_id="p", child_session_id="child-x",
+           child_status="completed", duration_ms=40, tool_call_history=[])
+    assert _rows(h)["child-x"]["verdict"] == "complex"  # the shadow itself is unaffected
+    note = json.loads(h.command("subagent_effort"))["note"]
+    assert "shadow-gate rows recorded=0 ledger_unavailable=2" in note
+
+
+def test_command_rows_keep_their_published_keys(load_plugin, classifier_stub):
+    """The summary row is an operator-facing contract: the key set may not drift.
+
+    Renaming or dropping a key breaks whatever reads the command; adding one belongs
+    with an update to this list, so the list is pinned here rather than inferred.
+    """
+    control = _stalled_classifier(classifier_stub)
+    h = load_plugin("subagent-effort")
+    parked, gate = control.park()
+    h.hook("subagent_start", parent_session_id="p", child_session_id="child-x",
+           child_goal="complex-marker do work")
+    assert parked.wait(timeout=10)
+    gate.set()
+    _settle(h)
+    assert sorted(_rows(h)["child-x"]) == _ROW_KEYS
+    h.hook("post_api_request", session_id="child-x",
+           usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+    h.hook("subagent_stop", parent_session_id="p", child_session_id="child-x",
+           child_status="completed", duration_ms=40, tool_call_history=[])
+    assert sorted(_rows(h)["child-x"]) == sorted([*_ROW_KEYS, *_RAW_USAGE_KEYS])

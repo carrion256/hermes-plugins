@@ -118,6 +118,22 @@ def _load_stub(monkeypatch):
     return module
 
 
+class _StubClient:
+    """Stand-in for the shared classifier client.
+
+    Only the prune stage talks to it, and the fake pruner ignores the response body, so
+    an empty answers envelope is enough; a test that cares what was asked builds its own
+    recorder and passes it as ``client``.
+    """
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object]:
+        return {}
+
+
+_INJECT = object()  # "give the engine a working transport"; distinct from an explicit None
+
+
 @pytest.fixture
 def engine_factory(monkeypatch):
     from agent.context_compressor import ContextCompressor
@@ -131,19 +147,14 @@ def engine_factory(monkeypatch):
 
     monkeypatch.setattr(ContextCompressor, "compress", fake_compress)
 
-    class FakeClient:  # the fake pruner ignores the response body entirely
-        def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
-            return {}
-
-    def make(pipeline, pruner=None, client=None, **over):
+    def make(pipeline, pruner=None, client=_INJECT, **over):
         mod = _load_stub(monkeypatch)
         settings = dict(CFG)
         settings["pipeline"] = pipeline
         settings.update(over)
-        if pruner is not None:  # a usable pruner implies a usable transport+key
-            monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic")
-            client = FakeClient() if client is None else client
-        engine = mod._engine_class()(settings, pruner, client)
+        if pruner is not None and client is _INJECT:  # a usable pruner implies a transport
+            client = _StubClient()
+        engine = mod._engine_class()(settings, pruner, None if client is _INJECT else client)
         return mod, engine, calls
     return make
 
@@ -234,7 +245,7 @@ def test_engine_survives_the_host_per_agent_copy(engine_factory, monkeypatch):
     never run and nothing else would report it. The prune stage holds the
     fast-compaction *module*, which copy cannot clone."""
     probe = _load_stub(monkeypatch)
-    pruner_mod, _ = probe._load_fast_compaction()
+    pruner_mod = probe._load_fast_compaction()
     assert pruner_mod is not None, "fast-compaction absent: the shared pruner is the point"
     mod, engine, _ = engine_factory("prune", pruner=pruner_mod)
     clone = engine.clone_for_agent()                        # the host's own entry point
@@ -313,16 +324,14 @@ def test_register_rejects_bad_pipeline_and_status_tool_reports():
     manifest = yaml.safe_load((PLUGIN / "plugin.yaml").read_text())
     assert manifest["name"] == "chain-compaction"
     assert "chain_compaction_status" in manifest["provides_tools"]
-    assert manifest["config_schema"]["pipeline"]["default"] == "prune,clip,drop_stale"
+    # The default pipeline gained drop_reasoning (pure chain-of-thought deletion first).
+    assert manifest["config_schema"]["pipeline"]["default"] == "drop_reasoning,prune,clip,drop_stale"
     with pytest.raises(ValueError):
         stages.parse_pipeline("nonsense", extra=mod.ENGINE_STAGES)
-
-
-class _SummaryClient:
-    """Transport stub: the summary stage never touches it."""
-
-    def post_questions(self, endpoint, api_key_env, text, questions, timeout=None, **_kw):
-        return {}
+    # The status tool's friction block is part of the contract: an operator must be able
+    # to see what the summary backstop reported and why a filing did not happen.
+    assert set(mod.STATUS["friction"]) == {"reports", "last_reason", "unavailable"}
+    assert mod.STATUS["friction"] == {"reports": 0, "last_reason": None, "unavailable": 0}
 
 
 def test_summary_stage_runs_the_normal_engine_once(monkeypatch):
@@ -370,8 +379,7 @@ def test_chain_prune_then_summary_summarises_the_pruned_transcript(monkeypatch):
     mod = _load_stub(monkeypatch)
     settings = dict(CFG)
     settings.update(pipeline="prune,summary", stage_min_reduction=0.0, drop_confidence=0.5)
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic")
-    engine = mod._engine_class()(settings, fake_pruner(drop_every=True), _SummaryClient())
+    engine = mod._engine_class()(settings, fake_pruner(drop_every=True), _StubClient())
 
     messages = transcript(old=6)
     out = engine.compress(messages, current_tokens=5000)
@@ -404,6 +412,94 @@ def test_summary_miss_falls_back_and_is_tallied(monkeypatch):
     assert out is not None
     assert mod.STATUS["fallbacks"] == fallbacks_before + 1
     assert mod.STATUS["stage_misses"].get("summary:summary_unavailable") == 1
+
+
+def _friction_sink(monkeypatch, mod, *, reason="filed", raises=False, missing=False):
+    """Point the cascade at a papercuts stand-in; return the list it captures into.
+
+    Only the two names the reporter uses are provided, so a renamed field or a producer
+    that stopped reporting is a test failure here, not a silent no-op.
+    """
+    from types import SimpleNamespace
+
+    reported: list[dict[str, object]] = []
+
+    def gate(**fields):
+        reported.append(fields)
+        return dict(fields)
+
+    def report(record):
+        if raises:
+            raise RuntimeError("the sink refused")
+        return SimpleNamespace(filed=True, reason=reason)
+
+    def load():
+        return None if missing else SimpleNamespace(GateFriction=gate, report=report)
+
+    monkeypatch.setattr(mod, "_load_friction", load)
+    return reported
+
+
+def test_under_delivery_files_a_summary_backstop_papercut(engine_factory, monkeypatch):
+    """The cascade giving up is a gate refusal with evidence: it must reach papercuts
+    before the built-in summary runs, carrying the stage trace that explains it."""
+    mod, engine, calls = engine_factory("prune", pruner=None)  # prune unavailable: no commit
+    reported = _friction_sink(monkeypatch, mod)
+    before = dict(mod.STATUS["friction"])
+
+    out = engine.compress(transcript(old=6))
+
+    assert out is not None and calls["summary"] == 1  # the backstop still ran
+    assert len(reported) == 1
+    filing = reported[0]
+    assert filing["source"] == "chain-compaction"
+    assert filing["kind"] == mod.FRICTION_KIND == "summary_backstop"
+    assert filing["identity"] == mod.CASCADE_INSUFFICIENT
+    assert isinstance(filing["summary"], str) and filing["summary"]
+    assert isinstance(filing["session_id"], str)
+    detail = filing["detail"]
+    assert isinstance(detail, str) and len(detail) <= mod.FRICTION_DETAIL_LIMIT
+    assert {"stage": "prune", "miss": "prune_unavailable:not_installed"} in json.loads(detail)
+    assert mod.STATUS["friction"]["reports"] == before["reports"] + 1
+    assert mod.STATUS["friction"]["last_reason"] == "filed"
+    assert mod.STATUS["friction"]["unavailable"] == before["unavailable"]
+
+
+def test_committed_cascade_files_no_friction(engine_factory, monkeypatch):
+    """Friction is for refusals. A cascade that hit its target reports nothing."""
+    mod, engine, _calls = engine_factory("prune", pruner=fake_pruner())
+    reported = _friction_sink(monkeypatch, mod)
+
+    engine.compress(transcript(old=6, big=True))
+
+    assert reported == []
+    assert mod.STATUS["friction"] == {"reports": 0, "last_reason": None, "unavailable": 0}
+
+
+def test_missing_friction_sink_is_counted_not_fatal(engine_factory, monkeypatch):
+    """Without papercuts enabled the report degrades to a counter; the compression and
+    its built-in backstop are unaffected."""
+    mod, engine, calls = engine_factory("prune", pruner=None)
+    reported = _friction_sink(monkeypatch, mod, missing=True)
+
+    out = engine.compress(transcript(old=6))
+
+    assert out is not None and calls["summary"] == 1
+    assert reported == []
+    assert mod.STATUS["friction"]["unavailable"] == 1
+    assert mod.STATUS["friction"]["reports"] == 0
+
+
+def test_refusing_sink_never_costs_a_compression(engine_factory, monkeypatch):
+    """A foreign sink is untrusted code: it may raise, and the cascade still backstops."""
+    mod, engine, calls = engine_factory("prune", pruner=None)
+    _friction_sink(monkeypatch, mod, raises=True)
+
+    out = engine.compress(transcript(old=6))
+
+    assert out is not None and calls["summary"] == 1
+    assert mod.STATUS["friction"]["last_reason"] == "error"
+    assert mod.STATUS["friction"]["reports"] == 0
 
 
 SNAP_STAGE = '''

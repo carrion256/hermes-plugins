@@ -1,6 +1,6 @@
 name: meta-classifier
 version: 0.1.0
-description: "Droid's classifier decisions on Hermes hooks: Jev/luna execute-risk tiers with redacted egress and operation-bound approvals, Droid Shield secret triage before git commit/push, Factory-Judge local-signals analytics, an agent-facing decision_model tool, and a replay of droid's captured payloads. Native permissions stay authoritative."
+description: "Droid's classifier decisions on Hermes hooks: Jev/luna execute-risk tiers with redacted egress and operation-bound approvals, Droid Shield secret triage before git commit/push, Factory-Judge local-signals analytics, an agent-facing decision_model tool, and a replay of droid's captured payloads. It also enforces keyword-steering's /dry turn while dry_turn is on: a call whose effects its own risk analysis classes as mutating is refused with rule_key 'dry_turn' and no classifier request at all, and the refusal is listed in keyword-steering's steering_status. Read-only tools are never touched by it. Native permissions stay authoritative. Every classifier call goes through the shared classifier-core transport, so this plugin declares no endpoint, served model or key environment variable of its own; with shadow_decisions on (the default) each risk tier it escalates to a human and each Droid Shield screen is also recorded as a shadow-gate verdict row, and the human's later approval answer is paired with it as the outcome row."
 author: "dsh-plugins port"
 manifest_version: 2
 api_version: 1
@@ -15,22 +15,14 @@ provides_hooks:
   - post_llm_call
   - pre_verify
   - subagent_stop
+  - post_approval_response
 provides_tools:
   - decision_model
   - browser_decision
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings and outage breaker; without it every classification returns no answer, which the risk gate fails open on and the shield fails closed on"
+  - "sibling plugin shadow-gate provides the shared verdict/outcome ledger for the meta_classifier.risk and meta_classifier.shield decisions; without it the rows are counted as ledger_unavailable and no screening changes"
 config_schema:
-  endpoint:
-    type: str
-    default: "http://127.0.0.1:8102"
-    description: "Classifier service base URL (GET /health, POST /v1/systemone)."
-  served_model:
-    type: str
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: str
-    default: "CLASSIFIER_API_KEY"
-    description: "Env var holding the Bearer key. Name only — value read at call time, never stored."
   policy:
     type: str
     default: "ask"
@@ -51,6 +43,14 @@ config_schema:
     type: bool
     default: true
     description: "Droid Shield secret triage on git commit/push (block B>=0.3775 on findings, warn B>=0.95 on secret-named lines)."
+  shadow_decisions:
+    type: bool
+    default: true
+    description: "Record the decisions this plugin makes as append-only verdict rows in the shadow-gate ledger: one meta_classifier.risk row per command escalated to a human (verdict = the tier, keyed by the approval's rule key, with the risk scale in meta), and one meta_classifier.shield row per git commit/push screened (verdict = block, warn or clean, keyed by the digest of the git command). When the human later answers that approval, post_approval_response writes the matching outcome row (approved/denied, with decided_by and surface in meta); a prompt that timed out or was withdrawn decided nothing and writes nothing. Rows are evidence for shadow-gate's promotion gate and for `hermes meta-classifier-replay --run`, never an input to a decision here: with this off nothing is written, and the row counters report it as disabled. An absent shadow-gate plugin is reported as ledger_unavailable and never blocks or fails a screening."
+  dry_turn:
+    type: bool
+    default: true
+    description: "Enforce keyword-steering's /dry turn: while that keyword is active for the session's current turn, refuse the tool calls this plugin already classifies as mutating — file writes/edits (write_file, patch, including their delete/move forms), terminal and execute_code (commands whose effects are not proven read-only), process control beyond polling, and any tool whose effects are unproven, which covers MCP mutations and browser actions. The refusal is a deterministic block carrying rule_key 'dry_turn' and a stable directive_id, made WITHOUT contacting the classifier (no request, no tokens), and it is recorded in the turn state so steering_status lists it. Read-only tools (the screening skip list and process_manage polling) pass untouched. Turning this off leaves /dry as guidance from keyword-steering only: nothing here blocks a mutating call. A non-boolean value fails registration."
   signals:
     type: bool
     default: false

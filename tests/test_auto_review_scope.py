@@ -3,26 +3,11 @@ import os
 from pathlib import Path
 
 import pytest
-
 from agent.subagent_lifecycle import bind_subagent_parent
 
 
-class Reply:
-    def __init__(self, body):
-        self.body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-    def read(self, size=-1):
-        return json.dumps(self.body).encode()
-
-
 def envelope(risky_probability, choice=None):
-    """A /v1/systemone answer for the plugin's `review` choice question."""
+    """The raw answer envelope the service returns for the plugin's `review` question."""
     probabilities = {"risky": risky_probability, "safe": 1.0 - risky_probability}
     answer = {"type": "choice", "probabilities": probabilities,
               "choice": choice or ("risky" if risky_probability >= 0.5 else "safe")}
@@ -30,24 +15,33 @@ def envelope(risky_probability, choice=None):
     return {"model": "synthetic", "usage": {}, "answers": {"review": answer}}
 
 
-def gate_setup(load_plugin, monkeypatch, verdict="risky", policy="ask"):
-    h = load_plugin("auto-review-classifier",
-                    {"policy": policy, "api_key_env": "REVIEW_TEST_KEY"})
-    captured = []
-    raws = []
+def gate_setup(load_plugin, monkeypatch, classifier_stub, verdict="risky", policy="ask",
+               answers=None):
+    """The plugin with its classifier transport replaced by the shared stub.
 
-    def fake_urlopen(request, *_a, **_kw):
-        raw = json.loads(request.data)
-        raws.append(raw)
-        captured.append(raw["state"])
+    The stub is installed BEFORE the plugin loads, because the plugin resolves its
+    client once, at registration. ``h.captured`` holds every state that left the
+    plugin, ``h.raws`` the state plus the questions asked, and ``h.transport.calls``
+    the caller and timeout the plugin passed. ``answers`` scripts raw envelopes in
+    order, for a test that needs a specific (or nonsense) reply.
+    """
+    captured, raws = [], []
+    script = list(answers) if answers is not None else []
+
+    def reply(state, questions, **_kwargs):
+        captured.append(state)
+        raws.append({"state": state, "questions": questions})
+        if script:
+            return script.pop(0)
         if verdict is None:
-            return Reply({"answers": {}})  # no answer for our question: unusable
-        return Reply(envelope(0.97 if verdict == "risky" else 0.03))
+            return {"answers": {}}  # no answer for our question: unusable
+        return envelope(0.97 if verdict == "risky" else 0.03)
 
-    monkeypatch.setenv("REVIEW_TEST_KEY", "synthetic-key")
-    monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
+    transport = classifier_stub.install(reply)
+    h = load_plugin("auto-review-classifier", {"policy": policy})
     h.captured = captured
     h.raws = raws
+    h.transport = transport
     return h
 
 
@@ -69,8 +63,8 @@ def screen(h, agent, task_id, tool, args, tool_call_id=None):
                       tool_call_id=tool_call_id or "", args=args)
 
 
-def test_secret_values_never_reach_classifier(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_secret_values_never_reach_classifier(load_plugin, monkeypatch, classifier_stub):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     agent = local_agent()
     secret = "super-secret-token"
     quoted = "correct horse battery staple"
@@ -104,8 +98,8 @@ def test_secret_values_never_reach_classifier(load_plugin, monkeypatch):
             assert summary["arguments"]["args"]["note"] == "safe value"
 
 
-def test_redaction_unavailable_blocks_egress(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_redaction_unavailable_blocks_egress(load_plugin, monkeypatch, classifier_stub):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     import agent.redact as native_redact
     monkeypatch.setattr(native_redact, "redact_for_egress",
                         lambda text: native_redact.REDACTION_UNAVAILABLE)
@@ -117,8 +111,8 @@ def test_redaction_unavailable_blocks_egress(load_plugin, monkeypatch):
                                         "screened": False}}]
 
 
-def test_relative_symlink_retarget_uses_fresh_target_identity(load_plugin, tmp_path, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_relative_symlink_retarget_uses_fresh_target_identity(load_plugin, tmp_path, monkeypatch, classifier_stub):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     workspace = tmp_path / "ws"
     a, b = workspace / "a.txt", workspace / "b.txt"
     workspace.mkdir()
@@ -137,8 +131,8 @@ def test_relative_symlink_retarget_uses_fresh_target_identity(load_plugin, tmp_p
     assert summary["targets"][0]["identity"]  # identity bound to the file the symlink now points at
 
 
-def test_absolute_symlink_retarget_changes_approval_scope(load_plugin, monkeypatch, tmp_path):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_absolute_symlink_retarget_changes_approval_scope(load_plugin, monkeypatch, classifier_stub, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     symlink = workspace / "target.txt"
@@ -162,8 +156,8 @@ def test_absolute_symlink_retarget_changes_approval_scope(load_plugin, monkeypat
     assert json.loads(h.captured[-1])["targets"][0]["resolved"].endswith("elsewhere.txt")
 
 
-def test_patch_header_targets_are_scoped(load_plugin, monkeypatch, tmp_path):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_patch_header_targets_are_scoped(load_plugin, monkeypatch, classifier_stub, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     (workspace / "one.txt").write_text("1")
@@ -177,8 +171,8 @@ def test_patch_header_targets_are_scoped(load_plugin, monkeypatch, tmp_path):
     assert directive["rule_key"].startswith("auto-review:patch:")
 
 
-def test_incomplete_safe_verdict_stays_unknown(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch, verdict="safe")
+def test_incomplete_safe_verdict_stays_unknown(load_plugin, monkeypatch, classifier_stub):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, verdict="safe")
     agent = local_agent()
     result = screen(h, agent, "task-safe", "terminal", {"command": "echo hi"})
     # Safe labels over incomplete context are refused; native permissions untouched.
@@ -187,8 +181,8 @@ def test_incomplete_safe_verdict_stays_unknown(load_plugin, monkeypatch):
                                         "screened": False}}]
 
 
-def test_risky_directive_shape_preserved_with_per_call_rule_keys(load_plugin, monkeypatch, tmp_path):
-    h = gate_setup(load_plugin, monkeypatch, verdict="risky")
+def test_risky_directive_shape_preserved_with_per_call_rule_keys(load_plugin, monkeypatch, classifier_stub, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, verdict="risky")
     workspace_for("task-risky", tmp_path)
     agent = local_agent()
     directive, = screen(h, agent, "task-risky", "terminal",
@@ -202,8 +196,8 @@ def test_risky_directive_shape_preserved_with_per_call_rule_keys(load_plugin, mo
     assert second["rule_key"] != directive["rule_key"]
 
 
-def test_approved_operation_revalidates_identity(load_plugin, monkeypatch, tmp_path):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_approved_operation_revalidates_identity(load_plugin, monkeypatch, classifier_stub, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     workspace_for("task-reval", tmp_path)
     (tmp_path / "f.txt").write_text("a")
     agent = local_agent()
@@ -219,13 +213,13 @@ def test_approved_operation_revalidates_identity(load_plugin, monkeypatch, tmp_p
     (tmp_path / "f.txt").write_text("b")
     assert directive["revalidate"](args) is False
     # Deny directives carry no closure; closure presence is approval-scoped.
-    denied = gate_setup(load_plugin, monkeypatch, policy="deny")
+    denied = gate_setup(load_plugin, monkeypatch, classifier_stub, policy="deny")
     directive, = screen(denied, agent, "task-reval", "patch", args, tool_call_id="c1")
     assert directive["action"] == "block" and "revalidate" not in directive
 
 
-def test_policy_deny_blocks_and_polling_skipped(load_plugin, monkeypatch, tmp_path):
-    h = gate_setup(load_plugin, monkeypatch, verdict="risky", policy="deny")
+def test_policy_deny_blocks_and_polling_skipped(load_plugin, monkeypatch, classifier_stub, tmp_path):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, verdict="risky", policy="deny")
     workspace_for("task-deny", tmp_path)
     agent = local_agent()
     directive, = screen(h, agent, "task-deny", "terminal",
@@ -236,27 +230,17 @@ def test_policy_deny_blocks_and_polling_skipped(load_plugin, monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("root", [{"risk": "weird"}, b"null"])
-def test_unknown_classifier_responses_stay_fail_open(load_plugin, monkeypatch, root):
-    h = gate_setup(load_plugin, monkeypatch, verdict=None)
-
-    class RawReply(Reply):
-        def __init__(self):
-            pass
-
-        def read(self, size=-1):
-            return root if isinstance(root, bytes) else json.dumps(root).encode()
-
-    monkeypatch.setattr(h.module.urllib.request, "urlopen",
-                        lambda *_a, **_kw: RawReply())
-    agent = local_agent()
-    result = screen(h, agent, "task-unknown", "terminal", {"command": "echo hi"})
+def test_unknown_classifier_responses_stay_fail_open(load_plugin, monkeypatch, classifier_stub, root):
+    """A reply that is not an answer to our question is refused, never guessed at."""
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, answers=[root])
+    result = screen(h, local_agent(), "task-unknown", "terminal", {"command": "echo hi"})
     assert result == [{"risk_review": {"status": "unknown",
                                         "reason": "classifier_unavailable_or_invalid",
                                         "screened": False}}]
 
 
-def test_quoted_environment_secret_is_masked_before_http(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_quoted_environment_secret_is_masked_before_http(load_plugin, monkeypatch, classifier_stub):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     screen(h, local_agent(), "env-secret", "terminal",
            {"command": 'TOKEN="correct horse battery staple" run'})
     assert len(h.captured) == 1
@@ -269,78 +253,71 @@ def test_quoted_environment_secret_is_masked_before_http(load_plugin, monkeypatc
     """sh -c 'run --password "correct horse battery staple"'""",
     """python -c 'request(token="correct horse battery staple")'""",
 ])
-def test_nested_credential_syntax_abstains_before_http(load_plugin, monkeypatch, command):
-    h = gate_setup(load_plugin, monkeypatch)
+def test_nested_credential_syntax_abstains_before_http(load_plugin, monkeypatch, classifier_stub, command):
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     result = screen(h, local_agent(), "nested-secret", "terminal", {"command": command})
     assert h.captured == []
     assert result[0]["risk_review"]["status"] == "unknown"
     assert result[0]["risk_review"]["screened"] is False
 
 
-def test_dead_classifier_cooldown_serves_fail_open_without_second_call(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch, verdict=None)
+def test_dead_classifier_fails_open_on_every_call(load_plugin, monkeypatch, classifier_stub):
+    """No answer twice means reported twice: a fail-open verdict is never cached.
+
+    Retry policy belongs to the shared transport now. What this plugin owes the agent
+    is that every screened call asks, and every call the transport declines to answer
+    says so instead of quietly passing.
+    """
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, verdict=None)
     agent = local_agent()
-    fail = screen(h, agent, "task-cooldown", "terminal", {"command": "echo hi"})
-    assert fail[0]["risk_review"]["reason"] == "classifier_unavailable_or_invalid"
-    assert len(h.raws) == 1
-    again = screen(h, agent, "task-cooldown-2", "terminal", {"command": "echo again"})
-    assert again[0]["risk_review"]["reason"] == "classifier_unavailable_or_invalid"
-    assert len(h.raws) == 1  # second call served from cooldown, no second urlopen
+    for task in ("task-dead", "task-dead-2"):
+        result = screen(h, agent, task, "terminal", {"command": "echo hi"})
+        assert result[0]["risk_review"]["reason"] == "classifier_unavailable_or_invalid"
+    assert len(h.raws) == 2  # the second call asks again rather than replaying a verdict
 
 
-class FakeClock:
-    def __init__(self):
-        self.now = 0.0
+def test_unusable_verdict_is_diagnosed_and_the_next_call_recovers(
+        load_plugin, monkeypatch, classifier_stub, tmp_path, caplog):
+    """A bad first reply is logged, not remembered: the next call is judged on its own answer.
 
-    def monotonic(self):
-        return self.now
-
-
-def test_cooldown_expires_and_classifier_recovers(load_plugin, monkeypatch, tmp_path, caplog):
-    h = gate_setup(load_plugin, monkeypatch, verdict=None)
-    clock = FakeClock()
-    monkeypatch.setattr(h.module, "time", clock)
+    The plugin used to black the endpoint out on a cooldown of its own; the transport
+    owns retry policy now, so the guarantee left here is diagnosability plus a fresh
+    ask, never a fail-open verdict served from a stale cache.
+    """
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub,
+                   answers=[{"answers": {}}, envelope(0.03)])
     agent = local_agent()
-    workspace_for("task-expire", tmp_path)
-    workspace_for("task-expired", tmp_path)
+    workspace_for("task-recover", tmp_path)
+    workspace_for("task-recovered", tmp_path)
     target = tmp_path / "target.txt"
     target.write_text("before")
-    assert screen(h, agent, "task-expire", "write_file",
+    assert screen(h, agent, "task-recover", "write_file",
                   {"path": str(target), "content": "after"}) is not None
     # An unusable verdict must be diagnosable, never a silent pass.
     assert any("unusable verdict" in r.getMessage() for r in caplog.records)
-    clock.now += h.module._COOLDOWN_SECONDS + 1
-    recovered = []
-    monkeypatch.setattr(h.module.urllib.request, "urlopen",
-                        lambda request, *_a, **_kw: recovered.append(1) or Reply(envelope(0.03)))
-    assert screen(h, agent, "task-expired", "write_file",
+    assert screen(h, agent, "task-recovered", "write_file",
                   {"path": str(target), "content": "after"}) == []
-    assert recovered == [1]  # classifier retried exactly once after expiry
+    assert len(h.raws) == 2  # both calls asked; only the second answer was believed
 
 
-def test_classify_timeout_is_bounded(load_plugin, monkeypatch):
-    h = gate_setup(load_plugin, monkeypatch)
-    seen = []
+def test_screening_names_its_caller_and_lets_the_transport_size_the_wait(
+        load_plugin, monkeypatch, classifier_stub):
+    """Each request carries this plugin's identity; the wait is the transport's to compute.
 
-    def spy(request, *args, timeout=None, **_kw):
-        seen.append((timeout, len(json.loads(request.data)["state"])))
-        return Reply(envelope(0.03))
-
-    monkeypatch.setattr(h.module.urllib.request, "urlopen", spy)
+    A many-field call still leaves as one large state, which is what the shared client
+    sizes its timeout from: measured ~0.17 ms/char on the live engine, so >15k chars
+    needs well over the 2.5 s floor this plugin used to compute for itself.
+    """
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub)
     screen(h, local_agent(), "task-timeout-bound", "terminal", {"command": "echo hi"})
-    # A many-field call reaches the _MAX_SUMMARY-512 payload the flat timeout this replaced
-    # could never cover: measured ~0.17 ms/char on the live engine, so >15k chars needs
-    # more than 2.5 s and used to black the endpoint out for the whole cooldown.
     screen(h, local_agent(), "task-timeout-big", "terminal",
            {chr(97 + i): "x" * 2000 for i in range(10)})
 
-    (small_timeout, small_chars), (big_timeout, big_chars) = seen
-    floor, cap = h.module._CLASSIFY_TIMEOUT, h.module._MAX_TIMEOUT
-    assert small_chars < big_chars and big_chars > 10000
-    assert all(floor <= t <= cap for t, _ in seen)  # bounded, never below the configured floor
-    assert big_timeout > small_timeout  # the wait tracks the payload it is paying for
-    assert h.module._budget("") == floor  # the configured timeout remains the floor
-    assert h.module._budget("x" * 1000000) == cap  # the guard rail still holds
+    calls = h.transport.calls
+    assert [call["caller"] for call in calls] == ["auto-review-classifier"] * 2
+    assert [call["timeout"] for call in calls] == [None, None]  # never a private budget
+    small, big = (len(call["state"]) for call in calls)
+    assert small < big and big > 10000  # the payload leaves whole, untruncated by us
 
 
 @pytest.mark.parametrize("probability,choice,needs_review", [
@@ -351,14 +328,13 @@ def test_classify_timeout_is_bounded(load_plugin, monkeypatch):
     # below the boundary. Only the probability may decide.
     (0.4999, "risky", False),
 ])
-def test_decision_thresholds_the_probability_not_the_label(load_plugin, monkeypatch, tmp_path,
+def test_decision_thresholds_the_probability_not_the_label(load_plugin, monkeypatch, classifier_stub, tmp_path,
                                                            probability, choice, needs_review):
-    h = gate_setup(load_plugin, monkeypatch, verdict="safe")
+    h = gate_setup(load_plugin, monkeypatch, classifier_stub, verdict="safe",
+                   answers=[envelope(probability, choice)])
     workspace_for("task-threshold", tmp_path)
     target = tmp_path / "f.txt"
     target.write_text("a")
-    monkeypatch.setattr(h.module.urllib.request, "urlopen",
-                        lambda request, *_a, **_kw: Reply(envelope(probability, choice)))
     result = screen(h, local_agent(), "task-threshold", "write_file",
                     {"path": str(target), "content": "b"}, tool_call_id="c1")
     if not needs_review:

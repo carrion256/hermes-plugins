@@ -31,9 +31,6 @@ OMITTED_NOTE = "ok, {total} chars (omitted)"
 
 DEFAULTS = {
     "enabled": True,
-    "endpoint": "http://127.0.0.1:8102",
-    "served_model": "qwen3.8-flash-next",
-    "api_key_env": "CLASSIFIER_API_KEY",
     "preserve_recent_messages": 6,
     "min_reduction": 0.25,
     "max_state_tokens": 20000,
@@ -44,6 +41,12 @@ DEFAULTS = {
     # keep/drop is plain argmax -- whatever the service answered. Raising it demands
     # stronger evidence before context is deleted.
     "drop_confidence": 0.5,
+    # Tool names whose call/result pairs are never dropped or truncated, on top of the
+    # positional pins below. prewalk_ready carries the validated plan handoff — the one
+    # record an execution model cannot reconstruct once it has been summarised away.
+    # Kept in sync with plugin.yaml's pinned_tools default; the function signature's own
+    # default stays the empty set so a direct caller sees today's behaviour unchanged.
+    "pinned_tools": ("prewalk_ready",),
     # Proactive mid-session eviction (host turn_preflight seam). off keeps the
     # host's deterministic passes; fifo drops oldest unpinned tool pairs with no
     # classifier call; classifier runs the keep/drop pass first and degrades to
@@ -56,6 +59,31 @@ DEFAULTS = {
 
 class PruneError(Exception):
     """Any condition that must route this compression to the built-in summary path."""
+
+
+def parse_pinned_tools(raw: object) -> frozenset[str]:
+    """Parse the ``pinned_tools`` setting into a frozen set of tool names.
+
+    ``None``/absent is the empty set: positional pins only, exactly the previous
+    behaviour. A value that is not a collection of names raises ``TypeError`` and a name
+    that is blank raises ``ValueError`` — both at register, because a silently ignored
+    typo would let a pinned pair (the plan handoff) be pruned anyway.
+    """
+    if raw is None:
+        return frozenset()
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple, set, frozenset)):
+        raise TypeError(
+            f"pinned_tools must be a list of tool names, got {type(raw).__name__}")
+    names: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise TypeError(
+                f"pinned_tools entries must be tool names, got {type(entry).__name__}")
+        if not entry.strip():
+            raise ValueError(
+                f"pinned_tools entries must be non-empty tool names, got {entry!r}")
+        names.append(entry.strip())
+    return frozenset(names)
 
 
 def message_text(content):
@@ -87,9 +115,10 @@ def _call_fields(tc):
     return str(tc.get("id") or ""), str(name), args
 
 
-def collect_tool_calls(messages, preserve_recent):
+def collect_tool_calls(messages, preserve_recent, pinned_tools: frozenset[str] = frozenset()):
     """Pair every tool_use with its tool_result by call id; pin the first message,
-    the newest ``preserve_recent`` messages, and any call whose result is missing."""
+    the newest ``preserve_recent`` messages, any call whose result is missing, and any
+    call whose tool name is in ``pinned_tools`` (config ``pinned_tools``)."""
     results = {}
     for index, message in enumerate(messages):
         if isinstance(message, dict) and message.get("role") == "tool":
@@ -119,7 +148,10 @@ def collect_tool_calls(messages, preserve_recent):
                 # edit_file call exactly on that boundary).
                 "pinned": (index == 0 or index >= recent_start
                            or result_index is None
-                           or result_index >= recent_start),
+                           or result_index >= recent_start
+                           # configured tool pins: the pair is part of the task record
+                           # regardless of where it sits (empty set == today's behaviour)
+                           or name in pinned_tools),
             }
             calls.setdefault(call_id, record)
     tag = 0
@@ -221,7 +253,7 @@ _QUESTION_INSTRUCTIONS = {
 
 
 def build_request(batch, state):
-    """One /v1/systemone request: the same full state plus one choice question per tool
+    """One typed-questions request: the same full state plus one choice question per tool
     call side -- {tag}_call and {tag}_result -- each offering the same keep/drop criteria
     the single-label heads carried, so the model is asked the unchanged task.
     Returns (text, questions); raises PruneError when the request shape is invalid."""

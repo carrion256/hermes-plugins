@@ -1,5 +1,5 @@
 name: rules
-version: 0.4.0
+version: 0.5.0
 description: "Cursor/Windsurf-style rule files: per-session project + global rulebook and always-apply text in cache-safe system-prompt sections; tool/condition/glob rules deliver once as tool_execution guidance without touching tool args."
 author: "dsh-plugins port"
 manifest_version: 2
@@ -27,4 +27,8 @@ config_schema:
   rules_explain_enabled:
     type: bool
     default: true
-    description: "Register the read-only rules_explain tool. Returns applicable rules with stable ids and sources, AND-scope match reasons, precedence/shadowing, explicit same-content/constraint conflicts (both sources), and budget omissions. Check/verification frontmatter refs are echoed as opaque data only, never resolved or executed."
+    description: "Register the read-only rules_explain tool. Returns applicable rules with stable ids and sources, AND-scope match reasons, precedence/shadowing, explicit same-content/constraint conflicts (both sources), budget omissions, and the acceptance obligations this session still owes. Check/verification frontmatter refs are echoed as opaque data only, never resolved or executed."
+  acceptance_obligations:
+    type: bool
+    default: true
+    description: "When a rule declaring check_refs/verification_refs matches a real file-mutating tool call, record one obligation per rule per session (opaque refs + the resolved paths) in the plugin's native state, so the continuation gate can hold completion until each ref is covered by a bound acceptance declaration. Recording is independent of the one-time guidance lane; obligations are dropped on session reset/finalize, and rules_explain reports what is owed plus store degradation counters. The store only records data: nothing here executes a ref. A malformed value keeps the safe default (true) with a logged warning."

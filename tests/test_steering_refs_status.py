@@ -76,7 +76,7 @@ def test_status_without_record_has_full_shape(load_plugin):
     assert s["hits"] == []
     assert s["unresolved_refs"] == {}
     assert s["classifier"]["enabled"] is False
-    assert s["classifier"]["endpoint"] is None
+    assert s["classifier"]["transport"] == "tiebreak_disabled"  # the service is classifier-core's
     assert set(s) >= {
         "success", "session_id", "turn_id", "scope", "lifetime", "state",
         "requested", "active", "withheld", "conflicts", "hits", "references",

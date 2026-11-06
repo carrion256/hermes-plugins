@@ -26,21 +26,33 @@ Native seams only — tool arguments and file bytes are never mutated:
   from the real bound runtime (cwd via agent.runtime_cwd, profile via
   hermes_cli.profiles); unknown identity delivers no guidance;
 - fired is marked only for rules actually delivered; activation state is
-  dropped on ``on_session_reset`` / ``on_session_finalize`` (bounded LRU).
+  dropped on ``on_session_reset`` / ``on_session_finalize`` (bounded LRU);
+- a rule that declares ``check_refs``/``verification_refs`` and matches a real
+  file-mutating tool call (the host's own file-mutating tool set) records a
+  per-session acceptance obligation in ``obligations.py`` (opaque refs, never
+  resolved or executed here). Recording is independent of the one-time delivery
+  lane: a rule already fired still owes its checks on every later match. The
+  continuation plugin is the consumer that holds a turn until those refs are
+  covered by a bound acceptance declaration; obligations are dropped with the
+  session, and ``rules_explain`` reports what is currently owed plus the
+  store's degradation counters. Disable with ``acceptance_obligations: false``.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import hashlib
+import importlib.util
 import logging
 import json
 import os
 import re
+import sys
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any, Optional
 
 import yaml
@@ -61,6 +73,50 @@ _FIRED_LOCK = threading.Lock()
 _META_KEYS = {"description", "alwaysapply", "always_apply", "enabled", "agents",
               "globs", "condition", "tools", "applies", "id", "check_refs",
               "verification_refs", "constraints"}
+# Shared with plugins/continuation: the store module registers itself under
+# this name, so one copy owns the process (see obligations.py docstring).
+_OBLIGATIONS_MODULE = "hermes_plugins_rules_obligations"
+# Only used when the host's file-mutating tool set cannot be imported.
+_FALLBACK_MUTATING_TOOLS = frozenset({"write_file", "patch"})
+
+
+def _load_obligations() -> ModuleType | None:
+    """Path-load the shared obligation store. An absent or unreadable store
+    degrades to recording nothing (logged once here, counted in the store's own
+    stats) — never a crash at register."""
+    shared = sys.modules.get(_OBLIGATIONS_MODULE)
+    if isinstance(shared, ModuleType):
+        return shared
+    target = Path(__file__).resolve().parent / "obligations.py"
+    try:
+        spec = importlib.util.spec_from_file_location(_OBLIGATIONS_MODULE, target)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {target}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_OBLIGATIONS_MODULE] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(_OBLIGATIONS_MODULE, None)
+            raise
+        return module
+    except Exception:  # executing plugin-authored module code can raise anything
+        logger.warning("rules: acceptance obligation store unavailable; rules with "
+                       "check/verification refs record nothing", exc_info=True)
+        return None
+
+
+def _mutating_tools() -> frozenset[str]:
+    """The host's own notion of file-mutating tools, so a read is never an
+    edit; the local set is used only if that module is unavailable."""
+    try:
+        from agent.tool_result_classification import FILE_MUTATING_TOOL_NAMES
+        return frozenset(FILE_MUTATING_TOOL_NAMES)
+    except (ImportError, AttributeError) as exc:
+        logger.warning("rules: host file-mutating tool set unavailable (%s); "
+                       "using the local fallback %s", exc,
+                       sorted(_FALLBACK_MUTATING_TOOLS))
+        return _FALLBACK_MUTATING_TOOLS
 
 
 class _Rule:
@@ -254,6 +310,16 @@ def register(ctx) -> None:
     disabled = {str(d) for d in (ctx.get_config("disabled_rules") or [])}
     ttsr_enabled = bool(ctx.get_config("ttsr_enabled", True))
     explain_enabled = bool(ctx.get_config("rules_explain_enabled", True))
+    # Malformed configuration keeps the safe default (obligations ON): the
+    # store only records data, and the consumer side (continuation) is the one
+    # that decides to hold. A rejected value is never silent.
+    obligations_enabled = _as_bool(ctx.get_config("acceptance_obligations", True))
+    if obligations_enabled is None:
+        logger.warning("rules: acceptance_obligations is not a boolean; using the "
+                       "safe default (true)")
+        obligations_enabled = True
+    obligations = _load_obligations() if obligations_enabled else None
+    mutating_tools = _mutating_tools() if obligations is not None else frozenset()
     base_rules: dict[str, _Rule] = {}
     base_sources: list[_Rule] = []
     for d in global_dirs:
@@ -313,6 +379,54 @@ def register(ctx) -> None:
                 paths.extend(headers[0])
         return [resolved for path in paths
                 if (resolved := _resolve_path(path, task_id))]
+
+    def _record_obligations(session_id: str, act: _Activation | None,
+                            tool_name: str, str_args: list[str],
+                            resolved_paths: list[str]) -> None:
+        """A rule whose declared refs apply to a REAL file mutation is owed for
+        the session. Refs stay opaque data here (never resolved or executed);
+        only the continuation gate holds on them. Recording is independent of
+        the one-time delivery lane, so an already-fired rule still owes its
+        checks on every later match, and a store failure never breaks delivery.
+        """
+        if obligations is None or act is None or not session_id:
+            return
+        if not resolved_paths or tool_name not in mutating_tools:
+            return
+        for rule in (*act.always, *act.reminders):
+            refs = tuple(dict.fromkeys([*rule.check_refs, *rule.verification_refs]))
+            if not refs:
+                continue
+            if not _matches(rule, tool_name, str_args, resolved_paths, act.cwd):
+                continue
+            try:
+                obligations.record(session_id, obligations.Obligation(
+                    rule_id=obligations.RuleId(rule.id), rule_name=rule.name,
+                    source=rule.path,
+                    refs=refs, paths=tuple(resolved_paths),
+                    recorded_at=obligations.now_iso()))
+            except (AttributeError, NameError, OSError, RuntimeError,
+                    TypeError, ValueError) as exc:
+                logger.warning("rules: could not record acceptance obligation for "
+                               "rule %s (%s); completion keeps its acceptance "
+                               "gate, but this obligation will not be reported",
+                               rule.name, exc, exc_info=True)
+
+    def _obligation_rows(session_id: str) -> list[dict]:
+        """This session's owed obligations (opaque refs), for rules_explain."""
+        if obligations is None or not session_id:
+            return []
+        try:
+            stored = obligations.for_session(session_id)
+        except (AttributeError, NameError, OSError, RuntimeError,
+                TypeError, ValueError) as exc:
+            logger.warning("rules: could not read acceptance obligations for "
+                           "session %s (%s); rules_explain reports none",
+                           session_id, exc, exc_info=True)
+            return []
+        return [{"rule_id": o.rule_id, "rule_name": o.rule_name, "source": o.source,
+                 "refs": list(o.refs), "paths": list(o.paths),
+                 "recorded_at": o.recorded_at} for o in stored]
 
     def _conflicts(rules: list[_Rule]) -> list[dict]:
         """Explicit conflicts only — same rule name with different content
@@ -477,7 +591,7 @@ def register(ctx) -> None:
         # pre-tool policy (agent/tool_executor.py), so the executor and
         # args are never modified; guidance rides the real tool result and
         # each rule is delivered at most once per session.
-        if next_call is None or not ttsr_enabled or not isinstance(args, dict):
+        if next_call is None or not isinstance(args, dict):
             return next_call(args) if next_call else None
         session_id = str(session_id or "")
         act = activation.get(session_id)
@@ -494,6 +608,9 @@ def register(ctx) -> None:
         claimed = []
         str_args = [v for v in args.values() if isinstance(v, str)]
         resolved_paths = _extract_paths(tool_name, args, task_id)
+        _record_obligations(session_id, act, tool_name, str_args, resolved_paths)
+        if not ttsr_enabled:
+            return next_call(args)  # guidance lane off; obligations are their own lane
         # Select and claim in one critical section: two tool calls from the
         # same parallel batch share this activation and must not both queue
         # the same reminder. The claim is provisional — it is rolled back
@@ -536,7 +653,17 @@ def register(ctx) -> None:
         return result + note
 
     def _drop_session(session_id: str = "", **_kw):
-        activation.pop(str(session_id or ""), None)
+        sid = str(session_id or "")
+        activation.pop(sid, None)
+        if obligations is None or not sid:
+            return
+        try:
+            obligations.clear(sid)
+        except (AttributeError, NameError, OSError, RuntimeError,
+                TypeError, ValueError) as exc:
+            logger.warning("rules: could not clear acceptance obligations for "
+                           "session %s (%s); stale obligations may still be "
+                           "reported", sid, exc, exc_info=True)
 
     def _agent_ok(rule: _Rule, agent: str) -> bool:
         return not rule.agents or any(
@@ -681,6 +808,9 @@ def register(ctx) -> None:
             "matched": matched,
             "rule_refs": _rule_refs([r for r in active_rules.values()
                                      if r.name in {m["name"] for m in matched}]),
+            "obligations": _obligation_rows(str(session_id or "")),
+            "obligation_store": asdict(obligations.stats())
+            if obligations is not None else {"disabled": True},
             "shadowed": shadowed,
             "conflicts": _conflicts([r for r in candidates
                                      if _matches(r, tool_name, str_args, resolved, cwd)]),
@@ -697,7 +827,9 @@ def register(ctx) -> None:
                     "description": "Explain rule decisions for intended paths/tool/agent: "
                                    "applicable rules with stable ids and sources, why they "
                                    "matched, precedence/shadowing, explicit conflicts with "
-                                   "both sources, and budget omissions. Read-only.",
+                                   "both sources, budget omissions, and the acceptance "
+                                   "obligations this session still owes from matched rules "
+                                   "(opaque refs). Read-only.",
                     "parameters": {"type": "object", "properties": {
                         "paths": {"type": "array", "items": {"type": "string"},
                                   "description": "Intended file paths for the next edit."},

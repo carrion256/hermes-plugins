@@ -10,19 +10,10 @@ provides_hooks:
   - post_api_request
   - post_llm_call
   - subagent_stop
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings; without it every classification is recorded unavailable"
+  - "sibling plugin shadow-gate provides the shared verdict/outcome ledger for the subagent_effort.difficulty decision; without it the rows are counted as ledger_unavailable in the subagent_effort command note"
 config_schema:
-  endpoint:
-    type: str
-    default: "http://127.0.0.1:8102"
-    description: "Classifier service base URL."
-  served_model:
-    type: str
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: str
-    default: "CLASSIFIER_API_KEY"
-    description: "Env var holding the Bearer key (name only; value read at call time)."
   low_effort:
     type: str
     default: "low"

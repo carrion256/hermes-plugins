@@ -238,7 +238,8 @@ MAGIC_MARKERS = {
 def test_magic_keywords_active_by_default_from_prose(load_plugin):
     harness = load_plugin("keyword-steering", settings={})
     bare = {k: v["bare"] for k, v in _status(harness)["magic_keywords"].items()}
-    assert bare == {"ultrathink": True, "orchestrate": False, "workflow": False}
+    assert bare == {"ultrathink": True, "orchestrate": False, "workflow": False,
+                    "cheap": False, "deep": False, "local": False, "dry": False}
     for keyword, message in MAGIC_MESSAGES.items():
         results = _turn(harness, message, turn_id=f"turn-{keyword}")
         assert len(results) == 1
@@ -378,7 +379,8 @@ def test_status_lists_magic_keyword_provenance(load_plugin):
     harness = load_plugin("keyword-steering", settings={})
     _turn(harness, "/orchestrate the migration please")
     status = _status(harness)
-    assert set(status["magic_keywords"]) == {"ultrathink", "orchestrate", "workflow"}
+    assert set(status["magic_keywords"]) == {"ultrathink", "orchestrate", "workflow",
+                                             "cheap", "deep", "local", "dry"}
     assert all(entry["enabled"] is True
                and entry["source"] == "built-in (OMP-compatible)"
                for entry in status["magic_keywords"].values())

@@ -49,19 +49,37 @@ Native agent access: ``agent.subagent_lifecycle.get_active_subagent_parent``
 dispatch preserves context via copy_context). Detached forks and
 platform=subagent contexts are refused; the agent's session_id must
 equal the hook's session_id.
+
+Rule-declared obligations: when the rules plugin is present, a rule that names
+``check_refs``/``verification_refs`` and matched a real file mutation records an
+obligation for the session (``plugins/rules/obligations.py``, read through the
+shared module instance). ``pre_verify`` treats each owed ref like a required
+outcome: it must be covered by a BOUND declaration whose ``refs`` contain that
+exact ref or whose check identity equals it — the ordinary coverage path, since
+those are ordinary declarations. The hold is a normal, counted blocker naming
+``rule → ref → paths`` and the exact ``acceptance`` call that satisfies it.
+Disable with ``rule_obligations: false``; an absent rules plugin means no
+obligations and no hold. ``plugins/continuation/closure.py`` is the single
+typed reader for "did this session close?", used by ``acceptance status`` and
+by sibling plugins alike.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
+import sys
 import threading
 import uuid
+from collections.abc import Mapping
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from types import ModuleType
+from typing import Any, Dict, Final, List, Optional
 import weakref
 
 logger = logging.getLogger(__name__)
@@ -101,6 +119,62 @@ _ACCEPTANCE_ACTIONS = ("declare", "bind", "status", "disposition")
 _CHECK_KINDS = ("terminal", "scenario", "external")
 _DISPOSITIONS = ("cancelled", "blocked", "clear")
 _COVERAGE_VALUES = ("covered", "gap", "cancelled")
+_OBLIGATIONS_MODULE = "hermes_plugins_rules_obligations"
+_CLOSURE_MODULE = "hermes_plugins_continuation_closure"
+# Gate-friction sink (plugins/papercuts/friction.py). This plugin is only a
+# PRODUCER: the sink's own module owns the slot, the dedupe window and the
+# counters, and it registers itself under this name when it is loaded.
+_FRICTION_MODULE = "hermes_plugins_papercuts_friction"
+# A repeated hold is worth a papercut only after this many consecutive holds on
+# the SAME blocker; 0 disables reporting (the streak is still counted).
+_DEFAULT_FRICTION_AFTER_HOLDS: Final = 3
+# Detail bound: the summary already carries the signal, so a runaway blocker
+# must never turn a friction row into an unbounded payload.
+_FRICTION_DETAIL_LIMIT: Final = 1_000
+_FRICTION_DIGEST_LEN: Final = 16
+
+
+def _path_load(plugin: str, module_name: str, filename: str) -> ModuleType | None:
+    """Load one sibling plugin module by file path. Both modules register
+    themselves in ``sys.modules`` under these names, so an already-loaded copy
+    is reused and one instance owns the shared state. Unavailable ⇒ ``None``
+    with a logged reason: the feature it feeds is simply off, never a crash.
+    """
+    shared = sys.modules.get(module_name)
+    if isinstance(shared, ModuleType):
+        return shared
+    target = Path(__file__).resolve().parent.parent / plugin / filename
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, target)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {target}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+        return module
+    except Exception:
+        logger.warning("continuation: %s/%s unavailable; the lane it feeds stays off",
+                       plugin, filename, exc_info=True)
+        return None
+
+
+def _friction_module() -> ModuleType | None:
+    """The papercuts gate-friction sink, or ``None`` when papercuts is not
+    installed. Loaded through the shared sibling loader so one process keeps one
+    sink. Absent is a normal configuration, never an error at register time."""
+    return _path_load("papercuts", _FRICTION_MODULE, "friction.py")
+
+
+def _blocker_digest(text: str) -> str:
+    """Identity of ONE normalised blocker. Whitespace-insensitive so a
+    re-rendered message with the same content is still the same repeated hold."""
+    normalised = " ".join(str(text or "").split())
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:_FRICTION_DIGEST_LEN]
+
 
 _COVERAGE_FOCUS = (
     " ACCEPTANCE COVERAGE IS PART OF THE CONTRACT: your canonical verdict "
@@ -139,12 +213,115 @@ def _now_iso() -> str:
 
 def register(ctx) -> None:
     max_review_rounds = max(1, int(ctx.get_config("max_review_rounds", 2) or 2))
+    # A non-boolean value keeps the safe default (hold on rule obligations) and
+    # says so; silently disabling a gate would hide a required check.
+    rule_obligations_setting = ctx.get_config("rule_obligations", True)
+    rule_obligations = rule_obligations_setting if isinstance(
+        rule_obligations_setting, bool) else True
+    if not isinstance(rule_obligations_setting, bool):
+        logger.warning("continuation: rule_obligations is not a boolean; using the "
+                       "safe default (true)")
+    # Repeated-hold reporting threshold. A non-integer or negative value keeps
+    # the default rather than silently turning the producer off (or on forever).
+    friction_setting = ctx.get_config(
+        "friction_after_holds", _DEFAULT_FRICTION_AFTER_HOLDS)
+    try:
+        friction_after_holds = int(friction_setting)
+    except (TypeError, ValueError):
+        friction_after_holds = _DEFAULT_FRICTION_AFTER_HOLDS
+        logger.warning("continuation: friction_after_holds is not an integer; using the "
+                       "safe default (%d)", _DEFAULT_FRICTION_AFTER_HOLDS)
+    if friction_after_holds < 0:
+        friction_after_holds = _DEFAULT_FRICTION_AFTER_HOLDS
+        logger.warning("continuation: friction_after_holds is negative; using the "
+                       "safe default (%d)", _DEFAULT_FRICTION_AFTER_HOLDS)
+    _module_memo: dict[str, ModuleType | None] = {}
     _session_lock = threading.Lock()
     _owners: Dict[str, str] = {}
     _memory_blockers: Dict[str, Any] = {}
 
+    def _obligation_store() -> ModuleType | None:
+        """The rules plugin's obligation store (loaded once per process)."""
+        if "obligations" not in _module_memo:
+            _module_memo["obligations"] = _path_load(
+                "rules", _OBLIGATIONS_MODULE, "obligations.py")
+        return _module_memo["obligations"]
+
+    def _closure_reader() -> ModuleType | None:
+        """This plugin's own typed closure reader, loaded through the same
+        path-loader siblings use — one implementation, no second copy."""
+        if "closure" not in _module_memo:
+            _module_memo["closure"] = _path_load(
+                "continuation", _CLOSURE_MODULE, "closure.py")
+        return _module_memo["closure"]
+
+    def _unmet_rule_obligations(session_id: str,
+                               criteria: Mapping[str, object]) -> list[str]:
+        """Rule-declared checks this session still owes. An obligation ref is
+        covered only by a BOUND declaration naming it in ``refs`` (exact string)
+        or pinning it as ``check_identity`` — the same evidence the outcome gate
+        requires, so a declared-but-unproven criterion satisfies nothing. Those
+        declarations are ordinary criteria, so they enter ``required`` coverage
+        through ``_acceptance_state`` with no extra work here. Absent rules
+        plugin or unreadable store ⇒ no obligations, never a hold."""
+        store = _obligation_store() if rule_obligations else None
+        if store is None or not session_id:
+            return []
+        try:
+            owed = store.for_session(session_id)
+        except Exception:
+            logger.warning("continuation: rule obligations unreadable for session %s",
+                           session_id, exc_info=True)
+            return []
+        covered: set[str] = set()
+        for crit in criteria.values():
+            if not isinstance(crit, dict) or not crit.get("evidence"):
+                continue
+            disposition = crit.get("disposition")
+            if isinstance(disposition, dict) and str(
+                    disposition.get("status")) in ("cancelled", "blocked"):
+                continue
+            identity = str(crit.get("check_identity") or "")
+            if identity:
+                covered.add(identity)
+            refs = crit.get("refs")
+            if isinstance(refs, list):
+                covered.update(str(ref) for ref in refs)
+        unmet: list[str] = []
+        for obligation in owed:
+            for ref in obligation.refs:
+                if ref in covered:
+                    continue
+                paths = ", ".join(obligation.paths) or "(no recorded path)"
+                unmet.append(
+                    f"rule {obligation.rule_id} ({obligation.rule_name or 'unnamed'}) "
+                    f"→ {ref!r} → {paths} requires bound acceptance; declare it with "
+                    'acceptance {"action":"declare","id":"<criterion id>",'
+                    '"observable":"<what must be observable>","check_kind":"terminal",'
+                    f'"check_identity":"{ref}","paths":["<workspace-relative path>"],'
+                    f'"refs":["{ref}"]}} and bind its fresh result with '
+                    'acceptance {"action":"bind","id":"<criterion id>",'
+                    '"evidence_id":<native evidence id>}')
+        return unmet
+
     def _session_key(session_id: str) -> str:
         return _STATE_PREFIX + session_id
+
+    def _closure_view(session_id: str) -> dict[str, object] | None:
+        """This session's completion closure through the ONE typed reader
+        (``plugins/continuation/closure.py``) that sibling plugins also use —
+        status and any other consumer can never disagree. An unreadable store
+        is reported, not hidden."""
+        reader = _closure_reader()
+        if reader is None:
+            return None
+        try:
+            view = reader.read_closure(session_id, state_reader=ctx.state.get)
+        except Exception:
+            logger.warning("continuation: completion closure unreadable for session %s",
+                           session_id, exc_info=True)
+            return None
+        return None if view is None else asdict(view)
 
     def _session_record(session_id: str) -> Dict[str, Any]:
         try:
@@ -177,6 +354,115 @@ def register(ctx) -> None:
                     _memory_blockers[session_id] = (owner, _blockers_text(blockers))
                 else:
                     _memory_blockers.pop(session_id, None)
+
+    def _friction_state(record: dict[str, object]) -> dict[str, object]:
+        """This session's durable repeated-hold bookkeeping, created on first
+        use. Records written before this feature exists are parsed field by
+        field, never trusted."""
+        state = record.get("friction")
+        if not isinstance(state, dict):
+            state = {}
+            record["friction"] = state
+        if not isinstance(state.get("hold_counts"), dict):
+            state["hold_counts"] = {}
+        if not isinstance(state.get("reported"), list):
+            state["reported"] = []
+        return state
+
+    def _friction_counters(state: dict[str, object]) -> dict[str, int]:
+        """Per-blocker hold streaks, dropping anything unparseable."""
+        counts = state.get("hold_counts")
+        if not isinstance(counts, dict):
+            return {}
+        return {str(key): value for key, value in counts.items()
+                if isinstance(value, int) and not isinstance(value, bool)}
+
+    def _friction_reported(state: dict[str, object]) -> list[str]:
+        """Blocker digests already filed for this session (one row each)."""
+        reported = state.get("reported")
+        return [str(item) for item in reported] if isinstance(reported, list) else []
+
+    def _friction_view(record: dict[str, object]) -> dict[str, object]:
+        """Read-only producer state for ``acceptance status``: the threshold,
+        the live per-blocker streaks, how many rows were filed, and the sink's
+        last answer. ``friction_unavailable`` is itself a reported outcome: the
+        producer ran and papercuts was not there to receive."""
+        state = record.get("friction")
+        if not isinstance(state, dict):
+            state = {}
+        reason = state.get("last_reason")
+        return {"enabled": friction_after_holds > 0,
+                "threshold": friction_after_holds,
+                "reported": len(_friction_reported(state)),
+                "hold_counts": _friction_counters(state),
+                "last_reason": str(reason) if isinstance(reason, str) else None,
+                "unavailable": bool(state.get("unavailable"))}
+
+    def _friction_detail(text: str) -> str:
+        """Blocker text for the sink: the native egress redaction the host
+        applies to its own outbound text, then bounded. The redactor lives in
+        the host; when it cannot be imported the row still goes out bounded
+        rather than not at all."""
+        try:
+            from agent.redact import redact_for_egress
+        except ImportError:
+            logger.debug("continuation: native egress redactor unavailable; filing "
+                         "the bounded blocker text as-is", exc_info=True)
+            return str(text)[:_FRICTION_DETAIL_LIMIT]
+        return str(redact_for_egress(str(text)))[:_FRICTION_DETAIL_LIMIT]
+
+    def _report_repeated_holds(session_id: str, record: dict[str, object]) -> bool:
+        """Count THIS hold against each blocker's streak and file exactly one
+        gate-friction row when one blocker keeps the turn held.
+
+        Counting and reporting are deliberately separate: the streak is durable
+        even where no sink exists, so ``acceptance status`` can say so. Returns
+        whether the record changed, so the caller writes only when there is
+        something new to persist."""
+        if friction_after_holds <= 0:
+            return False
+        state = _friction_state(record)
+        previous = _friction_counters(state)
+        raw = record.get("blockers")
+        candidates = [str(item) for item in raw] if isinstance(raw, list) else []
+        streaks: dict[str, int] = {}
+        texts: dict[str, str] = {}
+        for candidate in candidates:
+            normalised = candidate.strip()
+            if not normalised:
+                continue
+            digest = _blocker_digest(normalised)
+            if digest in streaks:
+                continue
+            streaks[digest] = previous.get(digest, 0) + 1
+            texts[digest] = normalised
+        # Only blockers present in THIS hold carry a streak forward: a blocker
+        # that stopped holding the turn is a new streak, not a longer one.
+        state["hold_counts"] = streaks
+        if state.get("unavailable"):
+            return True
+        reported = _friction_reported(state)
+        changed = False
+        for digest in [key for key in streaks if key not in reported]:
+            if streaks[digest] < friction_after_holds:
+                continue
+            sink = _friction_module()
+            if sink is None:
+                # No papercuts in this process: stay silent, stop probing for it,
+                # and let the status name the reason instead of guessing.
+                state["unavailable"] = True
+                state["last_reason"] = "friction_unavailable"
+                break
+            receipt = sink.report(sink.GateFriction(
+                source="continuation", kind="repeated_hold", identity=digest,
+                summary=f"continuation held {streaks[digest]}x on the same blocker",
+                detail=_friction_detail(texts[digest]), session_id=session_id))
+            reported.append(digest)
+            state["reported"] = reported
+            reason = getattr(receipt, "reason", None)
+            state["last_reason"] = str(reason) if isinstance(reason, str) else "error"
+            changed = True
+        return changed or streaks != previous
 
     def _clear_session(**kwargs) -> None:
         session_id = str(kwargs.get("session_id") or kwargs.get("session_key") or "")
@@ -883,6 +1169,8 @@ def register(ctx) -> None:
                                             for t, s in _todo_rows(agent)],
                            "uncovered_todo_outcomes": sorted(required - set(criteria)),
                            "blocked_criteria": blocked,
+                           "friction": _friction_view(record),
+                           "closure": _closure_view(session_id),
                            "evidence_observations": observations},
                           default=str)
 
@@ -897,7 +1185,7 @@ def register(ctx) -> None:
                     "check_kind": {"type": "string", "enum": list(_CHECK_KINDS)},
                     "check_identity": {"type": "string", "description": "Exact command or scenario identity the evidence must carry."},
                     "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative source paths the criterion is about."},
-                    "refs": {"type": "array", "items": {"type": "string"}, "description": "Optional source/rule references."},
+                    "refs": {"type": "array", "items": {"type": "string"}, "description": "Optional source/rule references. A rule-declared obligation ref is covered only by this list verbatim (or by check_identity equal to it) AND a bound criterion; an unbound or cancelled declaration covers nothing."},
                     "evidence_id": {"type": "integer", "description": "bind: explicitly selected real native verification event id; validated against the host lookup for this session/workspace (unavailable host = unverified, never auto-bound)."},
                     "disposition": {"type": "string", "enum": ["cancelled", "blocked", "clear"]},
                     "reason": {"type": "string"}},
@@ -1344,8 +1632,8 @@ def register(ctx) -> None:
                             + ". Address these, re-verify, and finish only after a clean review "
                               "binds the fresh evidence.")}
 
-    def pre_verify(session_id: str = "", coding: bool = False, attempt: int = 0,
-                   changed_paths=None, final_response: str = "", **_rest):
+    def _verify(session_id: str = "", coding: bool = False, attempt: int = 0,
+                changed_paths=None, final_response: str = "", **_rest):
         if not coding or not session_id:
             return None  # non-coding / unknown-session turns pass through
         owner = ""
@@ -1417,6 +1705,19 @@ def register(ctx) -> None:
                                     + _blockers_text(blockers)
                                     + ". A reviewer cannot substitute for native evidence; "
                                       "run the declared checks and bind their evidence ids.")}
+            # Rule-declared checks (rules plugin) are owed like any other
+            # required outcome: no bound declaration covering the ref, no
+            # release. Counted in record["blockers"] so the final response is
+            # labelled, never a silent hold.
+            owed = _unmet_rule_obligations(session_id, _acriteria)
+            if owed:
+                record["blockers"] = list(record.get("findings") or []) + owed
+                _save(session_id, record, owner)
+                return {"action": "continue",
+                        "message": ("Rule-declared acceptance obligations are unmet: "
+                                    + _blockers_text(owed)
+                                    + ". A reviewer cannot substitute for the checks the "
+                                      "rule files themselves declare required.")}
             drift = _bound_source_drift(record, session_id, workspace)
             if drift:
                 blockers = [f"acceptance criterion {cid} evidence no longer certifies "
@@ -1577,6 +1878,42 @@ def register(ctx) -> None:
                 logger.debug("continuation: blocker label persistence failed", exc_info=True)
             return None  # host budget decides; label marks the outcome unverified
 
+    def pre_verify(session_id: str = "", coding: bool = False, attempt: int = 0,
+                   changed_paths=None, final_response: str = "", **_rest):
+        """The completion gate, plus the one accounting step that must follow a
+        hold: a blocker that keeps holding the SAME turn is itself a papercut —
+        the agent is re-asking for something it has not acted on — so it is
+        filed with the shared gate-friction sink.
+
+        Observation only: the directive below is exactly what the gate decided,
+        and no friction failure may change it."""
+        directive = _verify(session_id=session_id, coding=coding, attempt=attempt,
+                            changed_paths=changed_paths, final_response=final_response,
+                            **_rest)
+        if not isinstance(directive, dict) or not session_id:
+            return directive
+        if str(directive.get("action") or "") != "continue":
+            return directive
+        try:
+            with _session_lock:
+                owner = _owners.get(session_id, "")
+            if not owner:
+                # The gate released this session (reset/finalize) while the
+                # callback ran: there is no record left to account against.
+                return directive
+            record = _session_record(session_id)
+            if _report_repeated_holds(session_id, record):
+                # Same owner the gate just wrote under: a genuine new turn that
+                # took the gate in between fences this write out (ValueError),
+                # which is exactly the reset semantics the streak needs.
+                _save(session_id, record, owner)
+        except Exception:
+            # Boundary observer around another plugin's sink: filing friction
+            # must never break the gate, release the turn, or lose the hold.
+            logger.warning("continuation: gate-friction accounting failed for session %s",
+                           session_id, exc_info=True)
+        return directive
+
     def transform_llm_output(response_text: str = "", session_id: str = "", **_rest):
         """Label the outcome honestly: unresolved blockers are appended to the
         final response so a capped, timed-out, or failed release is never
@@ -1663,6 +2000,10 @@ def register(ctx) -> None:
                 if genuine_turn:
                     # Review budget is per genuine user turn.
                     record["rounds"] = 0
+                    # So is a repeated-hold streak: a new request starts a new
+                    # streak (which blockers were already FILED stays recorded —
+                    # one row per blocker per session, not per turn).
+                    _friction_state(record)["hold_counts"] = {}
             _save(session_id, record, owner)
         except Exception:
             logger.debug("continuation: pre_llm_call capture failed", exc_info=True)

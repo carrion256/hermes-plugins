@@ -1,12 +1,16 @@
 name: chain-compaction
 version: 0.2.0
-description: "Ordered compaction cascade: runs configured methods in sequence (classifier prune, tool-output clip, stale-pair drop), advancing to the next whenever a stage fails or under-delivers, stopping when the cumulative reduction is substantial enough, and always falling back to the untouched built-in summary."
+description: "Ordered compaction cascade: runs configured methods in sequence (chain-of-thought deletion, classifier prune, tool-output clip, stale-pair drop), advancing to the next whenever a stage fails or under-delivers, stopping when the cumulative reduction is substantial enough, and always falling back to the untouched built-in summary. Configured tool pins (pinned_tools, default prewalk_ready) keep a plan handoff's call/result pair out of every reduction path."
 author: "hermes-plugins (cascade design; reuses the fast-compaction pruner)"
 manifest_version: 2
 api_version: 1
 provides_tools:
   - chain_compaction_status
 provides_hooks: []
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings; without it the prune stage misses with prune_unavailable:classifier_core and the pure stages still run"
+  - "sibling plugin fast-compaction provides the prune stage's keep/drop policy (pruner.py) and the proactive eviction policy (proactive.py); without it prune is a miss and the proactive seam keeps host behaviour"
+  - "sibling plugin papercuts receives one gate friction per summary backstop; without it the backstop is counted as friction_unavailable and never filed"
 config_schema:
   enabled:
     type: bool
@@ -14,8 +18,8 @@ config_schema:
     description: "When false the engine defers every compression to the built-in summary path."
   pipeline:
     type: string
-    default: "prune,clip,drop_stale"
-    description: "Comma-separated ordered stage names from: prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs), summary (the normal compaction engine itself), plus any stage registered through stage_modules. Without summary the cascade commits verbatim output and the built-in only runs as the under-delivery backstop — one or the other, never both. With summary last (for example \"prune,summary\") they compose: the earlier stages reduce, the built-in then summarises what survived, and no earlier stage may commit early and skip it."
+    default: "drop_reasoning,prune,clip,drop_stale"
+    description: "Comma-separated ordered stage names from: drop_reasoning (deletes chain-of-thought — reasoning/reasoning_content/reasoning_details and thinking blocks — from assistant turns older than the protected window; pure deletion, never rewrites visible text or tool calls), prune (classifier keep/drop via fast-compaction), clip (head+tail truncation of oversized tool results), drop_stale (positional removal of old tool pairs), summary (the normal compaction engine itself), plus any stage registered through stage_modules. Without summary the cascade commits verbatim output and the built-in only runs as the under-delivery backstop — one or the other, never both. With summary last (for example \"prune,summary\") they compose: the earlier stages reduce, the built-in then summarises what survived, and no earlier stage may commit early and skip it."
   stage_modules:
     type: list
     default: []
@@ -28,22 +32,10 @@ config_schema:
     type: float
     default: 0.05
     description: "Minimum reduction a single stage must produce on its own; below it the stage counts as 'not substantial enough' and the next one runs."
-  endpoint:
-    type: string
-    default: "http://127.0.0.1:8102"
-    description: "Classifier base URL (prune stage only). Never log or echo the key."
-  served_model:
-    type: string
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: string
-    default: "CLASSIFIER_API_KEY"
-    description: "Environment variable holding the classifier bearer key."
   request_timeout:
     type: float
     default: 20.0
-    description: "Seconds per classifier request."
+    description: "Seconds passed explicitly with each classifier request the prune stage makes through the shared classifier-core client."
   preserve_recent_messages:
     type: int
     default: 6
@@ -68,6 +60,10 @@ config_schema:
     type: object
     default: {}
     description: "Overrides forwarded to the fast-compaction pruner (max_state_tokens, max_request_tokens, truncate_head_chars, drop_confidence). A key set here wins over this plugin's own setting for that key."
+  pinned_tools:
+    type: list
+    default: ["prewalk_ready"]
+    description: "Tool names whose call/result pairs NO stage may clip, drop or prune, on top of the positional protections (first message, the protected recent window, a call whose result is missing). The default keeps the prewalk plan handoff — the validated brief an execution model cannot reconstruct once a compaction has summarised it away. Applies to prune, clip, drop_stale and the proactive eviction path. An empty list restores the unconfigured behaviour; an entry that is not a non-empty tool name is refused at register."
   proactive_prune_mode:
     type: string
     default: "off"

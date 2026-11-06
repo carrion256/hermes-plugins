@@ -3,7 +3,6 @@ import json
 import time
 
 import pytest
-
 from agent.subagent_lifecycle import bind_subagent_parent
 
 
@@ -33,28 +32,20 @@ def bind_agent(agent, task_id, cwd):
 
 
 def setup(load_plugin, monkeypatch, agent=None, **settings):
-    h = load_plugin("auto-answer-classifier", {"api_key_env": "ANSWER_TEST_KEY", **settings})
+    h = load_plugin("auto-answer-classifier", settings or None)
     if agent is not None:
         monkeypatch.setattr(h.module, "_owner", lambda *a: (agent, agent.session_id, agent._current_turn_id))
-    monkeypatch.delenv("ANSWER_TEST_KEY", raising=False)
     return h
 
 
-def systemone_reply(choice, probabilities, confidence=0.99, sound_default=0.99):
-    """One ``/v1/systemone`` envelope: a choice answer plus a yes/no answer."""
-    class Reply:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_a):
-            return False
-
-        def read(self, size=-1):
-            return json.dumps({"model": "test", "usage": {}, "answers": {
-                "pick": {"type": "choice", "choice": choice,
-                         "probabilities": probabilities, "confidence": confidence},
-                "sound_default": {"type": "noul", "noul": sound_default}}}).encode()
-    return Reply()
+def ranking_reply(choice, probabilities, confidence=0.99, sound_default=0.99):
+    """The answer to this plugin's ONE request: the pick and the soundness head."""
+    def reply(*_args, **_kwargs):
+        return {"answers": {
+            "pick": {"type": "choice", "choice": choice,
+                     "probabilities": probabilities, "confidence": confidence},
+            "sound_default": {"type": "noul", "noul": sound_default}}}
+    return reply
 
 
 def observed_proof(h, *, session_id="owner", turn_id="turn", task_id="task",
@@ -147,19 +138,13 @@ def test_expired_observation_is_refused(load_plugin, tmp_path, monkeypatch):
     assert result["recorded"] is False
 
 
-def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_path, monkeypatch):
+def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_path, monkeypatch,
+                                                               classifier_stub):
     agent = native_agent()
+    # Registering is what resolves the shared client, so the stand-in has to be in place
+    # first: installed afterwards, the plugin would hold the real transport.
+    stub = classifier_stub.install(ranking_reply("1", {"0": 0.01, "1": 0.98}, confidence=0.98))
     h = setup(load_plugin, monkeypatch, agent)
-    captured = []
-
-    def fake_urlopen(request, *_a, **_kw):
-        captured.append({"url": request.full_url,
-                         "auth": request.headers.get("Authorization"),
-                         "body": json.loads(request.data)})
-        return systemone_reply("1", {"0": 0.01, "1": 0.98}, confidence=0.98)
-
-    monkeypatch.setenv("ANSWER_TEST_KEY", "synthetic-key")
-    monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
     raw = json.dumps({"clarification_defaults": [
         {"question": "Which indentation?", "choice": "tabs"},
         {"question": "Which indentation?", "choice": "spaces"},
@@ -171,11 +156,13 @@ def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_
             "action": "recommend", "question": "Which indentation?",
             "choices": ["tabs", "spaces"], "evidence": [reference]}, task_id="task"))
     assert result["status"] == "recommended" and result["applied"] is False
-    assert len(captured) == 1  # exactly one ranking call
-    request = captured[0]
-    assert request["url"].endswith("/v1/systemone")
-    assert request["auth"] == "Bearer synthetic-key"  # the key goes out; the state never does unredacted
-    questions = request["body"]["questions"]
+    assert len(stub.calls) == 1  # exactly one ranking call
+    request = stub.calls[0]
+    # Every decline is attributed to this caller in the shared client's counters, and
+    # the wait is the transport's to compute (the bearer key never leaves it).
+    assert request["caller"] == "auto-answer-classifier"
+    assert request["timeout"] is None
+    questions = request["questions"]
     # ALL options ranked, identity by label; pick "1" maps to spaces, not index 0.
     assert questions["pick"]["type"] == "choice"
     assert questions["pick"]["criteria"] == {"0": "tabs", "1": "spaces"}
@@ -188,24 +175,23 @@ def test_ranking_consults_all_choices_once_and_labels_identity(load_plugin, tmp_
     assert result["ranking"]["sound_default"] == pytest.approx(0.99)
 
 
-def test_near_tie_ranking_abstains_until_the_margin_is_decisive(load_plugin, tmp_path, monkeypatch):
+def test_near_tie_ranking_abstains_until_the_margin_is_decisive(load_plugin, tmp_path, monkeypatch,
+                                                                classifier_stub):
     """P(pick)=0.51 vs 0.49 is a coin flip: the margin gate refuses it, and only the gate does."""
     agent = native_agent()
-    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n")
-
-    def fake_urlopen(request, *_a, **_kw):
-        return systemone_reply("0", {"0": 0.51, "1": 0.49}, confidence=0.51)
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n", encoding="utf-8")
+    reply = ranking_reply("0", {"0": 0.51, "1": 0.49}, confidence=0.51)
 
     for margin, expected in ((0.1, "abstained"), (0.0, "recommended")):
+        stub = classifier_stub.install(reply)
         h = setup(load_plugin, monkeypatch, agent, min_pick_margin=margin)
-        monkeypatch.setenv("ANSWER_TEST_KEY", "synthetic-key")
-        monkeypatch.setattr(h.module.urllib.request, "urlopen", fake_urlopen)
         with bind_agent(agent, "task", tmp_path):
             result = json.loads(h.tool("clarification_defaults", {
                 "action": "recommend", "question": "Which indentation?",
                 "choices": ["tabs", "spaces"],
                 "evidence": [{"path": ".editorconfig"}]}, task_id="task"))
         assert result["status"] == expected, margin
+        assert len(stub.calls) == 1, margin  # one request per ranking, either way
         if expected == "recommended":
             assert result["selected"] == "tabs"
             assert result["ranking"]["margin"] == pytest.approx(0.02)
@@ -248,7 +234,7 @@ def test_conditional_conflicting_and_unset_values_abstain(load_plugin, tmp_path,
 def test_rank_receives_actual_key_value_scope_evidence(load_plugin, tmp_path, monkeypatch):
     agent = native_agent()
     h = setup(load_plugin, monkeypatch, agent)
-    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n")
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n", encoding="utf-8")
     seen = []
     def fake_rank(q, choices, candidates, proofs, *a):
         seen.append((q, list(choices), list(candidates), proofs))
@@ -320,7 +306,7 @@ def test_width_values_match_only_width_domains(load_plugin, tmp_path, monkeypatc
 def test_style_and_size_domains_never_cross(load_plugin, tmp_path, monkeypatch):
     agent = native_agent()
     h = setup(load_plugin, monkeypatch, agent)
-    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n")
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n", encoding="utf-8")
     monkeypatch.setattr(h.module, "rank", lambda *a: "tabs")
     with bind_agent(agent, "task", tmp_path):
         result = json.loads(h.tool("clarification_defaults", {
@@ -375,9 +361,11 @@ def test_stale_evidence_hash_is_rejected(load_plugin, tmp_path, monkeypatch):
     assert result["status"] == "abstained"
 
 
-def test_secret_bearing_evidence_never_serves_default(load_plugin, tmp_path, monkeypatch):
+def test_secret_bearing_evidence_never_serves_default(load_plugin, tmp_path, monkeypatch,
+                                                      classifier_stub):
     agent = native_agent()
     h = setup(load_plugin, monkeypatch, agent)
+    stub = classifier_stub.install(ranking_reply("0", {"0": 0.99, "1": 0.01}))
     (tmp_path / "evidence.json").write_bytes(b'{"token":"super-secret-token"}')
     import agent.redact as native_redact
     monkeypatch.setattr(native_redact, "redact_for_egress", lambda text: "[redacted]")
@@ -389,6 +377,7 @@ def test_secret_bearing_evidence_never_serves_default(load_plugin, tmp_path, mon
                           "sha256": hashlib.sha256((tmp_path / "evidence.json").read_bytes()).hexdigest()}]},
             task_id="task"))
     assert result["status"] == "abstained"
+    assert stub.calls == []  # redaction changed the state, so nothing reaches the transport
 
 
 def test_genuine_timeout_applies_recommendation_legacy_batch_advisory(load_plugin, tmp_path, monkeypatch):
@@ -471,7 +460,7 @@ def test_human_answer_wins_and_skip_never_applied(load_plugin, tmp_path, monkeyp
 ])
 def test_invalid_raw_config_cannot_recommend_or_apply(
         load_plugin, tmp_path, monkeypatch, name, content, question, choices, selection):
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
     agent = native_agent()
     h = setup(load_plugin, monkeypatch, agent)
     (tmp_path / name).write_text(content)
@@ -561,7 +550,7 @@ def test_leading_zero_width_is_explicitly_invalid(name, content, load_plugin, tm
 @pytest.mark.parametrize("mutation_phase", ["during_ranking", "during_clarification"])
 def test_changed_evidence_cannot_supply_a_timeout_default(
         load_plugin, tmp_path, monkeypatch, mutation_phase):
-    from tools.clarify_tool import clarify_tool, TIMEOUT_RESPONSE
+    from tools.clarify_tool import TIMEOUT_RESPONSE, clarify_tool
     agent = native_agent()
     h = setup(load_plugin, monkeypatch, agent)
     config = tmp_path / ".editorconfig"
@@ -598,3 +587,46 @@ def test_changed_evidence_cannot_supply_a_timeout_default(
                               session_id="owner", turn_id="turn", task_id="task",
                               next_call=clarify)
     assert result == native_results[0]
+
+
+def test_declined_request_abstains_without_inventing_a_default(load_plugin, tmp_path, monkeypatch,
+                                                               classifier_stub):
+    """A shared client that declines is a missing answer, never a reason to pick something.
+
+    The abstention must be exactly the one the offline gate produces: no selection, no
+    ranking, and no second request.
+    """
+    agent = native_agent()
+    stub = classifier_stub.install()  # every request comes back declined
+    h = setup(load_plugin, monkeypatch, agent)
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n", encoding="utf-8")
+    with bind_agent(agent, "task", tmp_path):
+        result = json.loads(h.tool("clarification_defaults", {
+            "action": "recommend", "question": "Which indentation?",
+            "choices": ["tabs", "spaces"],
+            "evidence": [{"path": ".editorconfig"}]}, task_id="task"))
+    assert result["status"] == "abstained", result
+    # An abstention invents nothing: no selection, no recorded ranking, no applied default.
+    assert "selected" not in result and "ranking" not in result and not result.get("applied")
+    assert len(stub.calls) == 1  # asked once, declined, and stopped there
+
+
+def test_missing_classifier_core_sibling_degrades_to_the_same_abstention(
+        load_plugin, tmp_path, monkeypatch, classifier_stub, caplog):
+    """Without the classifier-core plugin the tool still loads, warns once and abstains.
+
+    Registering must not raise, the recommendation must not invent a default, and the log
+    must name the missing sibling so an operator can install it.
+    """
+    agent = native_agent()
+    classifier_stub.install(absent=True)
+    h = setup(load_plugin, monkeypatch, agent)
+    assert any("classifier-core" in record.getMessage() for record in caplog.records)
+    (tmp_path / ".editorconfig").write_text("[*]\nindent_style = tab\n", encoding="utf-8")
+    with bind_agent(agent, "task", tmp_path):
+        result = json.loads(h.tool("clarification_defaults", {
+            "action": "recommend", "question": "Which indentation?",
+            "choices": ["tabs", "spaces"],
+            "evidence": [{"path": ".editorconfig"}]}, task_id="task"))
+    assert result["status"] == "abstained", result
+    assert "selected" not in result and "ranking" not in result

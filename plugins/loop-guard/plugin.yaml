@@ -1,5 +1,5 @@
 name: loop-guard
-version: 0.3.0
+version: 0.4.0
 description: "Bounded exact-repeat, short-cycle and structured-failure recovery; budgets count delivered native directives only."
 author: "dsh-plugins port"
 manifest_version: 2
@@ -29,3 +29,7 @@ config_schema:
     type: int
     default: 2
     description: "Maximum delivered tool vetoes per live turn. Exhausted failures remain visible at stop; zero disables intervention."
+  friction:
+    type: bool
+    default: true
+    description: "File one gate-friction row with the papercuts sink the first time the intervention budget is spent and another block would have been emitted: source=loop-guard, kind=budget_exhausted, identity=digest of the blocker invariant, detail=the current blocker JSON (already egress-redacted). Once per blocker per session; counted and surfaced by loop_recovery status as friction={reported,last_reason}. With papercuts absent nothing is filed and the status reports friction.last_reason=friction_unavailable — never a crash. A non-boolean value keeps the safe default (true) with a logged warning."

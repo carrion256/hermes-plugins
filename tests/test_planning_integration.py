@@ -14,8 +14,8 @@ import json
 from inspect import getclosurevars
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-import pytest
 
+import pytest
 from agent.api_request_hooks import ApiRequestHooksMixin
 from agent.subagent_lifecycle import bind_subagent_parent
 
@@ -336,7 +336,6 @@ def test_detached_agent_never_switches(load_plugin, live_agent, workspace):
 
 
 def test_explicit_reset_rearms(load_plugin, live_agent):
-    agent = live_agent
     h = load_plugin("prewalk", settings={"target_model": TARGET})
     h.tool("prewalk_arm", {}, session_id="s")
     h.hook("on_session_reset", session_id="s")
@@ -895,31 +894,23 @@ def test_top_level_lane_still_requires_prewalk_ready(load_plugin, live_agent, wo
 
 
 @pytest.fixture
-def classifier(monkeypatch):
+def classifier(classifier_stub):
+    """The shared client, answering the difficulty question as the service does.
+
+    The verdict follows the goal text, so a test controls it by what it asks about.
+    Returns the requests made — a test asserts on that list to prove a call did or did
+    not happen. Installed at fixture setup, i.e. before any test body registers a
+    plugin and resolves its client.
+    """
     requests = []
 
-    class Reply:  # real context manager — urlopen result is used with `with`
-        def __init__(self, verdict):
-            self._body = json.dumps({"model": "fake", "usage": {},
-                                     "answers": {"difficulty": {"type": "choice",
-                                                                "choice": verdict}}}).encode()
+    def ask(state, questions, **_kwargs):
+        requests.append({"state": state, "questions": questions})
+        return {"answers": {"difficulty": {
+            "type": "choice",
+            "choice": "complex" if "complex-marker" in state else "simple"}}}
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            return self._body
-
-    def fake_urlopen(req, timeout=None):
-        requests.append(req)
-        verdict = "complex" if "complex-marker" in req.data.decode() else "simple"
-        return Reply(verdict)
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "test-key")
+    classifier_stub.install(ask)
     return requests
 
 
@@ -992,9 +983,9 @@ def test_invalid_effort_config_idles_plugin(load_plugin, classifier):
 
 
 def test_effort_levels_are_native_parsable(load_plugin, classifier):
-    from hermes_constants import parse_reasoning_effort
     from agent.reasoning_effort import clamp_effort
     from hermes_cli.models import clamp_reasoning_effort_to_supported
+    from hermes_constants import parse_reasoning_effort
 
     # real parser: every suggestion level produces a native config dict
     for level in ("none", "minimal", "low", "medium", "high", "xhigh"):
@@ -1278,6 +1269,7 @@ def test_report_lock_is_held_during_summary_iteration(load_plugin, classifier):
     # Use the registration hook's shared lock so the scheduling seam also
     # exists when the report's locking is deliberately removed.
     from inspect import getclosurevars
+
     from hermes_cli.plugins import get_plugin_command_handler
     register_child_hook = next(
         callback for callback in h.manager._hooks["subagent_start"]
@@ -1398,7 +1390,7 @@ def test_prewalk_handoff_feeds_real_provider_builders(load_plugin, live_agent, w
         # native todo tool executes a real write against the real store,
         # and the validated handoff on the genuine plan drives the switch
         todos = [{"id": "1", "content": "plan step", "status": "pending"}]
-        todo_result = todo_tool(todos=todos, store=store)
+        todo_tool(todos=todos, store=store)
         assert store.has_items()
         handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id="s"))
         assert handed["success"] is True
@@ -1443,7 +1435,7 @@ def test_tool_call_batch_bridge_arms_and_switches_with_exact_ids(
     from model_tools import handle_function_call
     from tools.todo_tool import TodoStore, todo_tool
     agent._todo_store = TodoStore()
-    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    load_plugin("prewalk", settings={"target_model": TARGET})
     with bind_subagent_parent(agent):
         # malformed legacy shape is rejected — the contract guard itself
         bad = json.loads(handle_function_call(
@@ -1462,7 +1454,7 @@ def test_tool_call_batch_bridge_arms_and_switches_with_exact_ids(
         assert result["armed"] is True
         assert result["target"] == TARGET
 
-        todo_result = todo_tool(
+        todo_tool(
             todos=[{"id": "1", "content": "plan step", "status": "pending"}],
             store=agent._todo_store,
         )
@@ -1532,3 +1524,122 @@ def test_ready_validates_effective_task_cwd(load_plugin, live_agent, tmp_path,
                                    task_id="t-override"))
         assert handed["success"] is True and handed["handed_off"] is True
         assert agent.model == TARGET
+
+
+# --- prewalk handoff durability across a compaction --------------------------
+#
+# The validated brief is exactly what a compaction summarises away, so prewalk keeps one
+# versioned durable record per session and re-injects it once after a committed
+# compaction. These run the real plugin against the native dispatcher and the real
+# durable-state facade under the per-test isolated $HERMES_HOME.
+
+
+def _durable_rows(h) -> dict:
+    """The plugin's stored state rows, read from disk the way the plugin writes them."""
+    rows = {}
+    for path in sorted((h.home / "plugin-data").glob("*/state.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            rows.update(payload)
+    return rows
+
+
+def _plan_and_hand_off(load_plugin, live_agent, session_id: str = "s"):
+    """Arm, produce a genuine native todo plan, and hand off via prewalk_ready."""
+    from tools.todo_tool import TodoStore, todo_tool
+    agent = live_agent
+    agent._todo_store = TodoStore()
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    h.tool("prewalk_arm", {}, session_id=session_id)
+    with bind_subagent_parent(agent):
+        todo_tool(todos=[{"id": "1", "content": "plan step", "status": "pending"}],
+                  store=agent._todo_store)
+        handed = json.loads(h.tool("prewalk_ready", _handoff(), session_id=session_id))
+    assert handed["success"] is True and handed["handed_off"] is True
+    return h
+
+
+def _compaction(h, session_id: str, old_session_id: str = ""):
+    """Fire the host's own post_compaction kwargs (agent/compaction_events.py)."""
+    return h.hook("post_compaction", session_id=session_id, old_session_id=old_session_id,
+                  kind="auto", reason="threshold", before_tokens=9000, after_tokens=2000,
+                  messages_removed=8)
+
+
+def test_ready_persists_the_brief_and_status_returns_the_record(load_plugin, live_agent, workspace):
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    status = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+    # Not a boolean any more: the operator sees what would survive a compaction.
+    assert status["handoff"]["chosen_approach"] == "guard the crash site"
+    assert status["handoff"]["files"] == ["widget.py"]
+    assert status["handoff_reinjections"] == 0 and status["handoff_pending"] is False
+    stored = _durable_rows(h)["handoff:s"]
+    assert stored["v"] == 1 and "recorded_at" in stored
+    assert stored["chosen_approach"] == "guard the crash site"
+
+
+def test_reset_clears_the_persisted_brief(load_plugin, live_agent, workspace):
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    assert _durable_rows(h)["handoff:s"]["v"] == 1
+    assert json.loads(h.tool("prewalk_reset", {}, session_id="s"))["reset"] is True
+    assert _durable_rows(h).get("handoff:s") is None      # explicit null, reads as absent
+    status = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+    assert status["handoff"] is False and status["handoff_reinjections"] == 0
+
+
+def test_session_lifecycle_hooks_clear_the_persisted_brief(load_plugin, live_agent, workspace):
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    h.hook("on_session_finalize", session_id="s")
+    assert _durable_rows(h).get("handoff:s") is None
+    assert json.loads(h.tool("prewalk_status", {}, session_id="s"))["handoff"] is False
+
+
+def test_compaction_reinjects_the_brief_once_per_compaction(load_plugin, live_agent, workspace):
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    _compaction(h, "s")
+    injected = h.hook("pre_llm_call", session_id="s", user_message="continue")
+    assert len(injected) == 1
+    context = injected[0]["context"]
+    assert context.startswith("[PREWALK HANDOFF — restored after compaction]\n")
+    for needle in ("widget.py", "guard the crash site", "keep API stable",
+                   "no schema change", "c1"):
+        assert needle in context, f"{needle!r} missing from the restored brief"
+    # the next turn of the same session gets nothing: one compaction buys one injection
+    assert h.hook("pre_llm_call", session_id="s", user_message="again") == []
+    # a second compaction arms it again: the count is per compaction, not one-shot
+    _compaction(h, "s")
+    assert len(h.hook("pre_llm_call", session_id="s", user_message="again")) == 1
+    status = json.loads(h.tool("prewalk_status", {}, session_id="s"))
+    assert status["handoff_reinjections"] == 2 and status["handoff_pending"] is False
+
+
+def test_compaction_never_injects_into_another_session(load_plugin, live_agent, workspace):
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    _compaction(h, "s")
+    assert len(h.hook("pre_llm_call", session_id="s", user_message="continue")) == 1
+    assert h.hook("pre_llm_call", session_id="other", user_message="hi") == []
+    assert json.loads(h.tool("prewalk_status", {}, session_id="other"))[
+        "handoff_reinjections"] == 0
+
+
+def test_compaction_rotation_moves_the_brief_to_the_live_session(load_plugin, live_agent,
+                                                                workspace):
+    """Compaction rotation reassigns agent.session_id on the same object, so the record
+    must follow the transcript instead of staying under the retired id."""
+    h = _plan_and_hand_off(load_plugin, live_agent)
+    _compaction(h, "s2", old_session_id="s")
+    rows = _durable_rows(h)
+    assert rows.get("handoff:s") is None and rows["handoff:s2"]["v"] == 1
+    injected = h.hook("pre_llm_call", session_id="s2", user_message="continue")
+    assert len(injected) == 1 and "guard the crash site" in injected[0]["context"]
+    assert h.hook("pre_llm_call", session_id="s", user_message="continue") == []
+
+
+def test_unplanned_session_gets_no_extra_prompt(load_plugin, live_agent):
+    """Nothing self-activates: a session that never handed off sees no injected context,
+    compaction or not."""
+    h = load_plugin("prewalk", settings={"target_model": TARGET})
+    _compaction(h, "never-planned")
+    assert h.hook("pre_llm_call", session_id="never-planned", user_message="hi") == []
+    status = json.loads(h.tool("prewalk_status", {}, session_id="never-planned"))
+    assert status["handoff"] is False and status["handoff_reinjections"] == 0

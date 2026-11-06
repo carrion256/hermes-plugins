@@ -43,7 +43,7 @@ class ProactiveUnavailable(Exception):
 
 class ProactivePruneMixin:
     """Requires the host engine as base and, from the host engine subclass:
-    ``_proactive_config()`` -> {"mode", "target_tokens", "preserve_recent"},
+    ``_proactive_config()`` -> {"mode", "target_tokens", "preserve_recent", "pinned_tools"},
     ``_proactive_pruner`` (module or None), ``_proactive_classifier_prune(messages)``
     -> (messages, stats) or raise ProactiveUnavailable, and ``_tokens(text)``.
     """
@@ -153,7 +153,9 @@ class ProactivePruneMixin:
         reaches the target, then stop — the reclaim gate below is the authority."""
         pruner = self._proactive_pruner
         try:
-            calls = pruner.collect_tool_calls(messages, int(cfgp.get("preserve_recent") or 6))
+            calls = pruner.collect_tool_calls(
+                messages, int(cfgp.get("preserve_recent") or 6),
+                pinned_tools=cfgp.get("pinned_tools") or frozenset())
             eligible = sorted(pruner.eligible_calls(calls), key=lambda r: r["assistant_index"])
         except Exception as exc:
             logger.warning("proactive fifo: pair scan failed (%s: %s)", type(exc).__name__, exc)

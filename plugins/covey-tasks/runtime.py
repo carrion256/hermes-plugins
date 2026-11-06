@@ -13,17 +13,22 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
 import weakref
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Final, Literal, NewType, Protocol, assert_never
 
 # Native transport reuse: the plugin depends on the installed Hermes covey
 # bridge module for subprocess execution.  Tests intercept this module-level
@@ -185,6 +190,11 @@ class FinishAction:
     evidence_digest: str | None
     request_id: str
     handoff: dict | None = None
+    # Opt-in, per call: prove completion instead of asserting it. When true the
+    # finish is refused unless this session's continuation review closure is
+    # closed, and the recorded evidence digest is the one derived from that
+    # reviewed evidence. Ungoverned finish (the default) is unchanged.
+    governed: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,6 +228,12 @@ def _parse_int(value: Any, name: str, *, lo: int, hi: int) -> int:
         raise ActionReject("invalid_arguments", f"{name} must be an integer")
     if not lo <= value <= hi:
         raise ActionReject("invalid_arguments", f"{name} must be between {lo} and {hi}")
+    return value
+
+
+def _parse_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ActionReject("invalid_arguments", f"{name} must be a boolean")
     return value
 
 
@@ -312,7 +328,8 @@ def parse_action(arguments: dict) -> Any:
             workspace="" if workspace is None else _parse_str(workspace, "workspace"),
         )
     if action == "finish":
-        _check_unknown(args, {"subtask_id", "summary", "evidence_digest", "request_id", "handoff"})
+        _check_unknown(args, {"subtask_id", "summary", "evidence_digest", "request_id",
+                              "handoff", "governed"})
         digest = args.get("evidence_digest")
         handoff = args.get("handoff")
         return FinishAction(
@@ -321,6 +338,7 @@ def parse_action(arguments: dict) -> Any:
             evidence_digest=None if digest is None else _parse_str(digest, "evidence_digest"),
             request_id=_parse_request_id(args.get("request_id")),
             handoff=None if handoff is None else _validate_handoff(handoff),
+            governed=_parse_bool(args.get("governed", False), "governed"),
         )
     if action == "checkpoint":
         _check_unknown(args, {"subtask_id", "handoff", "evidence_digest", "request_id"})
@@ -442,6 +460,196 @@ def decode_handoff(summary: Any) -> dict | None:
         if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
             return None
     return record
+
+
+# ---------------------------------------------------------------------------
+# Loop-guard blocker bridge
+# ---------------------------------------------------------------------------
+# loop-guard's delivered block directive carries its stall report as
+# ``"LOOP GUARD: " + json.dumps(blocker)``.  Only the host's authoritative
+# delivered notification is trusted, and only the selected directive is parsed.
+
+BLOCKER_PREFIX: Final = "LOOP GUARD: "
+BLOCKER_SESSION_CAP: Final = 256  # counted sessions kept per runtime (LRU)
+BLOCKER_HANDLED_CAP: Final = 64  # directive ids remembered per session
+BLOCKER_RECORD_CAP: Final = 50  # checkpoint attempts surfaced by status
+
+BlockerCheckpointMode = Literal["off", "first", "exhausted"]
+
+
+@dataclass(frozen=True, slots=True)
+class Approach:
+    """One attempt the guard recorded: digests and a check status, never payloads."""
+
+    tool: str
+    argument_digest: str
+    check_status: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LoopBlocker:
+    """The guard's stall report, parsed once at the hook edge."""
+
+    invariant: str
+    approaches: tuple[Approach, ...]
+    next_step: str
+
+
+@dataclass(frozen=True, slots=True)
+class BlockerCheckpoint:
+    """One observable checkpoint attempt, surfaced by ``covey_tasks status``.
+
+    A skip is a record too (``ok`` False with its reason): an observer that
+    silently did nothing is indistinguishable from one that never ran.
+    """
+
+    directive_id: str
+    subtask_id: str | None
+    ok: bool
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "directive_id": self.directive_id,
+            "subtask_id": self.subtask_id,
+            "ok": self.ok,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockerSession:
+    """Delivered-blocker counters for one session.
+
+    ``handled`` is the last ``BLOCKER_HANDLED_CAP`` directive ids: remembering
+    every id for the life of a long session would grow without bound, and an
+    evicted id replaying hours later is a re-delivery the host never makes.
+    """
+
+    delivered: int = 0
+    malformed: int = 0
+    handled: tuple[str, ...] = ()
+
+
+def parse_blocker_mode(value: object) -> BlockerCheckpointMode:
+    """The only accepted vocabulary; anything else is a configuration error."""
+    if value == "off":
+        return "off"
+    if value == "first":
+        return "first"
+    if value == "exhausted":
+        return "exhausted"
+    raise ValueError(
+        "covey-tasks setting 'blocker_checkpoint' must be one of 'off', "
+        f"'first', 'exhausted' (got {value!r})."
+    )
+
+
+def parse_loop_blocker(message: object) -> LoopBlocker | None:
+    """Parse the guard's directive text exactly once, or return None.
+
+    A malformed blocker is data, not a fault: the caller counts it and moves on,
+    because an invented approach the guard never recorded would be a fabrication.
+    """
+    if not isinstance(message, str) or not message.startswith(BLOCKER_PREFIX):
+        return None
+    try:
+        payload = json.loads(message[len(BLOCKER_PREFIX):])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    invariant = payload.get("invariant")
+    next_step = payload.get("next_step")
+    approaches = payload.get("approaches")
+    if not isinstance(invariant, str) or not invariant.strip():
+        return None
+    if not isinstance(next_step, str) or not next_step.strip():
+        return None
+    if not isinstance(approaches, list):
+        return None
+    parsed: list[Approach] = []
+    for item in approaches:
+        if not isinstance(item, dict):
+            return None
+        tool = item.get("tool")
+        digest = item.get("argument_digest")
+        status = item.get("check_status")
+        if not isinstance(tool, str) or not isinstance(digest, str):
+            return None
+        if not (status is None or isinstance(status, str)):
+            return None
+        parsed.append(Approach(tool=tool, argument_digest=digest, check_status=status))
+    return LoopBlocker(invariant=invariant, approaches=tuple(parsed), next_step=next_step)
+
+
+def blocker_failed_approaches(blocker: LoopBlocker) -> list[str]:
+    """What the guard proved did not work: each recorded attempt, then the invariant."""
+    lines = [
+        f"{approach.tool}#{approach.argument_digest} "
+        f"({approach.check_status or 'unverified'})"
+        for approach in blocker.approaches
+    ]
+    lines.append(blocker.invariant)
+    return lines
+
+
+def blocker_handoff(blocker: LoopBlocker, objective: str) -> dict[str, object]:
+    """The handoff a blocker checkpoint carries.
+
+    Nothing was changed and nothing was verified by a stalled loop, so those
+    lists stay empty rather than dressing up the attempt; what IS known is which
+    approaches failed, the invariant they violated, and the guard's next step.
+    """
+    return {
+        "objective": objective,
+        "changes": [],
+        "verification_refs": [],
+        "failed_approaches": blocker_failed_approaches(blocker),
+        "remaining": [blocker.next_step],
+    }
+
+
+BLOCKER_REQUEST_NAMESPACE: Final = uuid.uuid5(
+    uuid.NAMESPACE_URL, "hermes-plugins/covey-tasks/blocker-checkpoint")
+
+
+def blocker_request_id(directive_id: str) -> str:
+    """The request id for one directive: a namespaced UUID5 of its id.
+
+    The tool's own parser admits only UUIDs, and the native idempotency key is
+    derived from this value, so the same directive replayed by the host is the
+    SAME request instead of a second checkpoint.
+    """
+    return str(uuid.uuid5(BLOCKER_REQUEST_NAMESPACE, f"blocker:{directive_id}"))
+
+
+def blocker_checkpoint_due(mode: BlockerCheckpointMode, delivered: int, cap: int) -> bool:
+    """Whether this delivered blocker is the one that checkpoints the claim.
+
+    ``exhausted`` waits for loop-guard's own redirect budget, so an ordinary
+    stall stays a conversation event; a budget below one could never be reached,
+    so it is treated as one.
+    """
+    if mode == "off":
+        return False
+    if mode == "first":
+        return delivered == 1
+    return delivered >= max(1, cap)
+
+
+def _blocker_objective(task: object, subtask_id: str) -> str:
+    """The claimed task's own words for the handoff objective.
+
+    Reads the same fields the task projection publishes (title, then summary);
+    a task with neither is named by its id, never by an empty objective.
+    """
+    if isinstance(task, dict):
+        for key in ("title", "summary"):
+            value = task.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"subtask {subtask_id}"
 
 
 def _git_output(workspace: str, *args: str) -> str | None:
@@ -675,6 +883,235 @@ def _project_outcome(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Governed finish: completion must be proven, never asserted
+# ---------------------------------------------------------------------------
+
+CLOSURE_MODULE: Final = "hermes_plugins_continuation_closure"
+CLOSURE_PATH: Final = (
+    Path(__file__).resolve().parent.parent / "continuation" / "closure.py")
+CONTINUATION_PLUGIN: Final = "continuation"
+SessionId = NewType("SessionId", str)
+"""One Hermes session id, as the continuation plugin keys its own state."""
+CriterionId = NewType("CriterionId", str)
+"""A declared acceptance criterion id (the native todo id where applicable)."""
+# The verdict vocabulary is the sibling reader's closed set; a value outside it
+# parses as "no verdict recorded", never as a guessed one.
+ClosureVerdict = Literal["clean", "findings", "unverified"]
+GOVERNED_NOTE: Final = "governed: review clean; {} criteria bound"
+GOVERNANCE_UNAVAILABLE_MESSAGE: Final = (
+    "governed finish needs this session's completion closure and it could not be "
+    "read; an unprovable completion is refused rather than recorded")
+EVIDENCE_MISMATCH_MESSAGE: Final = (
+    "the supplied evidence_digest does not match the digest derived from the closed "
+    "review's evidence")
+
+
+class _StateReader(Protocol):
+    """Reads one key of the continuation plugin's state (``PluginState.get``)."""
+
+    def __call__(self, key: str) -> object: ...
+
+
+class _ClosureLoader:
+    """Owns the process's single path-loaded copy of the sibling reader."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._module: ModuleType | None = None
+        self._attempted = False
+
+    def load(self) -> ModuleType | None:
+        """The closure module, or ``None`` when it is genuinely unavailable.
+
+        The module must be in ``sys.modules`` BEFORE exec: its frozen
+        dataclasses resolve annotations through ``sys.modules[__name__]``. A
+        failed exec leaves no half-initialised entry behind. Absence is a
+        documented degraded mode, counted and visible in ``status`` as
+        ``governed_finish.available``; a governed finish then refuses
+        (fail-closed) and nothing raises.
+        """
+        with self._lock:
+            if self._attempted:
+                return self._module
+            self._attempted = True
+            cached = sys.modules.get(CLOSURE_MODULE)
+            if isinstance(cached, ModuleType):
+                self._module = cached
+                return cached
+            try:
+                spec = importlib.util.spec_from_file_location(CLOSURE_MODULE, CLOSURE_PATH)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"{CLOSURE_PATH} cannot be loaded")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[CLOSURE_MODULE] = module
+                try:
+                    spec.loader.exec_module(module)
+                except BaseException:
+                    sys.modules.pop(CLOSURE_MODULE, None)
+                    raise
+            except Exception as exc:  # boundary: absence degrades, it never raises here
+                logger.warning("covey-tasks: continuation closure unavailable (%s: %s)",
+                               type(exc).__name__, exc, exc_info=True)
+                self._module = None
+                return None
+            self._module = module
+            return module
+
+
+_CLOSURE_LOADER: Final = _ClosureLoader()
+
+
+def _load_closure_module() -> ModuleType | None:
+    """The sibling closure reader, loaded at most once per process."""
+    return _CLOSURE_LOADER.load()
+
+
+@dataclass(frozen=True, slots=True)
+class _Governance:
+    """One session's completion closure, parsed once from the sibling module."""
+
+    verdict: ClosureVerdict | None
+    review_identity: str
+    review_paths: tuple[str, ...]
+    acceptance: tuple[tuple[CriterionId, str], ...]  # (criterion id, check identity)
+    unbound: tuple[CriterionId, ...]
+    blockers: tuple[str, ...]
+    closed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernedFinish:
+    """The finish bound to proven closure: derived digest, marked summary."""
+
+    action: FinishAction
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernanceUnprovable:
+    """The proof could not be read at all: no module, no record, no session."""
+
+    session_id: SessionId | None
+
+
+@dataclass(frozen=True, slots=True)
+class _GovernanceOpen:
+    """The closure exists and says the session has not closed."""
+
+    verdict: ClosureVerdict | None
+    blockers: tuple[str, ...]
+    unbound: tuple[CriterionId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceMismatch:
+    """The caller supplied a digest that is not the one the evidence derives."""
+
+    expected: str
+    supplied: str
+
+
+GovernedDecision = _GovernedFinish | _GovernanceUnprovable | _GovernanceOpen | _EvidenceMismatch
+
+
+def _verdict_of(value: object) -> ClosureVerdict | None:
+    """Narrow to the closed verdict set; anything else is no verdict."""
+    match value:
+        case "clean" | "findings" | "unverified":
+            return value
+        case _:
+            return None
+
+
+def _attr(value: object, name: str) -> object:
+    """One attribute of the foreign closure record, as an untrusted value."""
+    return getattr(value, name, None)
+
+
+def _text_list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _excused(value: object) -> bool:
+    """True only when the ledger itself says this proof is not owed."""
+    match value:
+        case "cancelled" | "blocked":
+            return True
+        case _:
+            return False
+
+
+def _parse_governance(closure: object) -> _Governance:
+    """Parse the sibling ``Closure`` into this adapter's own typed value.
+
+    Nothing here trusts the shape: an unreadable field degrades to empty, and
+    ``closed`` is taken only from a real ``True``.
+    """
+    identity = _attr(closure, "review_identity")
+    acceptance: list[tuple[CriterionId, str]] = []
+    unbound: list[CriterionId] = []
+    for item in _attr(closure, "acceptance") or ():
+        cid = _attr(item, "id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        check = _attr(item, "check_identity")
+        criterion = CriterionId(cid)
+        acceptance.append((criterion, check if isinstance(check, str) else ""))
+        if _attr(item, "bound") is not True and not _excused(_attr(item, "disposition")):
+            unbound.append(criterion)
+    return _Governance(
+        verdict=_verdict_of(_attr(closure, "review_verdict")),
+        review_identity=identity if isinstance(identity, str) else "",
+        review_paths=_text_list(_attr(closure, "review_paths")),
+        acceptance=tuple(acceptance),
+        unbound=tuple(unbound),
+        blockers=_text_list(_attr(closure, "blockers")),
+        closed=_attr(closure, "closed") is True,
+    )
+
+
+def _governance_digest(state: _Governance) -> str:
+    """sha256 over the canonical reviewed evidence, algorithm-prefixed.
+
+    The native ``AttemptEvidenceDigest`` requires an ``<algorithm>:<token>``
+    form and accepts up to 256 bytes (covey ``model::validate_digest``), and
+    ``_do_outcome`` forwards the digest verbatim, so the full 64-hex digest is
+    carried rather than truncated.
+    """
+    canonical = {
+        "review_identity": state.review_identity,
+        "review_paths": list(state.review_paths),
+        "acceptance": [[cid, check] for cid, check in state.acceptance],
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _open_refusal_message(verdict: ClosureVerdict | None, blockers: tuple[str, ...],
+                          unbound: tuple[CriterionId, ...]) -> str:
+    """Name every reason the closure is not closed, in human-readable form."""
+    reasons = [f"review verdict: {verdict or 'none recorded'}"]
+    if blockers:
+        reasons.append("outstanding blockers: " + "; ".join(blockers))
+    if unbound:
+        reasons.append("unbound acceptance criteria: " + ", ".join(unbound))
+    return ("the completion closure is not closed (" + ", ".join(reasons)
+            + "); governed finish refused")
+
+
+def _continuation_state_reader() -> _StateReader:
+    """The host facade over the continuation plugin's OWN state namespace."""
+    from hermes_cli.plugins_state import PluginState
+    getter = PluginState(CONTINUATION_PLUGIN).get
+
+    def read(key: str) -> object:
+        return getter(key)
+
+    return read
+
+
+# ---------------------------------------------------------------------------
 # Internal state records
 # ---------------------------------------------------------------------------
 
@@ -755,6 +1192,11 @@ class CoveyRuntime:
         self._cwd_backup: dict[str, object] = {}
         self._guarded_workspace: str | None = None  # guard stays open until next valid start
         self._guidance_shown: set[str] = set()  # static guidance shown once per runtime
+        # Loop-guard blocker bridge: counted delivered blockers per session (LRU
+        # bounded) and the checkpoint attempts taken for them.  Both are status
+        # surfaces, so "saw it, chose not to act" is never silent.
+        self._blocker_sessions: OrderedDict[str, _BlockerSession] = OrderedDict()
+        self._blocker_checkpoints: deque[BlockerCheckpoint] = deque(maxlen=BLOCKER_RECORD_CAP)
         self._validate_config(binary)
 
     # -- config / capabilities ---------------------------------------------
@@ -930,6 +1372,106 @@ class CoveyRuntime:
             return _workspace_guard(self._guarded_workspace, self._claim,
                                     tool_name, args if isinstance(args, dict) else {})
 
+    # -- loop-guard blocker bridge -------------------------------------------
+
+    def observe_blocker(self, *, session_id: str, directive_id: str,
+                        blocker: LoopBlocker | None, mode: str,
+                        cap: int) -> BlockerCheckpoint | None:
+        """Count one delivered guard blocker; checkpoint the live claim when due.
+
+        Runs on the host's tool-dispatch thread, so nothing here may raise: the
+        turn already happened, and a plugin that cannot help must not spoil it.
+        Every decision that ends without acting is either a counted session or a
+        recorded skip, never silence.
+        """
+        try:
+            checkpoint_mode = parse_blocker_mode(mode)
+            with self._lock:
+                if self._closed:
+                    return None
+                session = self._blocker_session(session_id)
+                if blocker is None:
+                    session = replace(session, malformed=session.malformed + 1)
+                    self._blocker_sessions[session_id] = session
+                    return None
+                if directive_id in session.handled:
+                    return None  # one checkpoint per directive, whatever else arrives
+                session = replace(session, delivered=session.delivered + 1)
+                if not blocker_checkpoint_due(checkpoint_mode, session.delivered, cap):
+                    self._blocker_sessions[session_id] = session
+                    return None
+                session = replace(
+                    session,
+                    handled=(session.handled + (directive_id,))[-BLOCKER_HANDLED_CAP:])
+                self._blocker_sessions[session_id] = session
+                record = self._checkpoint_for_blocker(
+                    directive_id=directive_id, blocker=blocker)
+                self._blocker_checkpoints.append(record)
+                return record
+        except Exception as exc:  # boundary: an observer never fails a turn
+            logger.warning(
+                "covey-tasks: blocker checkpoint failed for directive %s (%s: %s)",
+                directive_id, type(exc).__name__, exc, exc_info=True)
+            return None
+
+    def _blocker_session(self, session_id: str) -> _BlockerSession:
+        """Counted state for one session, kept LRU-bounded (caller holds the lock)."""
+        session = self._blocker_sessions.get(session_id)
+        if session is not None:
+            self._blocker_sessions.move_to_end(session_id)
+            return session
+        session = _BlockerSession()
+        self._blocker_sessions[session_id] = session
+        while len(self._blocker_sessions) > BLOCKER_SESSION_CAP:
+            self._blocker_sessions.popitem(last=False)
+        return session
+
+    def _checkpoint_for_blocker(self, *, directive_id: str,
+                               blocker: LoopBlocker) -> BlockerCheckpoint:
+        """Hand the stalled task back through the normal `checkpoint` action.
+
+        Ownership is confirmed authoritatively first, never from local state: a
+        checkpoint of a lost claim would report success for work this agent no
+        longer owns.  The native checkpoint RELEASES the claim (it is a marked
+        retry), which is exactly why the default mode waits for the guard to
+        spend its budget instead of firing on the first stall.
+        """
+        claim = self._claim
+        if claim is None:
+            return BlockerCheckpoint(directive_id=directive_id, subtask_id=None,
+                                     ok=False, error="no_live_claim")
+        status = self._read_task_state(claim.subtask_id)
+        if status is None:
+            return BlockerCheckpoint(directive_id=directive_id,
+                                     subtask_id=claim.subtask_id, ok=False,
+                                     error="claim_state_unreadable")
+        token = self._token.get("executor")
+        if not self._live_claim_matches(status["claim"], claim, token):
+            return BlockerCheckpoint(directive_id=directive_id,
+                                     subtask_id=claim.subtask_id, ok=False,
+                                     error="no_live_claim")
+        objective = _blocker_objective(status["subtask"], claim.subtask_id)
+        try:
+            envelope = self.execute({
+                "action": "checkpoint",
+                "subtask_id": claim.subtask_id,
+                "handoff": blocker_handoff(blocker, objective),
+                "request_id": blocker_request_id(directive_id),
+            })
+        except Exception as exc:  # boundary: reported as a failed record, never raised
+            logger.warning(
+                "covey-tasks: blocker checkpoint raised for %s (%s: %s)",
+                claim.subtask_id, type(exc).__name__, exc, exc_info=True)
+            return BlockerCheckpoint(directive_id=directive_id,
+                                     subtask_id=claim.subtask_id, ok=False,
+                                     error=f"checkpoint_raised ({type(exc).__name__})")
+        if envelope.get("ok") is True:
+            return BlockerCheckpoint(directive_id=directive_id,
+                                     subtask_id=claim.subtask_id, ok=True, error=None)
+        return BlockerCheckpoint(
+            directive_id=directive_id, subtask_id=claim.subtask_id, ok=False,
+            error=f"{envelope.get('code')} {envelope.get('message')}".strip())
+
     # -- transport ----------------------------------------------------------
 
     def _call(self, command_args: list, timeout: float = NORMAL_TIMEOUT, *,
@@ -1079,6 +1621,22 @@ class CoveyRuntime:
                     self._thread is not None and self._thread.is_alive()
                     and not self._stop_event.is_set()
                 ),
+                # Visible fail-open for the loop-guard bridge: what was counted
+                # per session, and every checkpoint attempt with its reason.
+                "blocker_directives": {
+                    observed_id: {
+                        "delivered": observed.delivered,
+                        "malformed": observed.malformed,
+                    }
+                    for observed_id, observed in self._blocker_sessions.items()
+                },
+                "blocker_checkpoints": [
+                    record.as_dict() for record in self._blocker_checkpoints
+                ],
+                # Governed finish is opt-in per call; whether completion can be
+                # PROVEN here at all is a capability, so its absence is visible
+                # rather than a silent refusal later.
+                "governed_finish": {"available": _load_closure_module() is not None},
                 "closed": self._closed,
             }
         )
@@ -1754,6 +2312,54 @@ class CoveyRuntime:
                         "attempt_outcomes": data.get("attempt_outcomes")}
         return None
 
+    # -- governed finish -----------------------------------------------------
+
+    def _closure_state(self, session_id: str) -> _Governance | None:
+        """This session's completion closure, or ``None`` when it cannot be read.
+
+        Deliberately fail-closed: governed means PROVEN, so an unavailable
+        sibling module, a missing record, a failing state read and a session
+        this runtime cannot name all refuse the finish instead of letting an
+        unproven completion reach the ledger.
+        """
+        if not session_id:
+            logger.warning("covey-tasks: governed finish had no session id to prove")
+            return None
+        module = _load_closure_module()
+        reader = getattr(module, "read_closure", None) if module is not None else None
+        if not callable(reader):
+            return None
+        try:
+            closure = reader(session_id, state_reader=_continuation_state_reader())
+        except Exception as exc:  # boundary: an unreadable store refuses, it never raises
+            logger.warning("covey-tasks: completion closure could not be read (%s: %s)",
+                           type(exc).__name__, exc, exc_info=True)
+            return None
+        return None if closure is None else _parse_governance(closure)
+
+    def _apply_governance(self, action: FinishAction) -> GovernedDecision:
+        """Prove a governed finish against the closure, or refuse it.
+
+        Called before ANY transport call of this finish: only a closed review
+        earns a receipt, and the digest it carries is the one derived from that
+        reviewed evidence, never one asserted from the model side.
+        """
+        state = self._closure_state(self.last_session_id)
+        if state is None:
+            unproven = SessionId(self.last_session_id) if self.last_session_id else None
+            return _GovernanceUnprovable(session_id=unproven)
+        if not state.closed:
+            return _GovernanceOpen(verdict=state.verdict, blockers=state.blockers,
+                                   unbound=state.unbound)
+        digest = _governance_digest(state)
+        if action.evidence_digest is not None and action.evidence_digest != digest:
+            return _EvidenceMismatch(expected=digest, supplied=action.evidence_digest)
+        note = GOVERNED_NOTE.format(len(state.acceptance))
+        # A supplied handoff replaces the summary in the durable receipt (the
+        # encoded handoff IS the record); the derived digest still proves it.
+        return _GovernedFinish(replace(action, evidence_digest=digest,
+                                       summary=f"{note}; {action.summary}"))
+
     def _do_outcome(self, action: Any, state: _RequestState, requested: str = "") -> dict:
         claim = self._claim
         if claim is None or claim.subtask_id != action.subtask_id:
@@ -1783,6 +2389,29 @@ class CoveyRuntime:
             return self._fail("executor_unregistered", "executor session token is unavailable",
                               action.request_id)
         state.tokens["executor"] = token  # request is scoped to this token
+
+        if isinstance(action, FinishAction) and action.governed:
+            # Opt-in proof of completion, decided before any transport call for
+            # this finish: an unproven one never reaches the native binary.
+            match self._apply_governance(action):
+                case _GovernedFinish(action=governed):
+                    action = governed
+                case _GovernanceUnprovable(session_id=session_id):
+                    return self._fail("governance_unavailable", GOVERNANCE_UNAVAILABLE_MESSAGE,
+                                      action.request_id, data={"session_id": session_id})
+                case _GovernanceOpen(verdict=verdict, blockers=blockers, unbound=unbound):
+                    return self._fail(
+                        "not_governed_closed",
+                        _open_refusal_message(verdict, blockers, unbound),
+                        action.request_id,
+                        data={"verdict": verdict, "blockers": list(blockers),
+                              "unbound_criteria": list(unbound)})
+                case _EvidenceMismatch(expected=expected, supplied=supplied):
+                    return self._fail("evidence_mismatch", EVIDENCE_MISMATCH_MESSAGE,
+                                      action.request_id,
+                                      data={"expected": expected, "supplied": supplied})
+                case unexpected:
+                    assert_never(unexpected)
 
         # Required evidence applies to receipt operations only (finish/retry/fail);
         # abandon/release carry no evidence.

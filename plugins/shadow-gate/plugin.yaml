@@ -1,0 +1,21 @@
+name: shadow-gate
+version: 0.1.0
+description: "Promotion gate for shadow-mode decisions: reads the append-only verdict/outcome ledgers that producer plugins write, and reports per decision whether an explicitly configured policy is satisfied. Records and reports only — qualifies nothing by default, changes no behaviour."
+author: "dsh-plugins port"
+manifest_version: 2
+api_version: 1
+provides_tools:
+  - shadow_status
+config_schema:
+  ledger_dir:
+    type: str
+    default: ""
+    description: "Ledger directory holding one JSONL per decision; empty = $HERMES_HOME/plugin-data/shadow-gate. Producers write there via shared_ledger()."
+  max_rows_per_decision:
+    type: int
+    default: 5000
+    description: "Rows kept per decision ledger; above it the file is rewritten atomically keeping the newest rows. Must be >= 1."
+  decisions:
+    type: dict
+    default: {}
+    description: "Decision name -> {min_pairs, min_agreement, max_false_positive, positive_verdicts: [...], positive_outcomes: [...]}. Only decisions listed here can ever qualify; an unlisted decision reports NOT_QUALIFIED with reason no_policy."

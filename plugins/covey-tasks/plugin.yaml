@@ -1,6 +1,6 @@
 name: covey-tasks
 version: 0.1.0
-description: "Durable finite worklists and fenced task ownership backed by the Covey CLI; native todo_list is left untouched."
+description: "Durable finite worklists and fenced task ownership backed by the Covey CLI; native todo_list is left untouched. finish remains deliberately direct: the default path is unchanged and performs no governance read. governed: true is opt-in per call (never a setting) and makes that one finish prove completion instead of asserting it - it refuses unless the continuation plugin's review closure for the current session is closed, and records the evidence digest derived from that reviewed evidence. Refusals are not_governed_closed (open closure, with its blockers, unbound criteria and review verdict), evidence_mismatch (a caller-supplied digest that is not the derived one) and governance_unavailable (the closure could not be read; governed means proven, so it fails closed). 'covey_tasks status' reports governed_finish.available so the capability is never silently missing."
 author: "hermes-plugins"
 manifest_version: 2
 api_version: 1
@@ -11,6 +11,7 @@ provides_hooks:
   - on_session_reset
   - subagent_stop
   - pre_tool_call
+  - post_tool_directive
 config_schema:
   binary:
     type: str
@@ -20,3 +21,7 @@ config_schema:
     type: str
     default: ""
     description: "Absolute local path of the Covey SQLite database used by this profile (required; never defaulted)."
+  blocker_checkpoint:
+    type: str
+    default: "exhausted"
+    description: "When a delivered loop-guard block checkpoints the claimed task: 'off' counts without acting, 'first' checkpoints on the first delivered block, 'exhausted' (default) waits until loop-guard has spent its own redirect budget (plugins.entries.loop-guard.settings.redirect_cap, default 2). A checkpoint persists a marked resumable handoff and then RELEASES the claim, because the native checkpoint is a retry - which is why the default waits for budget exhaustion instead of shedding ownership over one stalled guess. Observed blocks and every checkpoint attempt (with its skip reason) are reported by 'covey_tasks status'. An unknown value refuses plugin registration."

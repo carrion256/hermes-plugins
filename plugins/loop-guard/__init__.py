@@ -1,18 +1,59 @@
 """Owned, bounded loop recovery; a proposed correction is not a delivered one."""
 from __future__ import annotations
 
-from collections import deque
 import hashlib
+import importlib.util
 import json
 import logging
+import sys
 import threading
 import uuid
 import weakref
+from collections import deque
+from pathlib import Path
+from types import ModuleType
 
 _POLL_ACTIONS = {"list", "poll", "log", "wait"}
 _HISTORY_LIMIT = 24
 _BLOCK_PREFIX = "LOOP GUARD:"
+# Gate-friction sink (plugins/papercuts/friction.py): this plugin is only a
+# PRODUCER. The sink module owns the slot, the dedupe window and the counters,
+# and registers itself under this name when it is loaded.
+_FRICTION_MODULE = "hermes_plugins_papercuts_friction"
+# The detail is the blocker JSON, already egress-redacted by blocker(); the
+# bound is the contract with the sink, not a guess about its size.
+_FRICTION_DETAIL_LIMIT = 1_000
+# Session-scoped bookkeeping lives outside the per-turn state; FIFO-bounded so
+# a long-lived process cannot grow a dict keyed by session ids without limit.
+_FRICTION_SESSION_LIMIT = 128
 logger = logging.getLogger(__name__)
+
+
+def _friction_module() -> ModuleType | None:
+    """The papercuts gate-friction sink, or ``None`` when papercuts is not
+    installed. Loaded by path like the other sibling modules: it registers
+    itself under the shared name, so one instance owns the process-wide slot.
+    Absent is a normal configuration and is never fatal here."""
+    shared = sys.modules.get(_FRICTION_MODULE)
+    if isinstance(shared, ModuleType):
+        return shared
+    target = Path(__file__).resolve().parent.parent / "papercuts" / "friction.py"
+    try:
+        spec = importlib.util.spec_from_file_location(_FRICTION_MODULE, target)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {_FRICTION_MODULE} from {target}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_FRICTION_MODULE] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(_FRICTION_MODULE, None)
+            raise
+        return module
+    except Exception:
+        logger.warning("loop-guard: papercuts/%s unavailable; exhaustions stay local",
+                       _FRICTION_MODULE, exc_info=True)
+        return None
 
 
 def _signature(name, args) -> str:
@@ -113,8 +154,77 @@ def register(ctx) -> None:
     streak = max(2, min(_HISTORY_LIMIT, int(ctx.get_config("tool_call_streak", 5))))
     answer_limit = max(2, int(ctx.get_config("answer_repetition", 3)))
     cap = max(0, int(ctx.get_config("redirect_cap", 2)))
+    # Reporting spent budgets is a producer's courtesy, not part of the guard's
+    # contract, so it is the one thing here that may be switched off; a
+    # non-boolean value keeps the default (on) and says so.
+    friction_setting = ctx.get_config("friction", True)
+    friction_enabled = friction_setting if isinstance(friction_setting, bool) else True
+    if not isinstance(friction_setting, bool):
+        logger.warning("loop-guard: friction is not a boolean; using the safe default (true)")
     states = weakref.WeakKeyDictionary()
     lock = threading.RLock()
+    # Keyed by session, NOT by turn state: per-turn state resets when the host
+    # moves to a new turn, while a blocker must be filed once per SESSION.
+    _friction_states: dict[str, dict[str, object]] = {}
+
+    def friction_state(session_id: str) -> dict[str, object]:
+        """This session's friction bookkeeping, created on first use."""
+        value = _friction_states.get(session_id)
+        if value is None:
+            value = {"reported": [], "last_reason": None, "unavailable": False}
+            _friction_states[session_id] = value
+            while len(_friction_states) > _FRICTION_SESSION_LIMIT:
+                _friction_states.pop(next(iter(_friction_states)))
+        return value
+
+    def friction_view(session_id: str) -> dict[str, object]:
+        """Read-only producer state for ``loop_recovery status``. A status read
+        never creates state, and ``friction_unavailable`` is itself a reported
+        outcome: the producer ran and papercuts was not there to receive."""
+        value = _friction_states.get(session_id) or {}
+        reason = value.get("last_reason")
+        reported = value.get("reported")
+        return {"enabled": friction_enabled,
+                "reported": len(reported) if isinstance(reported, list) else 0,
+                "last_reason": str(reason) if isinstance(reason, str) else None,
+                "unavailable": bool(value.get("unavailable"))}
+
+    def report_exhausted(blocker: dict[str, object], session_id: str) -> None:
+        """File exactly one gate-friction row per blocker invariant per session.
+
+        Boundary observer around another plugin's sink: nothing here may
+        propagate, because a failed report must never change what ``before``
+        decided about the tool call."""
+        if not friction_enabled:
+            return
+        try:
+            record = friction_state(session_id)
+            if record.get("unavailable"):
+                return
+            identity = _signature("blocker", str(blocker.get("invariant") or ""))
+            raw = record.get("reported")
+            seen = [str(item) for item in raw] if isinstance(raw, list) else []
+            if identity in seen:
+                return
+            sink = _friction_module()
+            if sink is None:
+                # Stop probing for a sink that is not in this process; the
+                # status names the reason rather than leaving it unexplained.
+                record["unavailable"] = True
+                record["last_reason"] = "friction_unavailable"
+                return
+            detail = json.dumps(blocker, ensure_ascii=False)[:_FRICTION_DETAIL_LIMIT]
+            receipt = sink.report(sink.GateFriction(
+                source="loop-guard", kind="budget_exhausted", identity=identity,
+                summary="loop-guard intervention budget exhausted",
+                detail=detail, session_id=session_id))
+            seen.append(identity)
+            record["reported"] = seen
+            reason = getattr(receipt, "reason", None)
+            record["last_reason"] = str(reason) if isinstance(reason, str) else "error"
+        except Exception:
+            logger.warning("loop-guard: gate-friction report failed for session %s",
+                           session_id, exc_info=True)
 
     def owner(session_id):
         from agent.subagent_lifecycle import get_active_subagent_parent
@@ -193,6 +303,12 @@ def register(ctx) -> None:
             # Reserve against the cap BEFORE native arbitration acknowledges; the
             # spent counter moves only on the authoritative delivered notification.
             if s["delivered"] + len(s["pending"]) >= cap:
+                # The budget is spent: this is the exact point where another
+                # block would have been emitted and cannot be. Repeating the
+                # same blocker silently is invisible to the operator, so the
+                # give-up is filed once per blocker (never silently dropped).
+                if isinstance(s["blocker"], dict):
+                    report_exhausted(s["blocker"], str(session_id or ""))
                 return None
             directive = {"action": "block",
                          "message": _BLOCK_PREFIX + " " + json.dumps(s["blocker"], ensure_ascii=False)}
@@ -340,11 +456,17 @@ def register(ctx) -> None:
         return None
 
     def recovery(args, session_id="", **_kw):
+        # The producer's own accounting is session-scoped and independent of a
+        # live agent, so every answer carries it: a consumer must be able to
+        # read a stable shape, including when reporting is switched off.
+        friction = friction_view(str(session_id or ""))
         agent = owner(session_id)
         if agent is None:
-            return json.dumps({"ok": False, "error": "no owned live agent"})
+            return json.dumps({"ok": False, "error": "no owned live agent",
+                               "friction": friction})
         if not isinstance(args, dict) or args.get("action") not in {"status", "hypothesis"}:
-            return json.dumps({"ok": False, "error": "action must be status or hypothesis"})
+            return json.dumps({"ok": False, "error": "action must be status or hypothesis",
+                               "friction": friction})
         with lock:
             s = state(agent)
             if args["action"] == "hypothesis":
@@ -354,15 +476,19 @@ def register(ctx) -> None:
                         or not isinstance(args.get("next_arguments"), dict)
                         or len(json.dumps(args["next_arguments"], default=str)) > 8000
                         or args["next_tool"] == "loop_recovery"):
-                    return json.dumps({"ok": False, "error": "an unresolved blocker and bounded explicit hypothesis/check/expected observation are required"})
+                    return json.dumps({"ok": False, "error": "an unresolved blocker and bounded explicit hypothesis/check/expected observation are required",
+                                       "friction": friction})
                 s["permit"] = _signature(args["next_tool"], args["next_arguments"])
                 s["hypothesis"] = {key: redact_for_egress(args[key]) for key in fields}
             return json.dumps({"ok": True, "blocker": s["blocker"], "hypothesis": s["hypothesis"],
                                "delivered_interventions": s["delivered"], "suppressed_interventions": s["suppressed"],
                                "observed_recoveries": s["recoveries"], "remaining_interventions": max(0, cap - s["delivered"]),
+                               "friction": friction,
                                "note": "A hypothesis permits one exact check, not permission to bypass native approvals."})
 
     def clear(session_id="", **_kw):
+        # Session-scoped, so dropped whether or not a live agent is still here.
+        _friction_states.pop(str(session_id or ""), None)
         agent = owner(session_id)
         if agent is not None:
             with lock:

@@ -6,40 +6,127 @@ backend, task workspace and real target identities, rechecked after screening.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib.util
 import json
 import logging
-from pathlib import Path
 import re
 import shlex
 import stat
-import os
-import time
-import urllib.request
+import sys
 import uuid
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
+from typing import Final, Protocol, cast
 
-_CLASSIFY_TIMEOUT = 2.5
-_COOLDOWN_SECONDS = 45
-# Client-side wait budget. Measured on the deployed engine (worst of 5 samples per size):
-# 0.10 s at 200 chars, 0.24 s at 2k, 1.67 s at 10k, 5.64 s at 40k, 12.8 s at 90k -- about
-# 0.17 ms/char plus fixed overhead, with a ~2x tail from queueing behind the service's
-# serialised inference lane. `_outbound` may emit up to _MAX_SUMMARY chars, which the flat
-# 2.5 s could not cover: the call timed out and blacked the endpoint out for the cooldown.
-# Small payloads keep the configured floor; _MAX_TIMEOUT is the guard rail.
-_CHAR_SECONDS = 0.00025
-_MAX_TIMEOUT = 30.0
-# Decision boundary on P(risky) from the /v1/systemone choice head. 0.5 is the argmax
+# Decision boundary on P(risky) from the classifier's choice head. 0.5 is the argmax
 # of the two-label head this replaces, so the documented default reproduces its verdicts
 # exactly; it is a config knob (`threshold`), recorded with every decision so it can be
 # recalibrated against real probabilities.
 _RISKY_THRESHOLD = 0.5
 logger = logging.getLogger(__name__)
 
+# The classifier transport belongs to classifier-core: one process-wide client per
+# endpoint, so a dead service is discovered once (its breaker) instead of once per
+# plugin, and the wait budget is computed where the engine's cost was measured. Its
+# settings live on the classifier-core entry; this plugin keeps only its boundary.
+_CLASSIFIER_MODULE_KEY: Final = "hermes_plugins_classifier_core"
+_CLASSIFIER_PLUGIN: Final = "classifier-core"
+_CLASSIFIER_CLIENT_PATH: Final = (
+    Path(__file__).resolve().parent.parent / "classifier-core" / "client.py")
+_CALLER: Final = "auto-review-classifier"
+_QUESTIONS: Final[dict[str, object]] = {
+    "review": {
+        "type": "choice",
+        "instructions": "Does this tool call need human review before it runs?",
+        "criteria": {"risky": "destructive, irreversible, or exfiltrating",
+                     "safe": "no destructive, irreversible, or exfiltrating effect"}},
+}
 
-def _budget(text):
-    """Seconds to wait for this payload: configured timeout is the floor, the text's
-    measured inference cost is the budget, _MAX_TIMEOUT is the ceiling."""
-    return min(_MAX_TIMEOUT, max(_CLASSIFY_TIMEOUT, 0.5 + len(text) * _CHAR_SECONDS))
+
+class _Transport(Protocol):
+    """The one classifier-core call this plugin makes; injected, never built here."""
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object] | None: ...
+
+
+class _SettingsClass(Protocol):
+    """``ClassifierSettings`` as this consumer sees it: parsed once, at register."""
+
+    def from_config(self, get_config: Callable[[str, object], object]) -> object: ...
+
+
+class _ClientModule(Protocol):
+    """The surface of classifier-core's ``client.py`` this plugin depends on."""
+
+    ClassifierSettings: _SettingsClass
+
+    def shared_client(self, settings: object) -> _Transport: ...
+
+
+def _load_client() -> _ClientModule | None:
+    """Path-load ``client.py``, preferring the process-wide shared registration.
+
+    A second copy of the module would mean a second breaker, so a module already
+    registered under ``_CLASSIFIER_MODULE_KEY`` (which ``client.py`` does itself at
+    import) is reused verbatim. An absent or broken sibling is ``None``: the same
+    fail-open path as an unusable verdict, never an exception at register.
+    """
+    shared = sys.modules.get(_CLASSIFIER_MODULE_KEY)
+    if isinstance(shared, ModuleType):
+        return cast(_ClientModule, shared)
+    if not _CLASSIFIER_CLIENT_PATH.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_CLASSIFIER_MODULE_KEY,
+                                                  _CLASSIFIER_CLIENT_PATH)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE execution, in the import system's own order: a frozen dataclass
+    # resolves its string annotations through the module entry in ``sys.modules``, and
+    # the shared-state registration inside ``client.py`` depends on that entry too.
+    sys.modules[_CLASSIFIER_MODULE_KEY] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:  # narrow: degraded
+        sys.modules.pop(_CLASSIFIER_MODULE_KEY, None)  # never share a half-built module
+        logger.warning("auto-review-classifier: classifier-core failed to load (%s: %s)",
+                       type(exc).__name__, exc, exc_info=True)
+        return None
+    return cast(_ClientModule, module)
+
+
+def _classifier_config() -> Callable[[str, object], object]:
+    """classifier-core's own settings reader; this plugin has no transport settings."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    config = load_config_readonly()
+
+    def reader(key: str, default: object) -> object:
+        return cfg_get(config, "plugins", "entries", _CLASSIFIER_PLUGIN, "settings",
+                       key, default=default)
+
+    return reader
+
+
+def _shared_client() -> _Transport | None:
+    """The shared client, or ``None``: with no transport every call fails open."""
+    module = _load_client()
+    if module is None:
+        logger.warning("auto-review-classifier: sibling plugin %s is unavailable (%s); "
+                       "every call fails open", _CLASSIFIER_PLUGIN, _CLASSIFIER_CLIENT_PATH)
+        return None
+    try:
+        return module.shared_client(module.ClassifierSettings.from_config(_classifier_config()))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:  # narrow
+        logger.warning("auto-review-classifier: classifier-core settings are unusable "
+                       "(%s: %s); every call fails open", type(exc).__name__, exc,
+                       exc_info=True)
+        return None
+
 
 _SKIP = {"read_file", "search_files", "web_search", "web_extract", "skill_view",
          "skills_list", "ha_get_state", "ha_list_entities", "ha_list_services"}
@@ -262,45 +349,29 @@ def _outbound(summary):
 
 
 def register(ctx):
-    # Cooldown is a fixed blackout: recovery is re-attempted after it expires.
-    down = {}  # endpoint -> monotonic deadline; a dead endpoint must not tax every tool call
+    # One shared transport for the whole process: the breaker that keeps a dead
+    # service from taxing every tool call lives in classifier-core, not here.
+    client = _shared_client()
+
     def classify(text):
-        key = os.environ.get(ctx.get_config("api_key_env", "CLASSIFIER_API_KEY"), "")
-        endpoint = str(ctx.get_config("endpoint", "http://127.0.0.1:8102") or "").rstrip("/")
-        model = str(ctx.get_config("served_model", "qwen3.8-flash-next") or "qwen3.8-flash-next")
-        if down.get(endpoint, 0.0) > time.monotonic():
-            return None
-        if not key or not endpoint:
-            return None
         threshold = _RISKY_THRESHOLD
-        try:
+        # An unusable configured boundary never becomes a block: the documented
+        # default stands, rather than failing the tool call open or closed by accident.
+        with contextlib.suppress(TypeError, ValueError):
             threshold = float(ctx.get_config("threshold", _RISKY_THRESHOLD))
-        except (TypeError, ValueError):
-            pass  # unusable config never becomes a block: keep the default boundary
-        request = urllib.request.Request(endpoint + "/v1/systemone",
-                                         data=json.dumps({"model": model, "state": text, "questions": {"review": {
-                                             "type": "choice",
-                                             "instructions": "Does this tool call need human review before it runs?",
-                                             "criteria": {"risky": "destructive, irreversible, or exfiltrating",
-                                                          "safe": "no destructive, irreversible, or exfiltrating effect"}}}}).encode(),
-                                         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
-        try:
-            with urllib.request.urlopen(request, timeout=_budget(text)) as reply:
-                data = json.loads(reply.read(16385))
-            answers = data.get("answers") if isinstance(data, dict) else None
-            answer = answers.get("review") if isinstance(answers, dict) else None
-            probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
-            probability = probabilities.get("risky") if isinstance(probabilities, dict) else None
-            if not isinstance(probability, bool) and isinstance(probability, (int, float)) \
-                    and 0.0 <= probability <= 1.0:
-                # The threshold decides on P(risky) -- the positive class of the head
-                # this replaces; the returned choice never upgrades a low probability.
-                return float(probability) >= threshold, float(probability), threshold
-            logger.warning("auto-review classifier returned unusable verdict: %r", answer)
-        except Exception as exc:
-            logger.warning("auto-review classifier unavailable: %s: %s",
-                           type(exc).__name__, exc, exc_info=True)
-        down[endpoint] = time.monotonic() + _COOLDOWN_SECONDS
+        if client is None:
+            return None  # no transport: fail open exactly as an unusable verdict does
+        data = client.ask(text, dict(_QUESTIONS), caller=_CALLER)
+        answers = data.get("answers") if isinstance(data, dict) else None
+        answer = answers.get("review") if isinstance(answers, dict) else None
+        probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
+        probability = probabilities.get("risky") if isinstance(probabilities, dict) else None
+        if not isinstance(probability, bool) and isinstance(probability, (int, float)) \
+                and 0.0 <= probability <= 1.0:
+            # The threshold decides on P(risky) -- the positive class of the head
+            # this replaces; the returned choice never upgrades a low probability.
+            return float(probability) >= threshold, float(probability), threshold
+        logger.warning("auto-review classifier returned unusable verdict: %r", answer)
         return None
 
     def gate(tool_name="", args=None, task_id="", tool_call_id="", session_id="", turn_id="", **_kw):

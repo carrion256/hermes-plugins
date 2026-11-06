@@ -186,40 +186,31 @@ def test_goal_and_state_fitting_stages():
 
 
 # ---------------------------------------------------------------- engine overlay
+#
+# The transport itself is the shared ``classifier_stub`` fixture (tests/conftest.py):
+# it installs a stand-in module under classifier-core's registry key, so these tests
+# drive the same seam the real path-loader uses — no socket, no URL, no Bearer key,
+# and nothing here patches urllib.
 
-def _patch_client(monkeypatch, responses):
-    """responses: list of dicts consumed per /v1/systemone call, or exceptions to raise."""
-    from urllib.error import URLError
-    requests = []
-    it = iter(responses)
 
-    class _Reply:
-        def __init__(self, payload):
-            self._payload = json.dumps(payload).encode()
+def _scripted(responses):
+    """Scripted answers for the stub's reply callable: one envelope per request.
 
-        def read(self, _n):
-            return self._payload
+    Asking beyond the script is a bug in the consumer, so it fails with a count rather
+    than a StopIteration.
+    """
+    pending = list(responses)
+    asked = []
 
-        def __enter__(self):
-            return self
+    def reply(state, questions, *, caller, timeout):
+        asked.append(state)
+        if not pending:
+            raise AssertionError(
+                f"the classifier was asked {len(asked)} times; the test scripted "
+                f"{len(asked) - 1} answer(s)")
+        return pending.pop(0)
 
-        def __exit__(self, *a):
-            return False
-
-    def fake_urlopen(request, *_a, **_kw):
-        body = json.loads(request.data.decode())
-        requests.append({"body": body, "url": request.full_url,
-                         "auth": request.get_header("Authorization")})
-        item = next(it)
-        if isinstance(item, Exception):
-            raise item
-        return _Reply(item)
-
-    monkeypatch.setenv("CLASSIFIER_API_KEY", "synthetic-key")
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    if isinstance(responses, list) and responses and isinstance(responses[0], Exception):
-        pass
-    return requests
+    return reply
 
 
 def _answer(keep_):
@@ -230,7 +221,7 @@ def _answer(keep_):
 
 
 def _verdicts(calls, keep=None, keep_result=None):
-    """Build the /v1/systemone answers envelope for one batch: keep/keep_result are
+    """Build the answers envelope for one batch: keep/keep_result are
     call_id -> bool."""
     keep = keep or {}
     keep_result = keep_result or {}
@@ -239,7 +230,7 @@ def _verdicts(calls, keep=None, keep_result=None):
         cid = record["call_id"]
         out[f"{record['tag']}_call"] = _answer(keep.get(cid, False))
         out[f"{record['tag']}_result"] = _answer(keep_result.get(cid, False))
-    return {"model": "fake-classifier", "answers": out}
+    return {"answers": out}
 
 
 def _soft_verdicts(calls, p_drop=0.7):
@@ -251,33 +242,47 @@ def _soft_verdicts(calls, p_drop=0.7):
             out[f"{record['tag']}_{kind}"] = {
                 "type": "choice", "choice": "drop",
                 "probabilities": {"keep": 1.0 - p_drop, "drop": p_drop}}
-    return {"model": "fake-classifier", "answers": out}
+    return {"answers": out}
 
 
-def _load_engine(load_plugin, monkeypatch, settings=None):
+def _load_engine(load_plugin, classifier_stub, settings=None, responses=(), absent=False,
+                 *, declined=False):
+    """Load the plugin over the shared classifier stub and return its engine and the stub.
+
+    The stub is installed BEFORE register(): registering is what resolves the shared
+    client, so a test that installed it afterwards would exercise the real transport.
+    ``declined`` is the service-declined shape — a shared client that answers nothing,
+    which is how any service failure reaches a consumer and what the plugin must route to
+    ``classifier_unavailable``. Without it, ``responses`` is the script and asking beyond
+    it fails with a count (``()`` = this pass must never reach the classifier).
+    ``absent`` simulates classifier-core not being installed at all.
+    """
+    stub = classifier_stub.install(None if declined else _scripted(responses),
+                                  absent=absent)
     h = load_plugin("fast-compaction", settings or {})
     from agent.context_engine import ContextEngine
     from hermes_cli.plugins import get_plugin_context_engine
     engine = get_plugin_context_engine()
     assert isinstance(engine, ContextEngine) and engine.name == "fast-compaction"
-    return h, engine
+    return h, engine, stub
 
 
-def test_registration_and_status_tool(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
+def test_registration_and_status_tool(load_plugin, classifier_stub):
+    h, engine, _stub = _load_engine(load_plugin, classifier_stub)
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["engine"] == "fast-compaction" and status["enabled"] is True
     assert status["attempts"] == 0
+    assert status["classifier_core_available"] is True
 
 
-def test_prune_success_keeps_text_verbatim(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
+def test_prune_success_keeps_text_verbatim(load_plugin, classifier_stub):
     messages = transcript(n_calls=6, result_size=40_000)
     calls = pruner.collect_tool_calls(messages, 6)
     eligible = pruner.eligible_calls(calls)
     keep = {eligible[0]["call_id"]: True}
     keep_result = {eligible[0]["call_id"]: True}
-    _patch_client(monkeypatch, [_verdicts(eligible, keep, keep_result)])
+    h, engine, stub = _load_engine(
+        load_plugin, classifier_stub, responses=[_verdicts(eligible, keep, keep_result)])
 
     out = engine.compress(list(messages), current_tokens=200_000)
     assert out is not messages
@@ -288,43 +293,52 @@ def test_prune_success_keeps_text_verbatim(load_plugin, monkeypatch):
     assert engine.compression_count == 1
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["pruned"] == 1 and status["fallbacks"] == 0
+    # attributed to this plugin, and it carries its own explicit budget, not a default
+    assert [c["caller"] for c in stub.calls] == ["fast-compaction"]
+    assert [c["timeout"] for c in stub.calls] == [20.0]
+    # the raw ask() path: the meta-classifier's label translation would rewrite the
+    # keep/drop schema this plugin's strict parser reads
+    assert [c["method"] for c in stub.calls] == ["ask"]
 
 
-def test_one_request_carries_every_question(load_plugin, monkeypatch):
-    """16 tool calls = 32 questions = ONE request: the state is sent exactly once."""
-    h, engine = _load_engine(load_plugin, monkeypatch)
+def test_one_request_carries_every_question(load_plugin, classifier_stub):
+    """16 tool calls = 32 questions = ONE request: the state is sent exactly once.
+
+    The wire shape (URL, the model field) is classifier-core's contract and is tested
+    there; what this plugin owns is the state and the question set it hands over, and
+    that it hands them over exactly once.
+    """
     messages = transcript(n_calls=6, result_size=40_000)
     eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
-    requests = _patch_client(monkeypatch, [_verdicts(eligible)])
+    h, engine, stub = _load_engine(load_plugin, classifier_stub, responses=[_verdicts(eligible)])
     engine.compress(list(messages), current_tokens=200_000)
-    assert len(requests) == 1
-    assert requests[0]["url"].endswith("/v1/systemone")
-    body = requests[0]["body"]
-    assert set(body) == {"model", "state", "questions"}
-    assert sorted(body["questions"]) == sorted(f"{r['tag']}_{kind}" for r in eligible
-                                               for kind in ("call", "result"))
+    assert len(stub.calls) == 1
+    asked = stub.calls[0]["questions"]
+    assert sorted(asked) == sorted(f"{r['tag']}_{kind}" for r in eligible
+                                   for kind in ("call", "result"))
     assert all(q["type"] == "choice" and set(q["criteria"]) == {"keep", "drop"}
-               for q in body["questions"].values())
+               for q in asked.values())
+    assert isinstance(stub.calls[0]["state"], str) and stub.calls[0]["state"]
 
 
-def test_default_confidence_deletes_weakly_favoured_drops(load_plugin, monkeypatch):
+def test_default_confidence_deletes_weakly_favoured_drops(load_plugin, classifier_stub):
     """P(drop)=0.7 beats the 0.5 default, so the pass still prunes."""
-    h, engine = _load_engine(load_plugin, monkeypatch)
     messages = transcript(n_calls=6, result_size=40_000)
     eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
-    _patch_client(monkeypatch, [_soft_verdicts(eligible)])
+    h, engine, _stub = _load_engine(load_plugin, classifier_stub,
+                                    responses=[_soft_verdicts(eligible)])
     engine.compress(list(messages), current_tokens=200_000)
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["drop_confidence"] == 0.5
     assert status["pruned"] == 1 and status["fallbacks"] == 0
 
 
-def test_raised_confidence_holds_the_context_and_falls_back(load_plugin, monkeypatch):
+def test_raised_confidence_holds_the_context_and_falls_back(load_plugin, classifier_stub):
     """The same answers are refused at drop_confidence=0.95: nothing deleted, summary path."""
-    h, engine = _load_engine(load_plugin, monkeypatch, {"drop_confidence": 0.95})
     messages = transcript(n_calls=6, result_size=40_000)
     eligible = pruner.eligible_calls(pruner.collect_tool_calls(messages, 6))
-    _patch_client(monkeypatch, [_soft_verdicts(eligible)])
+    h, engine, _stub = _load_engine(load_plugin, classifier_stub, {"drop_confidence": 0.95},
+                                    responses=[_soft_verdicts(eligible)])
     out = engine.compress(list(messages), current_tokens=200_000)
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["drop_confidence"] == 0.95
@@ -332,46 +346,72 @@ def test_raised_confidence_holds_the_context_and_falls_back(load_plugin, monkeyp
     assert isinstance(out, list)
 
 
-def test_redaction_runs_before_egress(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
+def test_redaction_runs_before_egress(load_plugin, classifier_stub):
     messages = transcript(n_calls=6, result_size=40_000)
     messages[0]["content"] += " token sk-ant-ABCDEF0123456789"
-    requests = _patch_client(monkeypatch, [{}])
+    h, engine, stub = _load_engine(load_plugin, classifier_stub, responses=[{}])
     engine.compress(list(messages), current_tokens=200_000)
-    # malformed empty answer -> fallback, but the state that WAS sent is scrubbed
-    if requests:
-        assert "sk-ant-ABCDEF0123456789" not in json.dumps(requests[0]["body"])
+    # malformed empty answer -> fallback, but the state that WAS handed over is scrubbed
+    if stub.calls:
+        assert "sk-ant-ABCDEF0123456789" not in json.dumps(stub.calls[0]["state"])
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["fallbacks"] == 1 and status["pruned"] == 0
 
 
-def test_classifier_down_falls_back_once_then_cooldown(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
-    from urllib.error import URLError
-    _patch_client(monkeypatch, [URLError("connection refused")] * 4)
+def test_classifier_down_falls_back_to_the_summary(load_plugin, classifier_stub):
+    """A declined request — the shared client's answer to any service failure — routes to
+    the built-in summary once, with the reason counted. The breaker and its cooldown are
+    classifier-core's own contract (tests/test_classifier_core.py), not this plugin's.
+    """
     messages = transcript(n_calls=6, result_size=40_000)
+    h, engine, stub = _load_engine(load_plugin, classifier_stub, declined=True)
     out = engine.compress(list(messages), current_tokens=200_000)
     status = json.loads(h.tool("fast_compaction_status", {}))
     assert status["pruned"] == 0 and status["fallbacks"] == 1
     assert "classifier_unavailable" in status["fallback_reasons"]
+    assert len(stub.calls) == 1  # one attempt per compression, never a retry loop here
     # Built-in summary path ran: it either rewrote the middle or refused; never crashed.
     assert isinstance(out, list)
 
 
-def test_focus_topic_always_uses_summary_path(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
-    requests = _patch_client(monkeypatch, [])  # zero tolerance: any call fails the test
+def test_missing_classifier_core_is_a_counted_fallback_reason(load_plugin, classifier_stub):
+    """Without the sibling plugin the pass is a visible, counted fallback: the built-in
+    summary still runs and nothing is ever handed to a classifier."""
+    messages = transcript(n_calls=6, result_size=40_000)
+    h, engine, stub = _load_engine(load_plugin, classifier_stub, absent=True)
+    out = engine.compress(list(messages), current_tokens=200_000)
+    status = json.loads(h.tool("fast_compaction_status", {}))
+    assert status["pruned"] == 0 and status["fallbacks"] == 1
+    assert "classifier_core_unavailable" in status["fallback_reasons"]
+    assert stub.calls == []
+    assert isinstance(out, list)
+
+
+def test_register_without_classifier_core_still_serves_status(monkeypatch):
+    """An unloadable classifier-core is a counted, logged degradation — never a refusal
+    to register: the overlay and its diagnostics still come up."""
+    module = _load_plugin_module()
+    monkeypatch.setattr(module, "_shared_classifier_client", lambda: None)
+    ctx = _RecordingCtx({})
+    module.register(ctx)
+    assert [engine.name for engine in ctx.engines] == ["fast-compaction"]
+    assert ctx.engines[0]._fc_client is None
+    payload = json.loads(ctx.tools["fast_compaction_status"]({}))
+    assert payload["classifier_core_available"] is False
+
+
+def test_focus_topic_always_uses_summary_path(load_plugin, classifier_stub):
+    h, engine, stub = _load_engine(load_plugin, classifier_stub)
     messages = transcript(n_calls=6, result_size=40_000)
     engine.compress(list(messages), current_tokens=200_000, focus_topic="release checklist")
-    assert requests == []
+    assert stub.calls == []
 
 
-def test_short_transcript_no_classifier_call(load_plugin, monkeypatch):
-    h, engine = _load_engine(load_plugin, monkeypatch)
-    requests = _patch_client(monkeypatch, [])
+def test_short_transcript_no_classifier_call(load_plugin, classifier_stub):
+    h, engine, stub = _load_engine(load_plugin, classifier_stub)
     messages = [msg_user("hi"), msg_assistant("hello!")]
     engine.compress(messages, current_tokens=200_000)
-    assert requests == []  # nothing eligible: straight to the built-in path
+    assert stub.calls == []  # nothing eligible: straight to the built-in path
 
 
 class _RecordingCtx:

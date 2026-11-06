@@ -29,6 +29,7 @@ import sys
 import threading
 import weakref
 from pathlib import Path
+from typing import Final
 
 # Maintenance timing. A long task can legitimately outlive the 300 s claim
 # lease, so maintenance ticks every 60 s and renews with headroom-restoring
@@ -39,6 +40,12 @@ RENEW_INTERVAL_MS = 60000
 HEARTBEAT_INTERVAL_MS = 60000
 
 DEFAULT_BINARY = "covey"
+
+# loop-guard owns the redirect budget; the bridge fires only when that budget is
+# spent, so "exhausted" cannot mean two different things in two plugins.  An
+# unreadable setting falls back to loop-guard's own documented default.
+LOOP_GUARD_PLUGIN: Final = "loop-guard"
+LOOP_GUARD_DEFAULT_REDIRECT_CAP: Final = 2
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +126,10 @@ TOOL_SCHEMA = {
         "task's persisted evidence policy is still enforced (a task that "
         "requires evidence needs evidence_digest to finish), and governed "
         "tasks stay outside this tool. Completion here is not review or "
-        "landing verification."
+        "landing verification. finish additionally accepts governed=true "
+        "(opt-in, per call): it then refuses unless this session's continuation "
+        "review closure is closed and records the evidence digest derived from "
+        "that reviewed evidence; without it, finish stays direct."
     ),
     "parameters": {
         "type": "object",
@@ -138,6 +148,13 @@ TOOL_SCHEMA = {
             "summary": {"type": "string"},
             "failure_code": {"type": "string"},
             "evidence_digest": {"type": "string"},
+            "governed": {
+                "type": "boolean",
+                "description": ("finish only, opt-in per call: refuse the finish unless "
+                                "this session's continuation review closure is closed and "
+                                "record the evidence digest derived from that reviewed "
+                                "evidence. Default false keeps finish direct."),
+            },
             "request_id": {"type": "string"},
             "workspace": {"type": "string"},
             "handoff": {
@@ -209,6 +226,81 @@ def _read_settings(ctx) -> tuple[str, str, str]:
     return binary, db_path, os.path.realpath(db_path)
 
 
+def _blocker_mode(ctx) -> str:
+    """The validated `blocker_checkpoint` mode for the profile active NOW.
+
+    The vocabulary belongs to the runtime (one definition, one refusal), so an
+    unknown value is a ValueError that fails registration instead of quietly
+    behaving like some other mode.
+    """
+    try:
+        raw = ctx.get_config("blocker_checkpoint", "exhausted")
+    except (AttributeError, LookupError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"covey-tasks setting 'blocker_checkpoint' could not be read "
+            f"({type(exc).__name__}: {exc}).") from exc
+    return _load_runtime_module().parse_blocker_mode(raw)
+
+
+def _loop_guard_redirect_cap() -> int:
+    """loop-guard's own redirect budget, read with the host config reader.
+
+    The default mode waits for the guard to spend this budget, so reading it at
+    the source is the only way the two plugins cannot drift apart.  A missing or
+    malformed value degrades to loop-guard's documented default and says so:
+    a bridge that silently never fires is worse than a counted, logged one.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        raw = cfg_get(load_config_readonly(), "plugins", "entries",
+                       LOOP_GUARD_PLUGIN, "settings", "redirect_cap",
+                       default=LOOP_GUARD_DEFAULT_REDIRECT_CAP)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "covey-tasks: loop-guard budget could not be read (%s); using default %s",
+            type(exc).__name__, LOOP_GUARD_DEFAULT_REDIRECT_CAP)
+        return LOOP_GUARD_DEFAULT_REDIRECT_CAP
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        logger.warning(
+            "covey-tasks: loop-guard setting 'redirect_cap' is not an integer (%r); "
+            "using default %s", raw, LOOP_GUARD_DEFAULT_REDIRECT_CAP)
+        return LOOP_GUARD_DEFAULT_REDIRECT_CAP
+    return raw
+
+
+def _selected_guard_directive(prefix: str, selected_directive_id: object,
+                              directives: object) -> tuple[str, str] | None:
+    """The authoritative delivered loop-guard block as (directive_id, message).
+
+    Only the SELECTED directive counts: a suppressed guard block never reached
+    the model, so checkpointing on it would release a claim over work the model
+    was never shown.  Returns None for anything else, including a selected
+    directive from another plugin.
+    """
+    if not isinstance(directives, list):
+        return None
+    records = [item for item in directives if isinstance(item, dict)]
+    selected = None
+    for record in records:
+        if record.get("directive_id") == selected_directive_id and selected_directive_id:
+            selected = record
+            break
+    if selected is None and not selected_directive_id:
+        delivered = [r for r in records if r.get("outcome") == "delivered"]
+        selected = delivered[-1] if delivered else None
+    if selected is None or selected.get("action") != "block":
+        return None
+    if selected.get("outcome") not in (None, "delivered"):
+        return None
+    message = selected.get("message")
+    directive_id = selected.get("directive_id")
+    if not isinstance(message, str) or not message.startswith(prefix):
+        return None
+    if not isinstance(directive_id, str) or not directive_id:
+        return None
+    return directive_id, message
+
+
 class _Entry:
     __slots__ = ("runtime", "ref")
 
@@ -218,7 +310,11 @@ class _Entry:
 
 
 def register(ctx) -> None:
-    CoveyRuntime = _load_runtime_module().CoveyRuntime
+    runtime_module = _load_runtime_module()
+    CoveyRuntime = runtime_module.CoveyRuntime
+    # Fail at registration, not at the first stall: an unreadable mode would
+    # otherwise surface as a checkpoint that never happens.
+    _blocker_mode(ctx)
 
     # (agent identity | None, profile home, canonical DB) -> entry. The agent
     # slot is id(agent) validated against the entry's weakref, so a recycled id
@@ -376,6 +472,48 @@ def register(ctx) -> None:
     ctx.register_hook("subagent_stop", on_subagent_stop)
     ctx.register_hook("on_session_finalize", on_session_end)
     ctx.register_hook("on_session_reset", on_session_end)
+
+    # A loop-guard block is the model saying, with evidence, that this exact
+    # approach is not working.  `blocker_checkpoint` decides when that evidence
+    # is strong enough to hand the task back: a checkpoint persists a resumable
+    # marked handoff and RELEASES the claim (native retry semantics), so the
+    # default waits until the guard's own redirect budget is spent rather than
+    # shedding ownership over a single bad guess.  Nothing here activates
+    # without that explicit setting, and nothing here raises into the dispatch.
+    def observe_loop_blocker(*, action=None, delivered=None, selected_directive_id=None,
+                             directives=None, session_id="", **_kw) -> None:
+        try:
+            if not delivered or action != "block":
+                return  # suppressed or non-block directives never count
+            selected = _selected_guard_directive(
+                runtime_module.BLOCKER_PREFIX, selected_directive_id, directives)
+            if selected is None:
+                return  # another plugin's directive, or a block that was not selected
+            directive_id, message = selected
+            # Parsed exactly once, at the boundary; a malformed report is counted
+            # by the runtime and never turned into an invented handoff.
+            blocker = runtime_module.parse_loop_blocker(message)
+            mode = _blocker_mode(ctx)
+            agent = _bound_agent()
+            if agent is None:
+                return
+            profile = _profile_home()
+            _, _, canonical_db = _read_settings(ctx)
+            with lock:
+                entry = _selected_entry((id(agent), profile, canonical_db), agent)
+                runtime = entry.runtime if entry is not None and entry.ref() is agent else None
+            if runtime is None or runtime.profile_home != profile:
+                return  # no runtime for this agent+profile: nothing here is claimed
+            runtime.observe_blocker(
+                session_id=str(session_id or "") or runtime.last_session_id,
+                directive_id=directive_id, blocker=blocker, mode=mode,
+                cap=_loop_guard_redirect_cap())
+        except Exception as exc:  # boundary: an observer never fails the turn
+            logger.warning(
+                "covey-tasks: loop-guard block could not be observed (%s: %s)",
+                type(exc).__name__, exc, exc_info=True)
+
+    ctx.register_hook("post_tool_directive", observe_loop_blocker)
 
     def _unload():
         with lock:

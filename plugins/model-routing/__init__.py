@@ -20,6 +20,14 @@ Host seam: registers its resolver through ``ctx.register_role_resolver``
 when the host provides it (one resolver per host); without the seam the
 plugin still loads, its tools work, and ``route_status`` reports
 ``host_seam: unavailable``.
+
+Turn pins (``pin_turn_role`` / ``clear_turn_pin``): a keyword-steering magic
+keyword (``/cheap``, ``/deep``, ``/local``) can pin a configured role for one
+user turn of one session. While a pin is held the resolver answers every
+requested role in that session with the pinned model and ``source="turn_pin"``:
+an explicit user keyword is a direct request and outranks the implicit route.
+Pins are runtime state only — never persisted, never configured, bounded, and
+expired with the turn by the caller. ``route_status`` lists what is held.
 """
 
 from __future__ import annotations
@@ -27,9 +35,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from dataclasses import dataclass
+from types import ModuleType
+from typing import Final
 
+# Stdlib logging, not structlog: the Hermes host ships no structlog (it is not
+# an installed dependency), so this module must stay stdlib-only.
 logger = logging.getLogger(__name__)
 
 _ROLE_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*")
@@ -39,6 +54,183 @@ _FALLBACKS = ("inherit", "refuse")
 _AUDIT_MAXLEN = 128
 _RECEIPT_KEYS = ("resolved", "role", "model", "provider", "source", "reason")
 _REVIEW_SURFACES = ("curator", "background_review", "review")
+_TURN_PIN_MAXLEN: Final = 256
+_TURN_SOURCE: Final = "turn_pin"
+# The nearest source THIS host's receipt law accepts for a deliberately chosen
+# model (see :func:`_turn_source`). "route" is not usable: the host requires a
+# non-empty provider with it, which a role that names no provider does not have.
+_TURN_SOURCE_STANDING: Final = "explicit"
+_CANONICAL_KEY: Final = "hermes_plugins_model_routing"
+_LOCK_TYPE = type(threading.Lock())  # _thread.lock: created via threading.Lock(), never directly
+
+
+def _turn_source() -> str:
+    """The source label a pinned resolution reports, chosen by the host's own law.
+
+    The host owns the receipt vocabulary (``hermes_cli.plugins._ROLE_RECEIPT_SOURCES``)
+    and drops a receipt whose source it does not know as malformed. Labelling a
+    pin with a word the host cannot name would therefore make the pin vanish
+    silently for every consumer — a fail-open nobody sees. So ask the host:
+    ``turn_pin`` while it recognises that source (an explicit keyword outranking
+    an implicit route is its own provenance), otherwise ``explicit``, the nearest
+    label it does accept. The reason text always names the pinned role and who
+    asked for it, so the audit never depends on this label.
+    """
+    try:
+        from hermes_cli.plugins import _ROLE_RECEIPT_SOURCES
+    except (ImportError, AttributeError):  # no host receipt law to obey
+        return _TURN_SOURCE_STANDING
+    return _TURN_SOURCE if _TURN_SOURCE in _ROLE_RECEIPT_SOURCES else _TURN_SOURCE_STANDING
+
+if __name__ in sys.modules:
+    sys.modules.setdefault(_CANONICAL_KEY, sys.modules[__name__])
+
+# A turn pin row: (turn_id, role, model, provider, requested_by). Plain
+# primitives, so a second instance of this file (keyword-steering path-loads it)
+# can read rows written by the first without depending on class identity.
+TurnPinRow = tuple[str, str, str, str | None, str]
+
+
+@dataclass(frozen=True, slots=True)
+class PinReceipt:
+    """The honest answer to :func:`pin_turn_role`: applied, or why it was not."""
+
+    applied: bool
+    role: str
+    model: str | None
+    provider: str | None
+    reason: str
+
+
+def _state_home() -> ModuleType:
+    """The module object owning the live turn state: one per process.
+
+    ``keyword-steering`` loads this file by path, so two instances of it can
+    exist. The pin store and the live role table therefore hang off the module
+    registered under :data:`_CANONICAL_KEY` (the first loader wins), and every
+    instance reads and writes them there — otherwise a pin set by one copy would
+    be invisible to the resolver registered by the other.
+    """
+    canonical = sys.modules.get(_CANONICAL_KEY)
+    return canonical if isinstance(canonical, ModuleType) else sys.modules[__name__]
+
+
+def _pin_store() -> OrderedDict[str, TurnPinRow]:
+    home = _state_home()
+    store = getattr(home, "_turn_pins", None)
+    if not isinstance(store, OrderedDict):
+        store = OrderedDict()
+        home._turn_pins = store
+    return store
+
+
+def _pin_lock() -> threading.Lock:
+    home = _state_home()
+    lock = getattr(home, "_shared_pin_lock", None)
+    if not isinstance(lock, _LOCK_TYPE):
+        lock = threading.Lock()
+        home._shared_pin_lock = lock
+    return lock
+
+
+def _pin_row(session_id: str) -> TurnPinRow | None:
+    if not session_id:
+        return None
+    with _pin_lock():
+        return _pin_store().get(session_id)
+
+
+def _publish_roles(roles: dict[str, dict[str, str | None]]) -> None:
+    """Publish the validated role table as this process's live routing state.
+
+    The attribute names are prefixed ``_shared_`` deliberately: they live on the
+    module object, and an unprefixed name would shadow the accessor function of
+    the same name (``_live_roles``/``_registered``), turning a callable into a
+    dict on the first registration. Writes are plain attribute assignments (a
+    module accepts new attributes); every read goes through ``getattr`` with a
+    default, because an idle or not-yet-registered copy has none of them.
+    """
+    home = _state_home()
+    home._shared_roles = dict(roles)
+    home._shared_registered = True
+
+
+def _live_roles() -> dict[str, dict[str, str | None]]:
+    roles = getattr(_state_home(), "_shared_roles", None)
+    return roles if isinstance(roles, dict) else {}
+
+
+def _registered() -> bool:
+    """Whether this plugin's ``register`` has run (an idle copy routes nothing)."""
+    return bool(getattr(_state_home(), "_shared_registered", False))
+
+
+def pin_turn_role(session_id: str, turn_id: str, role: str, *,
+                  requested_by: str) -> PinReceipt:
+    """Pin ``role`` for the rest of this session's turn.
+
+    An explicit user keyword outranks the implicit route: while a pin is held,
+    ``resolve_role_model`` answers every requested role in that session with the
+    pinned role's model, labelled with the source the host's receipt law accepts
+    for a deliberately chosen model (:func:`_turn_source` — ``turn_pin`` where the
+    host knows that source, ``explicit`` otherwise, because an unknown label makes
+    the host discard the receipt). The reason always names the pinned role and who
+    asked. Explicit ``target_model`` config in consumers still wins — that
+    precedence is consumer-side and unchanged. The pin is runtime state only:
+    never persisted, and cleared by :func:`clear_turn_pin` when the turn ends.
+
+    Declines with ``reason="role_not_configured"`` when the table has no such
+    role, and with ``reason="model_routing_unavailable"`` when this plugin was
+    never registered (an imported-but-idle copy routes nothing). An empty
+    session id is declined too (``"no_session"``): a pin without a session would
+    apply to every sessionless resolution in the process.
+    """
+    session = str(session_id or "").strip()
+    name = str(role or "").strip()
+    if not session:
+        return PinReceipt(False, name, None, None, "no_session")
+    if not _registered():
+        return PinReceipt(False, name, None, None, "model_routing_unavailable")
+    spec = _live_roles().get(name)
+    if spec is None:
+        return PinReceipt(False, name, None, None, "role_not_configured")
+    model = str(spec["model"])
+    provider = spec["provider"]
+    row = (str(turn_id or ""), name, model, provider, str(requested_by or ""))
+    with _pin_lock():
+        store = _pin_store()
+        store[session] = row
+        store.move_to_end(session)
+        while len(store) > _TURN_PIN_MAXLEN:
+            store.popitem(last=False)
+    return PinReceipt(True, name, model, provider, "applied")
+
+
+def clear_turn_pin(session_id: str) -> None:
+    """Drop this session's turn pin (the host call sites: next turn, session end)."""
+    session = str(session_id or "").strip()
+    if not session:
+        return
+    with _pin_lock():
+        _pin_store().pop(session, None)
+
+
+def current_turn_pin(session_id: str) -> PinReceipt | None:
+    """The pinned role for this session, ``None`` when no pin is held."""
+    row = _pin_row(str(session_id or "").strip())
+    if row is None:
+        return None
+    _turn_id, role, model, provider, _requested_by = row
+    return PinReceipt(True, role, model, provider, "applied")
+
+
+def _pin_listing() -> list[dict[str, str | None]]:
+    """Every active turn pin, for ``route_status``."""
+    with _pin_lock():
+        rows = list(_pin_store().items())
+    return [{"session_id": session, "turn_id": row[0], "role": row[1],
+             "model": row[2], "provider": row[3], "requested_by": row[4]}
+            for session, row in rows]
 
 
 def _entry_settings(ctx):
@@ -188,13 +380,30 @@ def _read_settings(ctx) -> dict:
 
 def _make_resolver(roles: dict, fallback: str, audit: deque):
     """Build the pure, deterministic resolver the host registers. Every call
-    appends ``{receipt, session_id, time}`` to the bounded audit ring."""
+    appends ``{receipt, session_id, time}`` to the bounded audit ring.
 
-    def resolve_role_model(role, *, session_id: str = "", parent_model: str = "",
+    A turn pin held for the session outranks the table: an explicit user keyword
+    (``/cheap``, ``/deep``, ``/local`` via keyword-steering) is a direct request,
+    while a role name in a delegate call is an implicit route. Consumers' own
+    explicit ``target_model`` pins still win — that precedence is consumer-side.
+    """
+
+    # Chosen once at build: the host's receipt vocabulary cannot change mid-turn,
+    # and a label the host does not know would discard every pinned receipt.
+    pinned_source = _turn_source()
+
+    def resolve_role_model(role: str, *, session_id: str = "", parent_model: str = "",
                            parent_provider: str = "") -> dict:
         role = str(role or "")
-        spec = roles.get(role)
-        if spec is not None:
+        pin = _pin_row(str(session_id or ""))
+        if pin is not None:
+            _turn_id, pinned_role, model, provider, requested_by = pin
+            receipt = {"resolved": True, "role": role, "model": model,
+                       "provider": provider or str(parent_provider or "").strip() or _main_provider(),
+                       "source": pinned_source,
+                       "reason": f"turn pin '{pinned_role}' (requested by {requested_by or 'unknown'}) "
+                                 f"applies to this session; it outranks the route for '{role}'"}
+        elif (spec := roles.get(role)) is not None:
             provider = spec["provider"] or str(parent_provider or "").strip() or _main_provider()
             receipt = {"resolved": True, "role": role, "model": spec["model"],
                        "provider": provider, "source": "route",
@@ -283,6 +492,8 @@ def register(ctx) -> None:
     fallback = settings["fallback"]
     delegation_role = settings["delegation_role"]
     provider_validation = settings["provider_validation"]
+    # Live routing state for pin_turn_role: read by any instance of this file.
+    _publish_roles(roles)
 
     audit: deque = deque(maxlen=_AUDIT_MAXLEN)
     resolver = _make_resolver(roles, fallback, audit)
@@ -306,6 +517,7 @@ def register(ctx) -> None:
             "config": config, "effective": effective,
             "audit": list(audit), "host_seam": host_seam,
             "provider_validation": provider_validation,
+            "turn_pins": _pin_listing(),
         }, sort_keys=True)
 
     def route_apply(args=None, **_kw):
@@ -362,7 +574,8 @@ def register(ctx) -> None:
         schema={"name": "route_status",
                 "description": "Report the model-routing table: validated config roles, "
                 "effective per-role model/provider, this plugin's bounded resolution audit "
-                "ring, the host resolver seam state, and whether provider validation ran.",
+                "ring, the host resolver seam state, whether provider validation ran, and "
+                "every turn pin currently held (session, turn, role, model, requester).",
                 "parameters": {"type": "object", "properties": {}}},
         handler=route_status,
         description="Inspect the model-routing table, effective routes and audit ring.",

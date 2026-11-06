@@ -7,14 +7,18 @@ answers/skips always win; legacy ambiguous batch defaults are never applied.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import stat
+import sys
 import time
-import urllib.request
+from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
+from typing import Final, Protocol, cast
 
 _UNSAFE = re.compile(r"\b(approv\w*|authoriz\w*|permission|consent|secret\w*|credential\w*|"
                      r"delet\w*|destroy\w*|deploy\w*|production|publish\w*|payment|purchase|"
@@ -56,39 +60,112 @@ def _owner(owner_session=None, owner_turn=None):
 
 
 
-_CLASSIFY_TIMEOUT = 2.5
-# Client-side wait budget, the same curve the sibling classifier clients use: the
-# engine measured 0.10 s at 200 chars, 0.24 s at 2k, 1.67 s at 10k, 5.64 s at 40k,
-# and the evidence proofs make up most of this payload. Small payloads keep the
-# configured floor; _MAX_TIMEOUT is the guard rail.
-_CHAR_SECONDS = 0.00025
-_MAX_TIMEOUT = 30.0
+# The classifier transport belongs to classifier-core: one process-wide client per
+# endpoint, so a dead service is discovered once instead of once per plugin. Its
+# settings live on the classifier-core entry; this plugin keeps only its thresholds.
+_CLASSIFIER_MODULE_KEY: Final = "hermes_plugins_classifier_core"
+_CLASSIFIER_PLUGIN: Final = "classifier-core"
+_CLASSIFIER_CLIENT_PATH: Final = (
+    Path(__file__).resolve().parent.parent / "classifier-core" / "client.py")
+_CALLER: Final = "auto-answer-classifier"
 
 
-def _budget(text, floor=_CLASSIFY_TIMEOUT):
-    """Seconds to wait for this payload: the configured timeout is the floor, the
-    text's measured inference cost is the budget, _MAX_TIMEOUT is the ceiling."""
-    return min(_MAX_TIMEOUT, max(float(floor), 0.5 + len(text) * _CHAR_SECONDS))
+class _Transport(Protocol):
+    """The one classifier-core call this plugin makes; injected, never built here."""
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object] | None: ...
 
 
-def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
-         endpoint="http://127.0.0.1:8102", model="qwen3.8-flash-next",
-         min_sound_default=0.8,
+class _SettingsClass(Protocol):
+    """``ClassifierSettings`` as this consumer sees it: parsed once, at register."""
+
+    def from_config(self, get_config: Callable[[str, object], object]) -> object: ...
+
+
+class _ClientModule(Protocol):
+    """The surface of classifier-core's ``client.py`` this plugin depends on."""
+
+    ClassifierSettings: _SettingsClass
+
+    def shared_client(self, settings: object) -> _Transport: ...
+
+
+def _load_client() -> _ClientModule | None:
+    """Path-load ``client.py``, preferring the process-wide shared registration.
+
+    A second copy of the module would mean a second breaker, so a module already
+    registered under ``_CLASSIFIER_MODULE_KEY`` (which ``client.py`` does itself at
+    import) is reused verbatim. An absent or broken sibling is ``None``: a documented
+    abstention, never an exception at register.
+    """
+    shared = sys.modules.get(_CLASSIFIER_MODULE_KEY)
+    if isinstance(shared, ModuleType):
+        return cast(_ClientModule, shared)
+    if not _CLASSIFIER_CLIENT_PATH.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(_CLASSIFIER_MODULE_KEY,
+                                                  _CLASSIFIER_CLIENT_PATH)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE execution, in the import system's own order: a frozen dataclass
+    # resolves its string annotations through the module entry in ``sys.modules``, and
+    # the shared-state registration inside ``client.py`` depends on that entry too.
+    sys.modules[_CLASSIFIER_MODULE_KEY] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:  # narrow: degraded
+        sys.modules.pop(_CLASSIFIER_MODULE_KEY, None)  # never share a half-built module
+        logger.warning("auto-answer-classifier: classifier-core failed to load (%s: %s)",
+                       type(exc).__name__, exc, exc_info=True)
+        return None
+    return cast(_ClientModule, module)
+
+
+def _classifier_config() -> Callable[[str, object], object]:
+    """classifier-core's own settings reader; this plugin has no transport settings."""
+    from hermes_cli.config import cfg_get, load_config_readonly
+
+    config = load_config_readonly()
+
+    def reader(key: str, default: object) -> object:
+        return cfg_get(config, "plugins", "entries", _CLASSIFIER_PLUGIN, "settings",
+                       key, default=default)
+
+    return reader
+
+
+def _shared_client() -> _Transport | None:
+    """The shared client, or ``None``: with no transport every ranking abstains."""
+    module = _load_client()
+    if module is None:
+        logger.warning("auto-answer-classifier: sibling plugin %s is unavailable (%s); "
+                       "every ranking abstains", _CLASSIFIER_PLUGIN, _CLASSIFIER_CLIENT_PATH)
+        return None
+    try:
+        return module.shared_client(module.ClassifierSettings.from_config(_classifier_config()))
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:  # narrow
+        logger.warning("auto-answer-classifier: classifier-core settings are unusable "
+                       "(%s: %s); every ranking abstains", type(exc).__name__, exc,
+                       exc_info=True)
+        return None
+
+
+def rank(q, choices, candidates, proofs, client, min_sound_default=0.8,
          min_pick_confidence=0.0, min_pick_margin=0.0):
     """ONE classifier ranking of all eligible choices; abstains on any failure.
 
-    The service answers both questions in one ``/v1/systemone`` pass: the pick is
+    The shared classifier-core client answers both questions in one pass: the pick is
     bound to option labels, so index order carries no meaning, and the default's
     soundness is read as P(yes) instead of an argmax. The three thresholds are
     calibration knobs -- their defaults (0.5 / 0.0 / 0.0) reproduce the previous
-    ``sound_default == "yes"`` gate exactly. 429/503 get one bounded backoff-retry
-    per the service contract; any other failure is a deliberate abstention.
+    ``sound_default == "yes"`` gate exactly. The wait budget and the single bounded
+    429/503 retry belong to the transport (classifier-core); a declined request
+    arrives here as ``None``, and so does a missing transport -- both abstain.
     """
-    import os, urllib.error, urllib.request, time
-    endpoint = str(endpoint or "").rstrip("/")
-    key = os.environ.get(api_key_env or "", "")
-    if not key or not endpoint:
-        return None
+    if client is None:
+        return None  # no transport: the same honest abstention as a None answer
     try:
         floor = float(min_sound_default)
         min_confidence = float(min_pick_confidence)
@@ -96,7 +173,7 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
     except (TypeError, ValueError):
         return None  # uncalibrated config is not a licence to recommend
     labels = {str(i): option for i, option in enumerate(choices)}
-    questions = {
+    questions: dict[str, object] = {
         "pick": {"type": "choice",
                  "instructions": "Pick the option the repository evidence supports.",
                  "criteria": dict(labels)},
@@ -111,55 +188,38 @@ def rank(q, choices, candidates, proofs, api_key_env="CLASSIFIER_API_KEY",
     safe = redact_for_egress(text)
     if safe != text:
         return None  # secret-laden inputs abstain rather than drop option identity
-    body = json.dumps({"model": str(model or "qwen3.8-flash-next"),
-                       "state": safe, "questions": questions}).encode()
-    for attempt in (0, 1):
-        if attempt:
-            time.sleep(1)
-        request = urllib.request.Request(endpoint + "/v1/systemone", data=body,
-                                         headers={"Content-Type": "application/json",
-                                                  "Authorization": f"Bearer {key}"})
-        try:
-            with urllib.request.urlopen(request, timeout=_budget(safe)) as reply:
-                verdict = json.loads(reply.read(16385))
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 503) and attempt == 0:
-                continue
-            return None
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-            return None
-        answers = verdict.get("answers") if isinstance(verdict, dict) else None
-        pick = answers.get("pick") if isinstance(answers, dict) else None
-        sound = answers.get("sound_default") if isinstance(answers, dict) else None
-        if not isinstance(pick, dict) or not isinstance(sound, dict):
-            return None
-        sound_default = sound.get("noul")
-        if (not isinstance(sound_default, (int, float)) or isinstance(sound_default, bool)
-                or sound_default < floor):
-            return None
-        choice = pick.get("choice")
-        probabilities = pick.get("probabilities")
-        if not isinstance(choice, str) or not isinstance(probabilities, dict):
-            return None
-        # An exact 0.0 is a confidently rejected option, not a missing answer.
-        scores = [value for value in probabilities.values()
-                  if isinstance(value, (int, float)) and not isinstance(value, bool)]
-        confidence = pick.get("confidence")
-        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
-            confidence = probabilities.get(choice)
-        if not isinstance(confidence, (int, float)):
-            return None
-        top = sorted(scores, reverse=True)
-        margin = top[0] - top[1] if len(top) > 1 else 1.0
-        if confidence < min_confidence or margin < min_margin:
-            return None  # a weak pick or a near-tie is not a recommendation
-        selected = labels.get(choice)
-        if selected not in candidates:
-            return None
-        return {"selected": selected, "probabilities": dict(probabilities),
-                "confidence": float(confidence), "margin": float(margin),
-                "sound_default": float(sound_default)}
-    return None
+    verdict = client.ask(safe, questions, caller=_CALLER)
+    answers = verdict.get("answers") if isinstance(verdict, dict) else None
+    pick = answers.get("pick") if isinstance(answers, dict) else None
+    sound = answers.get("sound_default") if isinstance(answers, dict) else None
+    if not isinstance(pick, dict) or not isinstance(sound, dict):
+        return None
+    sound_default = sound.get("noul")
+    if (not isinstance(sound_default, (int, float)) or isinstance(sound_default, bool)
+            or sound_default < floor):
+        return None
+    choice = pick.get("choice")
+    probabilities = pick.get("probabilities")
+    if not isinstance(choice, str) or not isinstance(probabilities, dict):
+        return None
+    # An exact 0.0 is a confidently rejected option, not a missing answer.
+    scores = [value for value in probabilities.values()
+              if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    confidence = pick.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        confidence = probabilities.get(choice)
+    if not isinstance(confidence, (int, float)):
+        return None
+    top = sorted(scores, reverse=True)
+    margin = top[0] - top[1] if len(top) > 1 else 1.0
+    if confidence < min_confidence or margin < min_margin:
+        return None  # a weak pick or a near-tie is not a recommendation
+    selected = labels.get(choice)
+    if selected not in candidates:
+        return None
+    return {"selected": selected, "probabilities": dict(probabilities),
+            "confidence": float(confidence), "margin": float(margin),
+            "sound_default": float(sound_default)}
 
 
 def _question(row):
@@ -377,6 +437,10 @@ def _evidence(workspace, references, question, choices):
 
 
 def register(ctx):
+    # One shared transport for the whole process, resolved with the operator's
+    # classifier-core settings; None means every ranking abstains.
+    client = _shared_client()
+
     def load(key):
         value = ctx.state.get(key)
         return value if isinstance(value, dict) else {}
@@ -427,9 +491,6 @@ def register(ctx):
             return
 
     def defaults(args, task_id="", **_kw):
-        key_env = ctx.get_config("api_key_env", "CLASSIFIER_API_KEY")
-        endpoint = ctx.get_config("endpoint", "http://127.0.0.1:8102")
-        model = ctx.get_config("served_model", "qwen3.8-flash-next")
         owner, workspace = _owner(), _workspace(task_id)
         if not isinstance(args, dict) or not owner or not workspace:
             return json.dumps({"status": "unknown", "reason": "native owner/workspace unavailable"})
@@ -478,9 +539,10 @@ def register(ctx):
                     return reply(status="abstained", reason="not a bounded low-risk conventional question")
                 q, choices = eligible
                 proofs, candidates = _evidence(workspace, args.get("evidence"), q, choices)
-                # Positional like key_env/endpoint: the thresholds are rank()'s next
-                # parameters, and every rank() stand-in in the tests takes *args.
-                observed = rank(q, choices, candidates, proofs, key_env, endpoint, model,
+                # Positional like the transport arguments before it: the thresholds
+                # are rank()'s next parameters, and every rank() stand-in in the
+                # tests takes *args.
+                observed = rank(q, choices, candidates, proofs, client,
                                 ctx.get_config("min_sound_default", 0.8),
                                 ctx.get_config("min_pick_confidence", 0.0),
                                 ctx.get_config("min_pick_margin", 0.0))

@@ -8,6 +8,7 @@ autouse isolated fixture).
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,9 @@ def _unit(monkeypatch, settings, *, with_seam=True, providers=("zai", "lilith"))
     spec = importlib.util.spec_from_file_location(
         "model_routing_unit", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
+    # A module holding dataclasses must be in sys.modules BEFORE exec: they
+    # resolve string annotations through sys.modules[cls.__module__].
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "_entry_settings", lambda ctx: dict(settings))
     monkeypatch.setattr(
@@ -114,6 +118,9 @@ def test_non_mapping_settings_raises_value_error_naming_the_problem(monkeypatch)
     spec = importlib.util.spec_from_file_location(
         "model_routing_unit", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
+    # A module holding dataclasses must be in sys.modules BEFORE exec: they
+    # resolve string annotations through sys.modules[cls.__module__].
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "_entry_settings", lambda ctx: "settings-as-a-string")
     with pytest.raises(ValueError, match="settings"):
@@ -135,6 +142,9 @@ def test_absent_settings_loads_idle_unit(monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "model_routing_unit", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
+    # A module holding dataclasses must be in sys.modules BEFORE exec: they
+    # resolve string annotations through sys.modules[cls.__module__].
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "_entry_settings", lambda ctx: None)
     ctx = _FakeCtx()
@@ -152,6 +162,9 @@ def _entry_subtree(monkeypatch, entry):
     spec = importlib.util.spec_from_file_location(
         "model_routing_subtree", PLUGIN_ROOT / PLUGIN_ID / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
+    # A module holding dataclasses must be in sys.modules BEFORE exec: they
+    # resolve string annotations through sys.modules[cls.__module__].
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "_known_providers", lambda: None)
     ctx = _FakeCtx()

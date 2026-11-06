@@ -1,11 +1,13 @@
 name: fast-compaction
 version: 0.2.0
-description: "Lossless-by-deletion compaction overlay: the classifier service decides which stale tool calls/results to drop or truncate; kept content stays verbatim and the built-in summary remains the fallback."
+description: "Lossless-by-deletion compaction overlay: the classifier service decides which stale tool calls/results to drop or truncate; kept content stays verbatim and the built-in summary remains the fallback. Configured tool pins (pinned_tools, default prewalk_ready) keep a plan handoff's call/result pair out of both the classifier and the proactive eviction path."
 author: "fast-jev-compaction port (tamaratran/fast-jev-compaction)"
 manifest_version: 2
 api_version: 1
 provides_tools: []
 provides_hooks: []
+external_dependencies:
+  - "sibling plugin classifier-core provides the shared classifier client and its endpoint/served_model/api_key_env settings; without it every prune falls back to the built-in summary with the counted reason classifier_core_unavailable"
 config_schema:
   register_engine:
     type: bool
@@ -15,18 +17,6 @@ config_schema:
     type: bool
     default: true
     description: "When false the engine defers every compression to the built-in summary path."
-  endpoint:
-    type: string
-    default: "http://127.0.0.1:8102"
-    description: "Classifier base URL. Never log or echo the key; set the key in the environment."
-  served_model:
-    type: string
-    default: "qwen3.8-flash-next"
-    description: "Model name sent as the top-level `model` field; the flare engine requires it."
-  api_key_env:
-    type: string
-    default: "CLASSIFIER_API_KEY"
-    description: "Environment variable holding the Bearer key, read at call time."
   preserve_recent_messages:
     type: int
     default: 6
@@ -50,7 +40,7 @@ config_schema:
   request_timeout:
     type: float
     default: 20.0
-    description: "Seconds per classifier request (/v1/systemone); on timeout the whole attempt falls back to the built-in summary."
+    description: "Seconds passed explicitly with each classifier request through the shared classifier-core client; on timeout the whole attempt falls back to the built-in summary."
   drop_confidence:
     type: float
     default: 0.5
@@ -59,6 +49,10 @@ config_schema:
     type: string
     default: "off"
     description: "Mid-session eviction on the host's proactive seam (runs when the request exceeds the trigger, below the compression threshold). off = host's deterministic passes; fifo = drop oldest unpinned tool pairs with no classifier call; classifier = keep/drop pass first, degrading to fifo per-turn on any classifier fault."
+  pinned_tools:
+    type: list
+    default: ["prewalk_ready"]
+    description: "Tool names whose call/result pairs are never dropped or truncated, on top of the positional protections (first message, the protected recent window, a call whose result is missing). The default keeps the prewalk plan handoff — the validated brief an execution model cannot reconstruct once a compaction has summarised it away. Applies to the classifier pass and to the proactive eviction path. An empty list restores the unconfigured behaviour; an entry that is not a non-empty tool name is refused at register."
   proactive_trigger_tokens:
     type: int
     default: 8000

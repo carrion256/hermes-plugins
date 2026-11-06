@@ -13,23 +13,115 @@ reduction is below ``min_reduction``, or the state cannot be fitted, the call fa
 through to the untouched built-in summary path. The built-in remains the source of
 truth for token bookkeeping, thresholds, cooldowns, telemetry and the summary fallback.
 
-Settings live under ``plugins.entries.fast-compaction.settings``; the API key is read
-from the environment at call time and never stored or logged.
+Settings live under ``plugins.entries.fast-compaction.settings``. The classifier
+transport — endpoint, served model, Bearer key, breaker, cooldown — belongs to the
+classifier-core plugin, loaded by path below: this file builds no request, opens no
+socket and reads no credential.
 """
 from __future__ import annotations
 
+import copy
+import importlib.util
 import json
 import logging
+import sys
+import types
+from collections.abc import Callable
+from pathlib import Path
+from typing import Final, Protocol, cast
 
 from . import pruner
-from .client import ClassifierClient
 from .proactive import (MODES, PROACTIVE_STATS, ProactivePruneMixin,
                         ProactiveUnavailable)
 
 logger = logging.getLogger(__name__)
 
+# One classifier transport for the whole process: a second copy of the module would
+# mean a second breaker, so one breaker serves every caller.
+CLASSIFIER_CORE_PLUGIN: Final[str] = "classifier-core"
+CLIENT_MODULE_KEY: Final[str] = "hermes_plugins_classifier_core"
+# Distinct per plugin, so classifier_status attributes declines to the right consumer.
+PRUNE_CALLER: Final[str] = "fast-compaction"
+
 STATUS = {"attempts": 0, "pruned": 0, "fallbacks": 0, "fallback_reasons": {},
           "last": None}
+
+
+class _QuestionClient(Protocol):
+    """The one method this plugin needs from the shared classifier client."""
+
+    def ask(self, state: str, questions: dict[str, object], *, caller: str,
+            timeout: float | None = None) -> dict[str, object] | None: ...
+
+
+class _SettingsClass(Protocol):
+    """``ClassifierSettings``: parsed once, at register, through the host config reader."""
+
+    def from_config(self, get_config: Callable[[str, object], object]) -> object: ...
+
+
+class _ClientModule(Protocol):
+    """The path-loaded surface of ``classifier-core/client.py`` this plugin depends on."""
+
+    ClassifierSettings: _SettingsClass
+
+    def shared_client(self, settings: object) -> _QuestionClient: ...
+
+
+def _load_classifier_core() -> _ClientModule | None:
+    """Path-load classifier-core's client, preferring the process-wide registration.
+
+    Returns ``None`` when the sibling plugin is absent or unloadable; the prune pass
+    then reports ``classifier_core_unavailable`` instead of raising at register.
+    """
+    shared = sys.modules.get(CLIENT_MODULE_KEY)
+    if isinstance(shared, types.ModuleType):
+        return cast(_ClientModule, shared)
+    path = Path(__file__).resolve().parent.parent / CLASSIFIER_CORE_PLUGIN / "client.py"
+    if not path.is_file():
+        logger.warning("fast-compaction: classifier-core is not installed (%s)", path)
+        return None
+    spec = importlib.util.spec_from_file_location(CLIENT_MODULE_KEY, path)
+    if spec is None or spec.loader is None:
+        logger.warning("fast-compaction: classifier-core/client.py is not loadable")
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE execution, in the import system's own order: a frozen dataclass
+    # resolves its string annotations through sys.modules, and client.py's own shared
+    # registration depends on that entry existing too.
+    sys.modules[CLIENT_MODULE_KEY] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        sys.modules.pop(CLIENT_MODULE_KEY, None)  # never leave a half-built module shared
+        logger.warning("fast-compaction: classifier-core client unusable (%s: %s)",
+                       type(exc).__name__, exc)
+        return None
+    return cast(_ClientModule, module)
+
+
+def _shared_classifier_client() -> _QuestionClient | None:
+    """The process-shared client for classifier-core's endpoint, or ``None``.
+
+    classifier-core's own settings are read through the host config reader, once, here:
+    a consumer never declares an endpoint, a model or a key environment variable.
+    """
+    module = _load_classifier_core()
+    if module is None:
+        return None
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        config = load_config_readonly()
+
+        def read(key: str, default: object = None) -> object:
+            return cfg_get(config, "plugins", "entries", CLASSIFIER_CORE_PLUGIN,
+                           "settings", key, default=default)
+
+        return module.shared_client(module.ClassifierSettings.from_config(read))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.warning("fast-compaction: classifier-core settings unusable (%s: %s)",
+                       type(exc).__name__, exc)
+        return None
 
 
 def _engine_class():
@@ -55,6 +147,19 @@ def _engine_class():
                 proactive_prune_min_reclaim_tokens=cfg["proactive_prune_min_reclaim_tokens"],
                 min_tail_user_messages=cfg["min_tail_user_messages"], tail_mode=cfg["tail_mode"],
             )
+
+        def __deepcopy__(self, memo):
+            """clone_for_agent() deep-copies the registered engine, and the shared
+            classifier client holds a lock and a breaker that copying would fork.
+            Share the client and the module references; copy only per-agent mutable
+            state — otherwise the host logs a warning and silently installs the
+            built-in compressor, and this overlay never runs."""
+            clone = self.__class__.__new__(self.__class__)
+            memo[id(self)] = clone
+            for key, value in self.__dict__.items():
+                shared = isinstance(value, types.ModuleType) or key == "_fc_client"
+                setattr(clone, key, value if shared else copy.deepcopy(value, memo))
+            return clone
 
         @property
         def name(self) -> str:
@@ -145,7 +250,9 @@ def _engine_class():
             return pruned
 
         def _prune_pass(self, messages):
-            calls = pruner.collect_tool_calls(messages, self._fc["preserve_recent_messages"])
+            calls = pruner.collect_tool_calls(
+                messages, self._fc["preserve_recent_messages"],
+                pinned_tools=self._fc.get("pinned_tools") or frozenset())
             eligible = pruner.eligible_calls(calls)
             if len(eligible) < 2:
                 raise pruner.PruneError("nothing_eligible")
@@ -156,17 +263,30 @@ def _engine_class():
             decisions = {}
             for batch in pruner.build_batches(eligible):
                 text, questions = pruner.build_request(batch, state)
-                data = self._fc_client.post_questions(
-                    self._fc["endpoint"], self._fc["api_key_env"], text, questions,
-                    timeout=self._fc["request_timeout"], model=self._fc.get("served_model"))
-                if data is None:
-                    raise pruner.PruneError("classifier_unavailable")
+                data = self._ask(text, questions)
                 decisions.update(pruner.parse_response(data, batch,
                                                        self._fc["drop_confidence"]))
             pruned, stats = pruner.apply_decisions(messages, calls, decisions,
                                                    self._fc["truncate_head_chars"])
             stats["state_tokens"] = self._tokens(state)
             return pruned, stats
+
+        def _ask(self, text, questions):
+            """One bounded keep/drop request through the shared classifier client.
+
+            The timeout is passed explicitly, as before: the operator's
+            ``request_timeout`` is the budget, not the transport's own default. A
+            missing client is a counted fallback reason, never a crash: the built-in
+            summary path still runs.
+            """
+            client = self._fc_client
+            if client is None:
+                raise pruner.PruneError("classifier_core_unavailable")
+            data = client.ask(text, questions, caller=PRUNE_CALLER,
+                              timeout=float(self._fc["request_timeout"]))
+            if data is None:
+                raise pruner.PruneError("classifier_unavailable")
+            return data
 
         def _redact(self, state):
             """Same egress discipline as meta-classifier: never send what the native
@@ -185,7 +305,8 @@ def _engine_class():
             return {"mode": self._fc.get("proactive_prune_mode", "off"),
                     "trigger_tokens": self._fc.get("proactive_trigger_tokens", 0),
                     "target_tokens": self._fc.get("proactive_target_tokens", 0),
-                    "preserve_recent": self._fc["preserve_recent_messages"]}
+                    "preserve_recent": self._fc["preserve_recent_messages"],
+                    "pinned_tools": self._fc.get("pinned_tools") or frozenset()}
 
         _proactive_pruner = pruner
 
@@ -257,6 +378,9 @@ def register(ctx):
     settings["truncate_head_chars"] = min(4000, max(0, int(settings["truncate_head_chars"])))
     settings["min_reduction"] = min(0.95, max(0.05, float(settings["min_reduction"])))
     settings["drop_confidence"] = min(1.0, max(0.0, float(settings["drop_confidence"])))
+    # Pinned tool names are a trust decision, so a malformed value is fatal at register
+    # rather than silently disabling the pin (pruner.parse_pinned_tools raises).
+    settings["pinned_tools"] = pruner.parse_pinned_tools(settings.get("pinned_tools"))
     mode = str(settings.get("proactive_prune_mode") or "off").strip().lower()
     if mode not in MODES:
         logger.error("fast-compaction: unknown proactive_prune_mode %r; using off", mode)
@@ -264,7 +388,12 @@ def register(ctx):
     settings["proactive_prune_mode"] = mode
     settings["proactive_trigger_tokens"] = max(0, int(settings["proactive_trigger_tokens"]))
     settings["proactive_target_tokens"] = max(0, int(settings["proactive_target_tokens"]))
-    client = ClassifierClient(timeout=settings["request_timeout"])
+    # Resolved once: the shared client is keyed by classifier-core's endpoint, so every
+    # consumer in the process gets the same breaker.
+    client = _shared_classifier_client()
+    if client is None:
+        logger.warning("fast-compaction: classifier-core unavailable; every prune will "
+                       "fall back with classifier_core_unavailable")
     # The host allows exactly one context-engine registrant and rejects the second, so two
     # cooperating plugins would otherwise decide between themselves by plugin load order.
     # chain-compaction composes this plugin's pruner as its own `prune` stage, so it must
@@ -287,7 +416,7 @@ def register(ctx):
                 "parameters": {"type": "object", "properties": {}}},
         handler=lambda args, **kw: json.dumps({
             "engine": "fast-compaction", "enabled": settings["enabled"],
-            "endpoint_configured": bool(settings["endpoint"]),
+            "classifier_core_available": client is not None,
             "min_reduction": settings["min_reduction"],
             "drop_confidence": settings["drop_confidence"],
             "proactive_mode": settings["proactive_prune_mode"],
