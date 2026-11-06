@@ -88,10 +88,14 @@ def record_load(ctx: PluginContext, settings: DoctorSettings, directories: Seque
     A plugin whose source cannot be read simply omits its digest, so the doctor reports it as
     absent rather than losing the whole record.
     """
+    state = getattr(ctx, "state", None)
+    if state is None:
+        logger.warning("plugins-doctor: load record not written (no state store on this context)")
+        return
     try:
-        records = _prior_records(ctx.state.get(checks.LOAD_RECORDS_KEY, []))
+        records = _prior_records(state.get(checks.LOAD_RECORDS_KEY, []))
         records.append(_new_record(directories))
-        ctx.state.set(checks.LOAD_RECORDS_KEY, records[-settings.stale_records_keep :])
+        state.set(checks.LOAD_RECORDS_KEY, records[-settings.stale_records_keep :])
     except (OSError, RuntimeError, ValueError) as exc:
         logger.warning("plugins-doctor: load record not written (%s)", exc)
 
@@ -154,16 +158,17 @@ def _read_config() -> tuple[Mapping[str, object], str | None]:
 def _read_manifests(
     directories: Sequence[Path],
 ) -> tuple[dict[str, checks.ManifestLike], str | None]:
-    """Manifests by plugin name, through the host's own discovery (same schema normalisation)."""
+    """Manifests by host registry key (``cat/name`` for category plugins), through the host's
+    own discovery so schema normalisation matches what the loader sees."""
     try:
-        from hermes_cli.plugins_discovery import scan_directory
+        from hermes_cli.plugins_discovery import manifest_key, scan_directory
     except ImportError as exc:
         return {}, f"host plugin discovery unavailable ({exc.__class__.__name__}: {exc})"
     manifests: dict[str, checks.ManifestLike] = {}
     for directory in directories:
         try:
             for manifest in scan_directory(directory, "user"):
-                manifests.setdefault(manifest.name, manifest)
+                manifests.setdefault(manifest_key(manifest), manifest)
         except (OSError, ValueError, TypeError) as exc:
             return manifests, f"cannot scan {directory} for manifests ({exc.__class__.__name__}: {exc})"
     return manifests, None
@@ -171,8 +176,11 @@ def _read_manifests(
 
 def _stored_records(ctx: PluginContext) -> tuple[list[object], str | None]:
     """Persisted load records; an unreadable state file is a row, never a silent empty list."""
+    state = getattr(ctx, "state", None)
+    if state is None:
+        return [], "load records unavailable (no state store on this context)"
     try:
-        stored = ctx.state.get(checks.LOAD_RECORDS_KEY, [])
+        stored = state.get(checks.LOAD_RECORDS_KEY, [])
     except (OSError, RuntimeError, ValueError) as exc:
         return [], f"load records unreadable ({exc.__class__.__name__}: {exc})"
     return (stored, None) if isinstance(stored, list) else ([], "load records are not a list")

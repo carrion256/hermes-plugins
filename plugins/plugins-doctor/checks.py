@@ -32,7 +32,9 @@ CheckId = Literal["links", "settings", "seams", "stale_import"]
 
 SEVERITY_ORDER: Final[Mapping[Severity, int]] = {"ok": 0, "warn": 1, "fail": 2}
 
-MANIFEST_FILENAME: Final[str] = "plugin.yaml"
+# Same acceptance as ``hermes_cli.plugins_discovery.scan_directory``: YAML manifests first, then a
+# portable ``plugin.json`` package.
+MANIFEST_FILENAMES: Final[tuple[str, ...]] = ("plugin.yaml", "plugin.yml", "plugin.json")
 SOURCE_PATTERN: Final[str] = "*.py"
 
 # README.md:51-57, the prose list of host contracts this repository's plugins build on.
@@ -154,11 +156,13 @@ def plugin_dirs(home: Path, profile: str | None) -> tuple[Path, ...]:
 
 
 def scan_entries(plugins_dir: Path) -> EntryScan:
-    """Resolve every entry of one plugins directory to a dir containing ``plugin.yaml``.
+    """Resolve every entry of one plugins directory to a dir containing a manifest.
 
-    A dangling symlink, a symlink to a non-directory, or a directory without a manifest is a
-    ``fail``: each one is a plugin the operator believes is installed and the host cannot load.
-    A stray regular file is only a ``warn`` — it was never a plugin.
+    Mirrors the host's discovery: ``<root>/<name>/`` carries a manifest, or is a category whose
+    children ``<root>/<cat>/<name>/`` do (entry name ``cat/name``, one level deep). A dangling
+    symlink, a symlink to a non-directory, or a directory with no manifest anywhere the host
+    would look is a ``fail``: each one is a plugin the operator believes is installed and the
+    host cannot load. A stray regular file is only a ``warn`` — it was never a plugin.
     """
     findings: list[Finding] = []
     entries: list[PluginEntry] = []
@@ -176,14 +180,38 @@ def scan_entries(plugins_dir: Path) -> EntryScan:
             if blocked is not None:
                 findings.append(blocked)
             continue
-        manifest = target / MANIFEST_FILENAME
-        if not manifest.is_file():
+        if _manifest_in(target) is not None:
+            entries.append(PluginEntry(child.name, target))
+            continue
+        members = _category_members(child.name, target)
+        if not members:
             findings.append(
-                Finding("links", child.name, "fail", f"no {MANIFEST_FILENAME} in resolved directory {target}")
+                Finding("links", child.name, "fail", f"no manifest in resolved directory {target} or one level below it")
             )
             continue
-        entries.append(PluginEntry(child.name, target))
+        entries.extend(members)
     return EntryScan(tuple(entries), tuple(findings))
+
+
+def _manifest_in(directory: Path) -> Path | None:
+    """The manifest file the host would read from *directory*, or None."""
+    return next((directory / name for name in MANIFEST_FILENAMES if (directory / name).is_file()), None)
+
+
+def _category_members(category: str, directory: Path) -> tuple[PluginEntry, ...]:
+    """Manifest-bearing children of a category dir, named ``category/child`` like the host key."""
+    try:
+        children = sorted(directory.iterdir())
+    except OSError:
+        return ()
+    members: list[PluginEntry] = []
+    for child in children:
+        if child.name.startswith(".") or child.name == "__pycache__":
+            continue
+        target, _blocked = _resolve_entry(child)
+        if target is not None and _manifest_in(target) is not None:
+            members.append(PluginEntry(f"{category}/{child.name}", target))
+    return tuple(members)
 
 
 def _resolve_entry(child: Path) -> tuple[Path | None, Finding | None]:
@@ -319,7 +347,7 @@ def _settings_findings(
     validator: Callable[[str, Mapping[str, object], Mapping[str, object]], list[str]],
 ) -> list[Finding]:
     if manifest is None:
-        return [Finding("settings", plugin.name, "fail", "enabled but no plugin.yaml manifest was found")]
+        return [Finding("settings", plugin.name, "fail", "enabled but no plugin manifest was found")]
     if plugin.settings_error is not None:
         return [Finding("settings", plugin.name, "fail", plugin.settings_error)]
     schema = _as_mapping(manifest.config_schema) or {}
@@ -431,7 +459,7 @@ def _host_plugins_module() -> ModuleType | None:
 
 
 def digest_plugin(plugin_dir: Path) -> str:
-    """sha256 over sorted (relative path, bytes) of every ``*.py`` and ``plugin.yaml``."""
+    """sha256 over sorted (relative path, bytes) of every ``*.py`` and the manifest file."""
     hasher = hashlib.sha256()
     for path in _source_files(plugin_dir):
         hasher.update(path.relative_to(plugin_dir).as_posix().encode("utf-8"))
@@ -442,7 +470,7 @@ def digest_plugin(plugin_dir: Path) -> str:
 
 
 def _source_files(plugin_dir: Path) -> tuple[Path, ...]:
-    candidates = {plugin_dir / MANIFEST_FILENAME, *plugin_dir.rglob(SOURCE_PATTERN)}
+    candidates = {*(plugin_dir / name for name in MANIFEST_FILENAMES), *plugin_dir.rglob(SOURCE_PATTERN)}
     return tuple(
         sorted(
             (path for path in candidates if "__pycache__" not in path.parts and path.is_file()),

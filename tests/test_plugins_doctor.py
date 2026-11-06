@@ -132,9 +132,23 @@ def test_links_fails_a_dangling_symlink_and_a_manifestless_dir(broken_plugins: P
     assert by_plugin["dangling"].severity == "fail"
     assert "never-installed" in by_plugin["dangling"].detail
     assert by_plugin["noyaml"].severity == "fail"
-    assert "plugin.yaml" in by_plugin["noyaml"].detail
+    assert "no manifest" in by_plugin["noyaml"].detail
     assert "good" not in by_plugin and "good-link" not in by_plugin
     assert [row for row in rows(findings, "links") if row.severity == "ok"]
+
+
+def test_links_accepts_portable_and_category_layouts_like_the_host(
+    clean_plugins: Path, doctor: Doctor
+) -> None:
+    (clean_plugins / "portable").mkdir()
+    (clean_plugins / "portable" / "plugin.json").write_text('{"name": "portable"}', encoding="utf-8")
+    category = clean_plugins / "image_gen"
+    (category / "meshy").mkdir(parents=True)
+    (category / "meshy" / "plugin.yaml").write_text("name: meshy\n", encoding="utf-8")
+    (clean_plugins / "empty-category" / "nothing").mkdir(parents=True)
+    scan = doctor.checks.scan_entries(clean_plugins)
+    assert {entry.name for entry in scan.entries} == {"good", "good-link", "portable", "image_gen/meshy"}
+    assert [(row.plugin, row.severity) for row in scan.findings] == [("empty-category", "fail")]
 
 
 def test_links_fails_when_the_plugins_dir_is_absent(doctor: Doctor, tmp_path: Path) -> None:
@@ -422,9 +436,13 @@ def test_cli_exits_zero_when_nothing_fails(
 def test_cli_writes_nothing_outside_the_fixture_home(
     broken_plugins: Path, doctor: Doctor
 ) -> None:
+    # The real home is shared with a live gateway that journals sessions and task databases
+    # concurrently, so only the subtrees a plugin doctor could plausibly touch are snapshotted.
     real_home = Path.home() / ".hermes"
-    before_home, before_plugins = tree(real_home), tree(broken_plugins)
+    watched = [real_home / name for name in ("plugins", "plugin-data", "config.yaml")]
+    before_home = [tree(p) for p in watched]
+    before_plugins = tree(broken_plugins)
     run_cli(doctor, ["plugins-doctor", "--json"])
-    assert tree(real_home) == before_home
+    assert [tree(p) for p in watched] == before_home
     assert tree(broken_plugins) == before_plugins
     assert list((doctor.handle.home / "plugin-data").rglob("state.json"))
