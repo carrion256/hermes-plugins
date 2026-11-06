@@ -146,7 +146,7 @@ lilith = LilithProviderProfile(
     ),
     base_url="http://lilith.porcupine-ide.ts.net:8001/v1",
     auth_type="api_key",
-    default_max_tokens=81920,
+    default_max_tokens=65536,
     fallback_models=(
         "dsv4",
         "qwen36",
