@@ -10,8 +10,34 @@ Front matter is parsed with PyYAML (comments, real lists); malformed or
 unknown metadata never applies broadly. Bucketing (deterministic):
 disabled/``enabled: false`` drop -> ``agents``-glob vs the session's
 profile_name (unknown identity: agent-named rules stay inactive) ->
-``alwaysApply`` -> rulebook; rules scoped by ``tools``/``condition``/``globs``
-are one-time reminders. Reminder matching is AND over the present scopes.
+``alwaysApply`` -> the always lane; rules scoped by ``tools``/``condition``/
+``globs`` are one-time reminders; only what neither lane reaches — a
+description with no ``alwaysApply``, no ``tools``, no ``condition`` and no
+``globs`` — joins the rulebook index. Reminder matching is AND over the
+present scopes.
+``condition`` is one regex or a list of 1..32 regexes (each compiled on its
+own, so inline flags like ``(?i)`` stay per entry); it matches when ANY entry
+matches ANY string tool argument.
+Globs with a ``/`` match the whole session-relative path (``**`` as a segment
+spans zero or more segments; ``/``-free globs match the basename).
+
+Every ordering — the always lane, the rulebook index, reminder delivery and
+``rules_explain``'s budget simulation — is one shared ``(priority, name)``
+order, where priority comes from ``constraints.priority``
+(CRITICAL > HIGH > MEDIUM > LOW > REFERENCE; missing or unrecognised is
+MEDIUM), so a budget cut always drops the least important rule first. A lane
+that cannot fit everything says so inside its own section and names the
+dropped rules IN INDEX ORDER on its final line — highest priority of the
+dropped ones first — five names at most, then ``, +k more``. The parenthetical
+in the always note, "(lowest priority first)", states the drop policy, not the
+listing order.
+Reminder delivery follows that order and is ONE-SHOT per rule, with no cap:
+a matching call delivers every unfired SPECIFIC reminder (naming a tool, a
+condition or a concrete path) at once — this call is what triggered them —
+plus exactly one EXTENSION-WIDE reminder (bare ``**/*.rs`` / ``*.py``), the
+first by ``(priority, name)``. The remaining extension-wide rules stay
+unfired and drain one per later matching call, CRITICAL first; nothing is
+capped or dropped, and each rule is delivered at most once per session.
 
 Native seams only — tool arguments and file bytes are never mutated:
 - per-session activation is seeded when the cache-safe system-prompt
@@ -50,6 +76,7 @@ import re
 import sys
 import threading
 from collections import OrderedDict
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -131,7 +158,7 @@ class _Rule:
         self.enabled = True
         self.agents: list[str] = []
         self.globs: list[str] = []
-        self.condition: Optional[re.Pattern] = None
+        self.condition: tuple[re.Pattern, ...] = ()
         self.tools: set[str] = set()
         self.id = "rule:" + hashlib.sha256(os.fsencode(path)).hexdigest()[:24]
         self.check_refs: list[str] = []
@@ -260,14 +287,26 @@ def _load_rule_file(path: str) -> Optional[_Rule]:
         rule.tools = set(items)
     if "condition" in meta:
         cond = meta["condition"]
-        if not isinstance(cond, str):
-            logger.warning("rules: %s has non-string condition; ignoring file", path)
+        # One regex (a string, unchanged) or 1..32 regexes compiled
+        # separately so inline flags work per entry; ANY entry may match.
+        sources: list[str]
+        if isinstance(cond, str):
+            sources = [cond]
+        elif (isinstance(cond, list) and 1 <= len(cond) <= 32 and
+              all(isinstance(c, str) and 0 < len(c) <= 4096 for c in cond)):
+            sources = cond
+        else:
+            logger.warning("rules: %s has malformed condition; ignoring file", path)
             return None
-        try:
-            rule.condition = re.compile(cond)
-        except re.error as exc:
-            logger.warning("rules: %s has invalid condition %r: %s", path, cond, exc)
-            return None
+        compiled: list[re.Pattern] = []
+        for source in sources:
+            try:
+                compiled.append(re.compile(source))
+            except re.error as exc:
+                logger.warning("rules: %s has invalid condition %r: %s",
+                               path, source, exc)
+                return None
+        rule.condition = tuple(compiled)
     return rule
 
 
@@ -303,6 +342,146 @@ def _release_fired(act: _Activation, names: list[str]) -> None:
     eligible for a later turn instead of being burned by a failed call."""
     with _FIRED_LOCK:
         act.fired.difference_update(names)
+
+
+# --- pure decision helpers (shared by _seed, the renderers and rules_explain) ---
+
+# Declared importance: what budget truncation drops first. Unrecognised or
+# absent is MEDIUM — a rule never gains priority by typo or omission.
+_PRIORITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "REFERENCE": 4}
+
+# ``**/*.rs`` / ``*.py``: a reminder scoped to a whole file type, and nothing
+# more specific than that.
+_EXT_WIDE_RX = re.compile(r"^(\*\*/)?\*\.[A-Za-z0-9_+-]+$")
+
+
+def _priority_rank(rule: _Rule) -> int:
+    """Rank from ``constraints.priority`` (case-insensitive); missing or
+    unrecognised sorts as MEDIUM."""
+    raw = rule.constraints.get("priority")
+    if not isinstance(raw, str):
+        return _PRIORITY_RANK["MEDIUM"]
+    return _PRIORITY_RANK.get(raw.strip().upper(), _PRIORITY_RANK["MEDIUM"])
+
+
+def _rule_order(rule: _Rule) -> tuple[int, str]:
+    """The one ordering every renderer and every budget cut uses: most
+    important first, ties broken by name so the order is reproducible."""
+    return (_priority_rank(rule), rule.name)
+
+
+def _glob_match(rel: str, pattern: str) -> bool:
+    """Whole-path glob match against ``rel`` (POSIX path relative to the
+    session cwd). A pattern with ``/`` is matched against the whole path —
+    never right-anchored — with ``**`` as a whole segment spanning zero or
+    more segments and ``*``/``?`` confined to one segment, case-sensitive.
+    A slash-free pattern keeps matching the basename."""
+    if "/" not in pattern:
+        return fnmatch.fnmatch(PurePosixPath(rel).name, pattern)
+    return _segments_match(pattern.split("/"), rel.split("/"))
+
+
+def _segments_match(pats: list[str], segs: list[str]) -> bool:
+    if not pats:
+        return not segs
+    head, rest = pats[0], pats[1:]
+    if head == "**":
+        if not rest:
+            return bool(segs)  # trailing ``**`` needs at least one segment
+        # ``**`` eats nothing, or one segment while staying open.
+        return _segments_match(rest, segs) or (
+            bool(segs) and _segments_match(pats, segs[1:]))
+    if not segs:
+        return False
+    return fnmatch.fnmatchcase(segs[0], head) and _segments_match(rest, segs[1:])
+
+
+def _is_extension_wide(rule: _Rule) -> bool:
+    """A blanket file-type reminder. Anything naming a tool, a condition or a
+    specific path says something more particular and outranks it."""
+    if rule.tools or rule.condition or not rule.globs:
+        return False
+    return all(_EXT_WIDE_RX.match(g) for g in rule.globs)
+
+
+def _delivery_order(rule: _Rule) -> tuple[int, int, str]:
+    """SPECIFIC reminders first, then EXTENSION-WIDE; within each group the
+    shared ``(priority, name)`` order."""
+    return (1 if _is_extension_wide(rule) else 0, _priority_rank(rule), rule.name)
+
+
+def _bucketed(active_rules: dict[str, _Rule]) -> tuple[
+        tuple[_Rule, ...], tuple[_Rule, ...], tuple[_Rule, ...]]:
+    """The same deterministic bucketing _seed applies, without session state,
+    in the shared ``(priority, name)`` order so a budget cut always drops the
+    least important rule first — here and in the live renderers alike."""
+    def _ordered(rows: Iterable[_Rule]) -> tuple[_Rule, ...]:
+        return tuple(sorted(rows, key=_rule_order))
+    active = list(active_rules.values())
+    return (_ordered(r for r in active if r.always and not r.globs),
+            _ordered(r for r in active if _is_index_only(r)),
+            _ordered(r for r in active if r.tools or r.condition or r.globs))
+
+
+def _is_index_only(rule: _Rule) -> bool:
+    """Indexable: description-only guidance no other lane delivers. An
+    always-apply rule is rendered in full; a rule naming a tool, a condition
+    or a glob is a reminder. Either way the rulebook must not repeat it."""
+    return (bool(rule.description) and not rule.always
+            and not rule.tools and not rule.condition and not rule.globs)
+
+
+def _rulebook_line(rule: _Rule) -> str:
+    return f"- **{rule.name}** — {rule.description} [{rule.path}]"
+
+
+def _omit_names(names: list[str], limit: int = 5) -> str:
+    """Drop-list names, at most ``limit`` of them, then ``, +k more``."""
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f", +{len(names) - limit} more"
+
+
+def _pack(rules: Sequence[_Rule], render: Callable[[_Rule], str],
+          joiner: str, budget: int) -> tuple[str, list[str]]:
+    """Fill ``budget`` chars with the rules in order, recording EVERY rule the
+    budget could not take. A rule that does not fit ends the section: what is
+    shown stays a priority PREFIX, so the omission list is exactly the
+    lowest-priority tail."""
+    text, lines = "", [render(rule) for rule in rules]
+    for index, line in enumerate(lines):
+        candidate = (text + joiner + line) if text else line
+        if len(candidate) > budget:
+            return text, [rule.name for rule in rules[index:]]
+        text = candidate
+    return text, []
+
+
+def _rulebook_note(omitted: Sequence[str]) -> str:
+    """The one final line a truncated index carries: what was dropped, named
+    in index order (lowest priority last), five at most."""
+    return (f"- {len(omitted)} lower-priority rule(s) over the rulebook budget "
+            "(read the rule files or call rules_explain): "
+            f"{_omit_names(list(omitted))}")
+
+
+def _always_note(omitted: Sequence[str]) -> str:
+    """The always lane's own drop line: the omitted tail in index order. The
+    parenthetical names the DROP policy (lowest priority is dropped first),
+    not the listing order."""
+    names = list(omitted)
+    return (f"[RULES] {len(names)} always-apply rule(s) exceed the prompt "
+            "budget and are omitted (lowest priority first): "
+            f"{_omit_names(names)}; read the rule files directly.")
+
+
+def _pack_always(rules: Sequence[_Rule]) -> tuple[str, list[str]]:
+    return _pack(rules, lambda rule: rule.body, "\n\n", _BODY_BUDGET)
+
+
+def _pack_rulebook(rules: Sequence[_Rule]) -> tuple[str, list[str]]:
+    return _pack(rules, _rulebook_line, "\n", _BOOKLET_BUDGET)
+
 
 def register(ctx) -> None:
     global_dirs = [os.path.abspath(os.path.expanduser(str(raw)))
@@ -488,12 +667,11 @@ def register(ctx) -> None:
                     fnmatch.fnmatch(profile, a) for a in rule.agents)):
                 continue
             active[name] = rule
-        reminders = tuple(r for r in active.values()
-                          if r.tools or r.condition or r.globs)
+        # One bucketing + one order for every consumer (see _bucketed).
+        always, rulebook, reminders = _bucketed(active)
         act = _Activation(
-            always=tuple(r for r in active.values() if r.always and not r.globs),
-            rulebook=tuple(r for r in active.values()
-                           if r.description and (not r.always or r.globs)),
+            always=always,
+            rulebook=rulebook,
             reminders=reminders,
             cwd=cwd,
             profile=profile,
@@ -503,7 +681,7 @@ def register(ctx) -> None:
         activation[session_id] = act
         demoted = len([r for r in active.values() if r.always and r.globs])
         logger.info("rules: session %s active: %d always, %d rulebook, %d reminder "
-                    "(cwd=%s, %d alwaysApply+globs demoted to scoped reminder/rulebook)",
+                    "(cwd=%s, %d alwaysApply+globs delivered as scoped reminders only)",
                     session_id, len(act.always), len(act.rulebook), len(act.reminders),
                     cwd or "-", demoted)
 
@@ -512,19 +690,12 @@ def register(ctx) -> None:
         act = activation.get(str(info.get("session_id") or ""))
         if act is None:
             return ""
-        omitted = 0
-        text = ""
-        for rule in act.always:
-            candidate = (text + "\n\n" + rule.body) if text else rule.body
-            if len(candidate) > _BODY_BUDGET:
-                omitted += 1
-                continue
-            text = candidate
+        text, omitted = _pack_always(act.always)
         if omitted:
             logger.warning("rules: %d always-apply rule(s) exceed the prompt budget "
-                           "and are omitted for session %s", omitted, info.get("session_id"))
-            return text + (f"\n\n[RULES] {omitted} always-apply rule(s) exceed the "
-                           "prompt budget and are omitted; read the rule files directly.")
+                           "and are omitted for session %s", len(omitted),
+                           info.get("session_id"))
+            return text + "\n\n" + _always_note(omitted)
         return text
 
     def _render_rulebook(info: Any) -> str:
@@ -532,23 +703,9 @@ def register(ctx) -> None:
         act = activation.get(str(info.get("session_id") or ""))
         if act is None:
             return ""
-        lines, omitted = [], []
-        text = ""
-        for rule in act.rulebook:
-            line = (f"- **{rule.name}** — {rule.description}"
-                    + (f" (globs: {', '.join(rule.globs)})" if rule.globs else "")
-                    + f" [{rule.path}]")
-            candidate = (text + "\n" + line) if text else line
-            if len(candidate) > _BOOKLET_BUDGET:
-                omitted.append(rule.name)
-                continue
-            text = candidate
-            lines.append(line)
+        text, omitted = _pack_rulebook(act.rulebook)
         if omitted:
-            shown = ", ".join(omitted[:8])
-            more = f" (+{len(omitted) - 8} more)" if len(omitted) > 8 else ""
-            text += (f"\n- {shown}{more} — over the rulebook budget; "
-                     "read these rule files directly")
+            return text + "\n" + _rulebook_note(omitted)
         return text
 
     def _matches(rule: _Rule, tool_name: str, str_args: list[str],
@@ -556,11 +713,13 @@ def register(ctx) -> None:
         # AND over present scopes: no single scope may act as a bypass.
         if rule.tools and tool_name not in rule.tools:
             return False
-        if rule.condition and not any(rule.condition.search(v) for v in str_args):
+        if rule.condition and not any(p.search(v) for p in rule.condition
+                                      for v in str_args):
             return False
-        # Multi-segment globs are scoped to paths relative to the session
-        # project root; an absolute suffix match would fire across foreign
-        # workspaces. Slash-free globs (e.g. "*.rs") match the basename.
+        # Multi-segment globs are matched against the path relative to the
+        # session project root — whole-path, `**` recursive (see _glob_match);
+        # an absolute suffix match would fire across foreign workspaces.
+        # Slash-free globs (e.g. "*.rs") match the basename.
         if rule.globs:
             if not cwd:
                 return False
@@ -569,10 +728,7 @@ def register(ctx) -> None:
                     rel = str(Path(p).relative_to(cwd))
                 except ValueError:
                     continue
-                if any("/" in g and PurePosixPath(rel).match(g) or
-                       "/" not in g and fnmatch.fnmatch(
-                           PurePosixPath(p).name, g)
-                       for g in rule.globs):
+                if any(_glob_match(rel, g) for g in rule.globs):
                     return True
             return False
         return True
@@ -604,29 +760,36 @@ def register(ctx) -> None:
             _seed({"session_id": session_id, "profile_name": _profile_name(),
                    "cwd": _runtime_cwd()})
             act = activation.get(session_id)
-        hits = []
-        claimed = []
         str_args = [v for v in args.values() if isinstance(v, str)]
         resolved_paths = _extract_paths(tool_name, args, task_id)
         _record_obligations(session_id, act, tool_name, str_args, resolved_paths)
         if not ttsr_enabled:
             return next_call(args)  # guidance lane off; obligations are their own lane
-        # Select and claim in one critical section: two tool calls from the
-        # same parallel batch share this activation and must not both queue
-        # the same reminder. The claim is provisional — it is rolled back
-        # below unless the guidance actually rides the result.
+        # Select, order and claim in ONE critical section: two tool calls from
+        # the same parallel batch share this activation and must not both
+        # deliver the same reminder. EVERY matching unfired SPECIFIC reminder
+        # is delivered now (this call triggered it; a later call may not
+        # match); of the EXTENSION-WIDE ones only the first by
+        # ``(priority, name)`` is, so a file type's library drains one rule
+        # per matching call, nothing capped or dropped. Only the delivered
+        # rules are claimed, and the claim is provisional: rolled back below
+        # unless the guidance actually rides the result.
         with _FIRED_LOCK:
-            for rule in act.reminders:
-                if rule.name in act.fired:  # already delivered once
-                    continue
-                if _matches(rule, tool_name, str_args, resolved_paths, act.cwd):
-                    hits.append(rule)
-                    claimed.append(rule.name)
+            hits = sorted(
+                (rule for rule in act.reminders
+                 if rule.name not in act.fired  # already delivered once
+                 and _matches(rule, tool_name, str_args, resolved_paths, act.cwd)),
+                key=_delivery_order)
+            # _delivery_order puts every specific rule before the first
+            # extension-wide one: deliver that prefix plus that one rule.
+            specific = sum(1 for rule in hits if not _is_extension_wide(rule))
+            delivered = hits[:specific + 1]
+            claimed = [r.name for r in delivered]
             act.fired.update(claimed)
-        if not hits:
+        if not delivered:
             return next_call(args)
-        text = "\n\n".join(f"{r.body}\n[rule file: {r.path}]" for r in hits)
-        refs = _rule_refs(hits)
+        text = "\n\n".join(f"{r.body}\n[rule file: {r.path}]" for r in delivered)
+        refs = _rule_refs(delivered)
         try:
             result = next_call(args)
         except BaseException:  # tool failed: nothing was delivered
@@ -668,16 +831,6 @@ def register(ctx) -> None:
     def _agent_ok(rule: _Rule, agent: str) -> bool:
         return not rule.agents or any(
             fnmatch.fnmatch(agent, a) for a in rule.agents)
-
-    def _bucketed(active_rules: dict) -> tuple:
-        """The same deterministic bucketing _seed applies, without session state."""
-        reminders = tuple(r for r in active_rules.values()
-                          if r.tools or r.condition or r.globs)
-        always = tuple(r for r in active_rules.values()
-                       if r.always and not r.globs)
-        rulebook = tuple(r for r in active_rules.values()
-                         if r.description and (not r.always or r.globs))
-        return always, rulebook, reminders
 
     def _match_reasons(rule: _Rule, tool_name: str, resolved_paths: list[str],
                        agent: str) -> list[str]:
@@ -735,9 +888,10 @@ def register(ctx) -> None:
                       and _agent_ok(r, agent)]
         always, rulebook, reminders = _bucketed(active_rules)
         # Deterministic AND-scoped matching, same engine the live lane uses.
-        # always-apply rules are unconditional; globbed rulebook entries are
-        # judged through the reminder lane below, plain rulebook entries are
-        # indexed by description.
+        # always-apply rules are unconditional; every rule scoped by tools,
+        # condition or globs is judged EXCLUSIVELY through the reminder lane
+        # below; the rulebook holds only index-only rules, which are indexed
+        # by description.
         matched = []
         for rule in always:
             matched.append({
@@ -754,13 +908,7 @@ def register(ctx) -> None:
                     "check_refs": rule.check_refs,
                     "verification_refs": rule.verification_refs,
                 })
-        matched_names = {m["name"] for m in matched}
         for rule in rulebook:
-            if rule.globs or rule.tools or rule.condition:
-                continue  # tool/condition/glob scopes are judged EXCLUSIVELY
-                          # through the reminder lane — never re-added here
-            if rule.name in matched_names:
-                continue  # always entries deduped
             matched.append({
                 "id": rule.id, "name": rule.name, "source": rule.path,
                 "reasons": ["rulebook: indexed by description"],
@@ -768,24 +916,10 @@ def register(ctx) -> None:
                 "verification_refs": rule.verification_refs,
             })
         matched.sort(key=lambda m: m["name"])
-        # Budget omissions: exactly the rules the live renderer lanes drop.
-        text, always_omitted = "", []
-        for rule in always:
-            cand = (text + "\n\n" + rule.body) if text else rule.body
-            if len(cand) > _BODY_BUDGET:
-                always_omitted.append(rule.name)
-                continue
-            text = cand
-        text, booklet_omitted = "", []
-        for rule in rulebook:
-            line = (f"- **{rule.name}** — {rule.description}"
-                    + (f" (globs: {', '.join(rule.globs)})" if rule.globs else "")
-                    + f" [{rule.path}]")
-            cand = (text + "\n" + line) if text else line
-            if len(cand) > _BOOKLET_BUDGET:
-                booklet_omitted.append(rule.name)
-                continue
-            text = cand
+        # Budget omissions: exactly the rules the live renderer lanes drop —
+        # the very same packers, over the very same candidate tuples.
+        _, always_omitted = _pack_always(always)
+        _, booklet_omitted = _pack_rulebook(rulebook)
         # Precedence/shadowing: every source the discovery merge dropped.
         by_name: dict[str, list[_Rule]] = {}
         for r in sources:

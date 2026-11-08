@@ -117,8 +117,15 @@ def test_yaml_lists_and_comments_parse(load_plugin, tmp_path, monkeypatch):
     fm = 'description: typed\n# comment\nglobs:\n  - "*.rs"\n  - "*.toml"\n'
     _write_rule(tmp_path / "global" / "typed.md", fm, body="TYPED-BODY")
     harness = _rules_harness(load_plugin, tmp_path, monkeypatch)
-    sections = _sections(harness, _meta(tmp_path))
-    assert "(globs: *.rs, *.toml)" in sections["rules.rulebook"]
+    # The YAML list is read as two real globs: a rule with a broken scope is
+    # rejected outright, so delivery on each extension is the parse proof.
+    _seeded(harness, tmp_path)
+    result, calls = _mw(harness, tool_name="read_file", args={"path": "src/a.rs"})
+    assert "TYPED-BODY" in _guidance(result)[0] and len(calls) == 1
+    _seeded(harness, tmp_path, session_id="sess-2")
+    result, calls = _mw(harness, tool_name="read_file", args={"path": "Cargo.toml"},
+                        session_id="sess-2")
+    assert "TYPED-BODY" in _guidance(result)[0] and len(calls) == 1
 
 
 def test_malformed_metadata_never_applies(load_plugin, tmp_path, monkeypatch):
@@ -363,7 +370,9 @@ def test_rulebook_budget_omits_complete_rules_and_lists_remainder(
     harness = _rules_harness(load_plugin, tmp_path, monkeypatch)
     rulebook = _sections(harness, _meta(tmp_path))["rules.rulebook"]
     assert "- **d3**" in rulebook  # included rules are complete
-    assert "- d4 — over the rulebook budget" in rulebook  # remainder discoverable
+    assert rulebook.splitlines()[-1] == (  # remainder named, bounded, discoverable
+        "- 1 lower-priority rule(s) over the rulebook budget "
+        "(read the rule files or call rules_explain): d4")
 
 
 def test_reminders_disabled_via_config(load_plugin, tmp_path, monkeypatch):

@@ -165,6 +165,8 @@ def test_cli_plans_verifies_reviews_and_finishes(tmp_path):
         "plugins": {"enabled": names, "entries": {name: {"enabled": True, "settings": {}} for name in names}},
     }
     config["plugins"]["entries"]["prewalk"]["settings"] = {"target_model": "audit-executor"}
+    # Hermetic: the default rule_dirs is the real ~/.hermes/rules (HOME is inherited), which would feed live rules into this run.
+    config["plugins"]["entries"]["rules"]["settings"] = {"rule_dirs": [str(tmp_path / "no-global-rules")]}
     config["plugins"]["entries"]["loop-guard"]["settings"] = {"tool_call_streak": 3, "redirect_cap": 1}
     (home / "config.yaml").write_text(json.dumps(config))
     environment = {key: value for key, value in os.environ.items() if not key.endswith("_API_KEY")}
