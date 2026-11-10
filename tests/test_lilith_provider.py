@@ -59,11 +59,24 @@ def test_qwen_budget_and_disable_contract(lilith):
     assert body["thinking_budget"] == 32768
     assert body["chat_template_kwargs"]["thinking_scaffold"] is True
     assert body["chat_template_kwargs"]["auto_disable_thinking_with_tools"] is True
+    # The SGLang Qwen template validates reasoning_effort and accepts only
+    # xhigh/medium/low; an unmapped rung 400s the whole request (2026-11-10
+    # fallback incident). Finer Hermes rungs clamp to the nearest supported.
+    assert body["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+    body, _ = profile.build_api_kwargs_extras(model="qwen36",
+                                              reasoning_config={"effort": "minimal"})
+    assert body["chat_template_kwargs"]["reasoning_effort"] == "low"
+    assert body["thinking_budget"] == 2048
+    body, _ = profile.build_api_kwargs_extras(model="qwen36",
+                                              reasoning_config={"effort": "medium"})
+    assert body["chat_template_kwargs"]["reasoning_effort"] == "medium"
     assert kwargs == {}
     body, kwargs = profile.build_api_kwargs_extras(model="qwen36",
                                                    reasoning_config={"enabled": False})
     assert body["chat_template_kwargs"]["enable_thinking"] is False
     assert body["chat_template_kwargs"]["preserve_thinking"] is False
+    # "none" is not a template effort; the disabled contract omits the key.
+    assert "reasoning_effort" not in body["chat_template_kwargs"]
     assert "thinking_budget" not in body
     assert "thinking" not in body
 

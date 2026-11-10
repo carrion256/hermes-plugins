@@ -31,6 +31,12 @@ _THINKING_BUDGET_BY_EFFORT = {
     "xhigh": 65536,
 }
 
+# The Qwen chat template validates chat_template_kwargs.reasoning_effort and
+# only accepts xhigh/medium/low (an unmapped rung is an HTTP 400). Map Hermes'
+# finer rungs to the nearest supported one; thinking_budget still carries the
+# distinct effort.
+_TEMPLATE_EFFORT = {"minimal": "low", "high": "xhigh"}
+
 
 def _is_deepseek_v4_model(model: str | None) -> bool:
     normalized = str(model or "").strip().lower().rsplit("/", 1)[-1]
@@ -101,13 +107,16 @@ class LilithProviderProfile(ProviderProfile):
                 effort = raw_effort
 
         if not enabled:
+            # No reasoning_effort here: the template validator only knows
+            # xhigh/medium/low and 400s anything else ("none" included,
+            # title-generation 400 2026-11-10); enable_thinking=False is the
+            # complete disable contract.
             return {
                 "chat_template_kwargs": {
                     "auto_disable_thinking_with_tools": True,
                     "enable_thinking": False,
                     "preserve_thinking": False,
                     "thinking_scaffold": False,
-                    "reasoning_effort": "none",
                 },
                 "separate_reasoning": True,
             }, {}
@@ -124,7 +133,7 @@ class LilithProviderProfile(ProviderProfile):
                 "enable_thinking": True,
                 "preserve_thinking": True,
                 "thinking_scaffold": scaffold,
-                "reasoning_effort": effort,
+                "reasoning_effort": _TEMPLATE_EFFORT.get(effort, effort),
             },
             "thinking_budget": budget,
             "separate_reasoning": True,
